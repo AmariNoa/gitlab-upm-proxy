@@ -67,9 +67,11 @@ Only the endpoints required for Unity Package Manager operation are supported.
 
 The following environment variables are required:
 
+````
 PUBLIC_BASE_URL=https://upm.example.com  
 TARBALL_CACHE_DIR=./data/cache  
 UPSTREAM_CONFIG_PATH=config/upstreams.yml
+````
 
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
@@ -79,6 +81,7 @@ If a package scope matches an upstream entry, search requests are sent to that r
 
 Sample config (`config/upstreams_sample.yml`). Copy this to `config/upstreams.yml` and edit as needed:
 
+````
 default:
   - baseUrl: https://gitlab.sample.domain
 upstreams:
@@ -89,6 +92,7 @@ upstreams:
   - baseUrl: https://package.openupm.com
     scopes:
       - com.fuga.*
+````
 
 ---
 
