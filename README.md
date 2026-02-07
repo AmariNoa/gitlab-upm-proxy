@@ -48,7 +48,7 @@ Only the endpoints required for Unity Package Manager operation are supported.
 
 - No standalone implementation is provided for `/-/whoami` or `/-/all`
   - These endpoints are handled via transparent passthrough if requested
-- The proxy does **not** cache packages
+- The proxy caches metadata and tarballs under `TARBALL_CACHE_DIR`
 - All authorization and permission checks are enforced by GitLab
 
 ---
@@ -67,8 +67,30 @@ Only the endpoints required for Unity Package Manager operation are supported.
 
 The following environment variables are required:
 
-GITLAB_BASE_URL=https://gitlab.example.com  
 PUBLIC_BASE_URL=https://upm.example.com
+
+Optional environment variables:
+
+TARBALL_CACHE_DIR=./data/cache  
+UPSTREAM_CONFIG_PATH=config/upstreams.yml
+
+Cached tarballs and merged metadata are stored under:
+`{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
+
+Upstream registries are configured in a YAML (or JSON) file. The default upstream is GitLab.
+
+Example (`config/upstreams.yml`):
+
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://registry.npmjs.org
+    scopes:
+      - jp.keijiro.*
+      - com.unity.*
+  - baseUrl: https://openupm.com/
+    scopes:
+      - com.vrmc.*
 
 ---
 

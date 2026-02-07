@@ -1,0 +1,10 @@
+default:
+  - baseUrl: https://gitlab.sample.domain
+upstreams:
+  - baseUrl: https://registry.npmjs.org
+    scopes:
+      - jp.hoge.*
+      - com.piyo.*
+  - baseUrl: https://openupm.com/
+    scopes:
+      - com.fuga.*

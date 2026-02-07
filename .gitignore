@@ -67,3 +67,5 @@ dist
 # custom settings
 markdown/*
 .env
+data/*
+config/upstreams.yml
