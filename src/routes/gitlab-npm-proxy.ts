@@ -18,6 +18,7 @@ import {
   extractPackageName,
   getUpstreamConfig,
   selectUpstream,
+  selectUpstreamForScopeText,
   UpstreamEntry
 } from "../lib/upstreams";
 
@@ -28,7 +29,7 @@ function mustEnv(name: string): string {
 }
 
 const PUBLIC_BASE_URL = mustEnv("PUBLIC_BASE_URL").replace(/\/+$/, "");
-const TARBALL_CACHE_DIR = process.env.TARBALL_CACHE_DIR ?? "./data/cache";
+const TARBALL_CACHE_DIR = mustEnv("TARBALL_CACHE_DIR");
 
 const upstreamConfig = getUpstreamConfig();
 const defaultUpstream = upstreamConfig.default;
@@ -50,6 +51,7 @@ function buildUpstreamHeaders(reqHeaders: Record<string, unknown>): Record<strin
   delete out["connection"];
   delete out["content-length"];
   delete out["transfer-encoding"];
+  delete out["accept-encoding"];
 
   const auth =
     (typeof reqHeaders["authorization"] === "string" ? (reqHeaders["authorization"] as string) : "") ||
@@ -79,7 +81,9 @@ function applyUpstreamHeaders(
 ): void {
   for (const [k, v] of Object.entries(headers)) {
     if (typeof v !== "string") continue;
-    if (skipContentLength && k.toLowerCase() === "content-length") continue;
+    const key = k.toLowerCase();
+    if (key === "transfer-encoding") continue;
+    if (skipContentLength && key === "content-length") continue;
     reply.header(k, v);
   }
 }
@@ -110,6 +114,45 @@ function pickLatestByName(items: any[]): any[] {
   return Array.from(byName.values()).sort((a, b) =>
     String(a?.name ?? "").localeCompare(String(b?.name ?? ""))
   );
+}
+
+function sendEmptySearch(reply: any): void {
+  const now = new Date().toISOString();
+  reply.type("application/json").send({
+    objects: [],
+    total: 0,
+    time: now
+  });
+}
+
+function normalizeSearchResponse(payload: any): { objects: any[]; total: number; time: string } {
+  const now = new Date().toISOString();
+  if (!payload || typeof payload !== "object") {
+    return { objects: [], total: 0, time: now };
+  }
+
+  if (Array.isArray(payload.objects)) {
+    const objects = payload.objects.map((obj: any) => {
+      const pkg = obj?.package ?? obj;
+      return {
+        package: {
+          name: String(pkg?.name ?? ""),
+          version: String(pkg?.version ?? ""),
+          description: String(pkg?.description ?? ""),
+          date: pkg?.date ?? now
+        },
+        score: obj?.score ?? { final: 1, detail: {} },
+        searchScore: obj?.searchScore ?? 1
+      };
+    });
+    return {
+      objects,
+      total: typeof payload.total === "number" ? payload.total : objects.length,
+      time: typeof payload.time === "string" ? payload.time : now
+    };
+  }
+
+  return { objects: [], total: 0, time: now };
 }
 
 function getLatestVersionFromMetadata(metadata: any): string | null {
@@ -308,9 +351,45 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   const groupEncOnce = encodeURIComponent(groupPath);
 
   const text = (req.query.text ?? "").toString();
+  const searchUpstream = text ? selectUpstreamForScopeText(text) : defaultUpstream;
   const from = Number.parseInt((req.query.from ?? "0").toString(), 10) || 0;
   const sizeRaw = Number.parseInt((req.query.size ?? "20").toString(), 10) || 20;
   const size = Math.min(Math.max(sizeRaw, 1), 250);
+
+  if (searchUpstream.baseUrl !== defaultUpstream.baseUrl) {
+    const u = new URL(`${searchUpstream.baseUrl}/-/v1/search`);
+    u.searchParams.set("text", text);
+    u.searchParams.set("from", String(from));
+    u.searchParams.set("size", String(size));
+
+    const headers = buildUpstreamHeaders(req.headers as any);
+    let res;
+    try {
+      res = await request(u.toString(), { method: "GET", headers });
+    } catch {
+      reply.code(200);
+      sendEmptySearch(reply);
+      return;
+    }
+    const contentType = String(res.headers["content-type"] ?? "");
+
+    if (res.statusCode >= 400 || !contentType.includes("application/json")) {
+      reply.code(200);
+      sendEmptySearch(reply);
+      return;
+    }
+
+    try {
+      const payload = await res.body.json();
+      const normalized = normalizeSearchResponse(payload);
+      reply.code(200);
+      reply.type("application/json").send(normalized);
+    } catch {
+      reply.code(200);
+      sendEmptySearch(reply);
+    }
+    return;
+  }
 
   const base = `${defaultUpstream.baseUrl}/api/v4/groups/${groupEncOnce}/packages`;
   const headers = buildUpstreamHeaders(req.headers as any);

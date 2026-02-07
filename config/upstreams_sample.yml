@@ -5,6 +5,6 @@ upstreams:
     scopes:
       - jp.hoge.*
       - com.piyo.*
-  - baseUrl: https://openupm.com/
+  - baseUrl: https://package.openupm.com
     scopes:
       - com.fuga.*

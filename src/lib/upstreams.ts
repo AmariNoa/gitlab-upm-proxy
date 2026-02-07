@@ -2,6 +2,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
+function mustEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
+}
+
 export type UpstreamEntry = {
   baseUrl: string;
   scopes?: string[];
@@ -22,8 +28,6 @@ export type UpstreamConfig = {
   default: UpstreamEntry;
   upstreams: UpstreamEntry[];
 };
-
-const DEFAULT_CONFIG_PATH = resolve(process.cwd(), "config", "upstreams.yml");
 
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
@@ -47,9 +51,7 @@ let cachedConfig: UpstreamConfig | null = null;
 export function getUpstreamConfig(): UpstreamConfig {
   if (cachedConfig) return cachedConfig;
 
-  const configPath = process.env.UPSTREAM_CONFIG_PATH
-    ? resolve(process.cwd(), process.env.UPSTREAM_CONFIG_PATH)
-    : DEFAULT_CONFIG_PATH;
+  const configPath = resolve(process.cwd(), mustEnv("UPSTREAM_CONFIG_PATH"));
 
   const rawText = readFileSync(configPath, "utf-8");
   const parsed = parseYaml(rawText) as RawConfig;
@@ -75,6 +77,10 @@ function escapeRegExp(value: string): string {
 }
 
 export function matchScope(name: string, scope: string): boolean {
+  if (scope.endsWith(".*")) {
+    const base = scope.slice(0, -2);
+    if (name === base) return true;
+  }
   const pattern = `^${scope.split("*").map(escapeRegExp).join(".*")}$`;
   return new RegExp(pattern).test(name);
 }
@@ -84,6 +90,16 @@ export function selectUpstream(packageName: string): UpstreamEntry {
   for (const upstream of config.upstreams) {
     for (const scope of upstream.scopes ?? []) {
       if (matchScope(packageName, scope)) return upstream;
+    }
+  }
+  return config.default;
+}
+
+export function selectUpstreamForScopeText(scopeText: string): UpstreamEntry {
+  const config = getUpstreamConfig();
+  for (const upstream of config.upstreams) {
+    for (const scope of upstream.scopes ?? []) {
+      if (matchScope(scopeText, scope)) return upstream;
     }
   }
   return config.default;

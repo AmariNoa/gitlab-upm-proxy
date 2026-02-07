@@ -33,14 +33,14 @@ Usage, modification, and redistribution of this software are governed by the ter
 
 ## Forwarded / Supported Endpoints
 
-The proxy accepts GitLab-style URLs and forwards them to the upstream GitLab instance.  
+The proxy accepts GitLab-style URLs and forwards them to the upstream GitLab instance or configured npm registries.  
 Only the endpoints required for Unity Package Manager operation are supported.
 
 ### Supported Endpoints
 
 | Incoming Endpoint (Proxy) | Purpose | Response Format | Notes |
 |---|---|---|---|
-| GET /api/v4/groups/:groupEnc/-/v1/search | Package search (Unity-compatible) | JSON (npm search v1-like) | Calls GitLab Groups Packages API and reformats the response |
+| GET /api/v4/groups/:groupEnc/-/v1/search | Package search (Unity-compatible) | JSON (npm search v1-like) | Routes by scope: upstream npm registry if matched, otherwise GitLab Groups Packages API |
 | GET /api/v4/groups/:groupEnc/<any> | Package metadata & registry access | JSON / Binary | Used when Unity treats the group root as the registry URL |
 | GET /api/v4/projects/:projectId/packages/npm/<any> | Tarball download (project-level) | Binary (`.tgz`) | Required because GitLab npm tarballs are project-scoped |
 
@@ -58,8 +58,8 @@ Only the endpoints required for Unity Package Manager operation are supported.
 1. Unity is configured with a **Scoped Registry**
 2. The registry URL points to this proxy
 3. Unity sends search, metadata, and tarball requests
-4. The proxy forwards requests to GitLab with the provided PAT
-5. GitLab responses are returned with minimal transformation
+4. The proxy routes requests to GitLab or configured npm registries
+5. Responses are returned with minimal transformation
 
 ---
 
@@ -67,30 +67,28 @@ Only the endpoints required for Unity Package Manager operation are supported.
 
 The following environment variables are required:
 
-PUBLIC_BASE_URL=https://upm.example.com
-
-Optional environment variables:
-
+PUBLIC_BASE_URL=https://upm.example.com  
 TARBALL_CACHE_DIR=./data/cache  
 UPSTREAM_CONFIG_PATH=config/upstreams.yml
 
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 
-Upstream registries are configured in a YAML (or JSON) file. The default upstream is GitLab.
+Upstream registries are configured in a YAML (or JSON) file. The default upstream is GitLab.  
+If a package scope matches an upstream entry, search requests are sent to that registry.
 
-Example (`config/upstreams.yml`):
+Sample config (`config/upstreams_sample.yml`). Copy this to `config/upstreams.yml` and edit as needed:
 
 default:
-  - baseUrl: https://gitlab.example.com
+  - baseUrl: https://gitlab.sample.domain
 upstreams:
   - baseUrl: https://registry.npmjs.org
     scopes:
-      - jp.keijiro.*
-      - com.unity.*
-  - baseUrl: https://openupm.com/
+      - jp.hoge.*
+      - com.piyo.*
+  - baseUrl: https://package.openupm.com
     scopes:
-      - com.vrmc.*
+      - com.fuga.*
 
 ---
 
