@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import AutoLoad, { AutoloadPluginOptions } from '@fastify/autoload'
 import { FastifyPluginAsync, FastifyServerOptions } from 'fastify'
 import "dotenv/config";
+import { startVpmPrefetch } from "./lib/vpm-prefetch";
 
 
 export interface AppOptions extends FastifyServerOptions, Partial<AutoloadPluginOptions> {
@@ -16,6 +17,7 @@ const app: FastifyPluginAsync<AppOptions> = async (
   opts
 ): Promise<void> => {
   // Place here your custom code!
+  startVpmPrefetch(fastify.log);
 
   // Do not touch the following lines
 

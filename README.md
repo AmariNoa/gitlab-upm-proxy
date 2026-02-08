@@ -18,7 +18,7 @@ The primary goal is to enable **Unity to consume private GitLab-hosted UPM packa
 ## Notice
 
 This project is built using Fastify, which is licensed under the MIT License.  
-Parts of this application and this README were created with the assistance of **ChatGPT**.  
+Parts of this application and this README were created with the assistance of **ChatGPT** and **Codex**.  
 Usage, modification, and redistribution of this software are governed by the terms described in the LICENSE file.
 
 ---
@@ -92,6 +92,16 @@ upstreams:
   - baseUrl: https://package.openupm.com
     scopes:
       - com.fuga.*
+````
+
+To use a VPM registry, set `type: vpm` (case-insensitive) and point `baseUrl` to the VPM index:
+
+````yaml
+upstreams:
+  - baseUrl: https://vpm.example.com/index.json
+    type: vpm
+    scopes:
+      - dev.example.*
 ````
 
 ---
@@ -278,6 +288,54 @@ sudo ufw status
 ```bash
 curl -I https://upm.example.com
 curl "http://127.0.0.1:3000/api/v4/groups/<groupEnc>/-/v1/search?text=com.example&from=0&size=10"
+```
+
+---
+
+## Update Guide (Ubuntu Server)
+
+### 1) Stop the service
+
+```bash
+sudo systemctl stop gitlab-upm-proxy
+```
+
+### 2) Pull latest changes
+
+```bash
+cd /opt/gitlab-upm-proxy
+git pull
+```
+
+### 3) Install dependencies
+
+```bash
+npm install
+```
+
+### 4) Build
+
+```bash
+npm run build:ts
+```
+
+### 5) Ensure `dist/plugins` exists
+
+```bash
+mkdir -p /opt/gitlab-upm-proxy/dist/plugins
+```
+
+### 6) Start the service
+
+```bash
+sudo systemctl start gitlab-upm-proxy
+sudo systemctl status gitlab-upm-proxy
+```
+
+### 7) Smoke test (optional)
+
+```bash
+curl -I https://upm.example.com
 ```
 
 ---

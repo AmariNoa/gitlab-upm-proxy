@@ -1,8 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { createReadStream } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import type { FastifyPluginAsync } from "fastify";
 import * as semver from "semver";
 import * as tar from "tar";
+import * as unzipper from "unzipper";
 import { request } from "undici";
 import {
   deleteMetadataCache,
@@ -88,6 +91,12 @@ function applyUpstreamHeaders(
   }
 }
 
+function applyTarballHeaders(reply: any, size: number): void {
+  reply.header("content-type", "application/octet-stream");
+  reply.header("content-length", String(size));
+  reply.header("accept-ranges", "bytes");
+}
+
 function compareVersions(a: string, b: string): number {
   const aValid = semver.valid(a);
   const bValid = semver.valid(b);
@@ -123,6 +132,302 @@ function sendEmptySearch(reply: any): void {
     total: 0,
     time: now
   });
+}
+
+type VpmIndex = {
+  packages?: Record<string, { versions?: Record<string, any> }>;
+};
+
+function getVpmIndexUrl(upstream: UpstreamEntry): string {
+  return upstream.baseUrl.endsWith(".json")
+    ? upstream.baseUrl
+    : `${upstream.baseUrl.replace(/\/+$/, "")}/index.json`;
+}
+
+async function fetchVpmIndex(
+  upstream: UpstreamEntry,
+  headers: Record<string, string>
+): Promise<VpmIndex> {
+  const res = await request(getVpmIndexUrl(upstream), { method: "GET", headers });
+  if (res.statusCode >= 400) {
+    throw new Error(`vpm_index_failed:${res.statusCode}`);
+  }
+  return (await res.body.json()) as VpmIndex;
+}
+
+function pickLatestVpmVersion(versions: Record<string, any> | undefined): string | null {
+  if (!versions) return null;
+  const keys = Object.keys(versions);
+  if (keys.length === 0) return null;
+  const valid = keys.filter((v) => semver.valid(v));
+  if (valid.length > 0) return valid.sort(semver.rcompare)[0];
+  return keys.sort().at(-1) ?? null;
+}
+
+function buildVpmSearchResult(
+  packageName: string,
+  versions: Record<string, any> | undefined
+): { name: string; version: string; description: string; date: string } | null {
+  const latest = pickLatestVpmVersion(versions);
+  if (!latest) return null;
+  const latestNode = versions?.[latest];
+  return {
+    name: packageName,
+    version: String(latestNode?.version ?? latest),
+    description: String(latestNode?.description ?? ""),
+    date: new Date().toISOString()
+  };
+}
+
+function buildNpmMetadataFromVpm(
+  packageName: string,
+  versions: Record<string, any> | undefined
+): any {
+  const latest = pickLatestVpmVersion(versions);
+  const out: any = {
+    name: packageName,
+    "dist-tags": {},
+    versions: {}
+  };
+  if (latest) out["dist-tags"].latest = latest;
+
+  if (!versions) return out;
+
+  for (const [version, node] of Object.entries<any>(versions)) {
+    const sourceUrl = typeof node?.url === "string" ? node.url : "";
+    out.versions[version] = {
+      name: String(node?.name ?? packageName),
+      version: String(node?.version ?? version),
+      description: typeof node?.description === "string" ? node.description : "",
+      displayName: typeof node?.displayName === "string" ? node.displayName : undefined,
+      author: node?.author ?? undefined,
+      dist: {
+        tarball: "",
+        original: sourceUrl
+      }
+    };
+  }
+
+  if (latest && out.versions[latest]) {
+    out.author = out.versions[latest].author;
+    out.displayName = out.versions[latest].displayName;
+  }
+
+  return out;
+}
+
+function mergeShasumFromCache(target: any, cached: any): void {
+  if (!target?.versions || typeof target.versions !== "object") return;
+  if (!cached?.versions || typeof cached.versions !== "object") return;
+  for (const [version, node] of Object.entries<any>(target.versions)) {
+    if (!node?.dist || node.dist.shasum) continue;
+    const cachedNode = cached.versions[version];
+    const cachedShasum = cachedNode?.dist?.shasum;
+    if (cachedShasum) {
+      node.dist.shasum = cachedShasum;
+    }
+  }
+}
+
+function filterMetadataByShasum(metadata: any): any {
+  if (!metadata || typeof metadata !== "object") return metadata;
+  if (!metadata.versions || typeof metadata.versions !== "object") return metadata;
+  const filtered: Record<string, any> = {};
+  for (const [version, node] of Object.entries<any>(metadata.versions)) {
+    if (node?.dist?.shasum) {
+      filtered[version] = node;
+    }
+  }
+  metadata.versions = filtered;
+  const versions = Object.keys(filtered);
+  if (versions.length === 0) {
+    delete metadata["dist-tags"];
+  } else {
+    const latest = versions.sort(semver.rcompare)[0];
+    metadata["dist-tags"] = { latest };
+  }
+  return metadata;
+}
+
+function buildVpmTarballProxyUrl(
+  groupEnc: string,
+  packageName: string,
+  version: string
+): string {
+  const encodedName = encodeURIComponent(packageName);
+  const encodedVersion = encodeURIComponent(`${packageName}-${version}.tgz`);
+  return `${PUBLIC_BASE_URL}/api/v4/groups/${groupEnc}/npm/${encodedName}/-/${encodedVersion}`;
+}
+
+async function unzipToDirectory(zipPath: string, targetDir: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(zipPath).pipe(unzipper.Extract({ path: targetDir }));
+    stream.on("close", () => resolve());
+    stream.on("error", (err) => reject(err));
+  });
+}
+
+async function convertZipBufferToTgz(
+  zipBuffer: Buffer,
+  targetTgzPath: string,
+  tempRoot: string
+): Promise<void> {
+  await mkdir(tempRoot, { recursive: true });
+  await mkdir(dirname(targetTgzPath), { recursive: true });
+  const tempDir = await mkdtemp(join(tempRoot, "vpm-"));
+  const zipPath = join(tempDir, "package.zip");
+  const extractDir = join(tempDir, "extract");
+  try {
+    await mkdir(extractDir, { recursive: true });
+    await writeFile(zipPath, zipBuffer);
+    await unzipToDirectory(zipPath, extractDir);
+    const rootDir = await findPackageRoot(extractDir);
+    const entries = await readdir(rootDir);
+    await tar.c(
+      {
+        gzip: true,
+        file: targetTgzPath,
+        cwd: rootDir,
+        prefix: "package/"
+      },
+      entries
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+function stripVpmOriginal(metadata: any): any {
+  if (!metadata || typeof metadata !== "object") return metadata;
+  if (!metadata.versions || typeof metadata.versions !== "object") return metadata;
+  for (const v of Object.values<any>(metadata.versions)) {
+    if (v?.dist && typeof v.dist === "object" && "original" in v.dist) {
+      delete v.dist.original;
+    }
+  }
+  return metadata;
+}
+
+function computeSha1(buffer: Buffer): string {
+  return createHash("sha1").update(buffer).digest("hex");
+}
+
+async function serveVpmTarball(
+  req: any,
+  reply: any,
+  path: string,
+  decodedName: string,
+  decodedVersion: string,
+  cacheKey: string,
+  headers: Record<string, string>
+): Promise<boolean> {
+  const vpmUpstream = selectUpstream(decodedName);
+  if (vpmUpstream.type !== "vpm") {
+    return false;
+  }
+
+  req.log.info({ path, method: req.method }, "vpm_tarball_request");
+
+  const cachedBuffer = await readTarballCache(vpmUpstream.host, decodedName, cacheKey);
+  if (cachedBuffer) {
+    reply.code(200);
+    applyTarballHeaders(reply, cachedBuffer.length);
+    if (req.method.toUpperCase() === "HEAD") {
+      reply.send();
+    } else {
+      reply.send(cachedBuffer);
+    }
+    return true;
+  }
+
+  const cachedMetadata = await readMetadataCache(vpmUpstream.host, decodedName);
+  const versionNode =
+    cachedMetadata?.metadata?.versions && typeof cachedMetadata.metadata.versions === "object"
+      ? cachedMetadata.metadata.versions[decodedVersion]
+      : undefined;
+  const tarballUrl = typeof versionNode?.dist?.original === "string" ? versionNode.dist.original : "";
+  if (!tarballUrl) {
+    reply.code(404).send();
+    return true;
+  }
+
+  try {
+    const buffer = await fetchBufferWithRedirects(tarballUrl, headers);
+    const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
+    await convertZipBufferToTgz(buffer, tgzPath, TARBALL_CACHE_DIR);
+    const tgzBuffer = await readFile(tgzPath);
+    const shasum = computeSha1(tgzBuffer);
+
+    if (cachedMetadata?.metadata?.versions && typeof cachedMetadata.metadata.versions === "object") {
+      const cachedVersionNode = cachedMetadata.metadata.versions[decodedVersion];
+      if (cachedVersionNode?.dist) {
+        cachedVersionNode.dist.shasum = shasum;
+        await writeMetadataCache(vpmUpstream.host, decodedName, {
+          latestVersion: cachedMetadata.latestVersion,
+          author: cachedMetadata.author,
+          displayName: cachedMetadata.displayName,
+          metadata: cachedMetadata.metadata
+        });
+      }
+    }
+
+    reply.code(200);
+    applyTarballHeaders(reply, tgzBuffer.length);
+    if (req.method.toUpperCase() === "HEAD") {
+      reply.send();
+    } else {
+      reply.send(tgzBuffer);
+    }
+    return true;
+  } catch {
+    reply.code(404).send();
+    return true;
+  }
+}
+
+async function fetchBufferWithRedirects(
+  url: string,
+  headers: Record<string, string>,
+  maxRedirects = 5
+): Promise<Buffer> {
+  let current = url;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const res = await request(current, { method: "GET", headers });
+    const status = res.statusCode;
+    if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
+      const next = new URL(res.headers.location, current).toString();
+      current = next;
+      continue;
+    }
+    if (status >= 400) {
+      throw new Error(`zip_download_failed:${status}`);
+    }
+    return Buffer.from(await res.body.arrayBuffer());
+  }
+  throw new Error("zip_download_redirects_exceeded");
+}
+
+async function findPackageRoot(extractDir: string): Promise<string> {
+  try {
+    await stat(join(extractDir, "package.json"));
+    return extractDir;
+  } catch {
+    // continue
+  }
+
+  const entries = await readdir(extractDir, { withFileTypes: true });
+  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  if (dirs.length === 1) {
+    const candidate = join(extractDir, dirs[0]);
+    try {
+      await stat(join(candidate, "package.json"));
+      return candidate;
+    } catch {
+      return candidate;
+    }
+  }
+
+  return extractDir;
 }
 
 function normalizeSearchResponse(payload: any): { objects: any[]; total: number; time: string } {
@@ -356,6 +661,65 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   const sizeRaw = Number.parseInt((req.query.size ?? "20").toString(), 10) || 20;
   const size = Math.min(Math.max(sizeRaw, 1), 250);
 
+  if (searchUpstream.type === "vpm") {
+    const headers = buildUpstreamHeaders(req.headers as any);
+    try {
+      const index = await fetchVpmIndex(searchUpstream, headers);
+      const packages = index.packages ?? {};
+      const matches = Object.entries(packages)
+        .filter(([name]) => (text ? name.includes(text) : true))
+        .map(([name, pkg]) => buildVpmSearchResult(name, pkg?.versions))
+        .filter((v): v is { name: string; version: string; description: string; date: string } => !!v);
+
+      for (const [name, pkg] of Object.entries(packages)) {
+        if (text && !name.includes(text)) continue;
+        const versions = pkg?.versions;
+        if (!versions) continue;
+        const latestVersion = pickLatestVpmVersion(versions);
+        if (!latestVersion) continue;
+        const metadata = buildNpmMetadataFromVpm(name, versions);
+        const cached = await readMetadataCache(searchUpstream.host, name);
+        if (cached?.metadata) {
+          mergeShasumFromCache(metadata, cached.metadata);
+        }
+        if (metadata?.versions && typeof metadata.versions === "object") {
+          for (const [version, node] of Object.entries<any>(metadata.versions)) {
+            node.dist = node.dist ?? {};
+            node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, name, version);
+          }
+        }
+        await writeMetadataCache(searchUpstream.host, name, {
+          latestVersion,
+          author: extractAuthor(metadata?.author),
+          displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+          metadata
+        });
+      }
+
+      const sliced = matches.slice(from, from + size);
+      const now = new Date().toISOString();
+      reply.type("application/json").send({
+        objects: sliced.map((p) => ({
+          package: {
+            name: p.name,
+            version: p.version,
+            description: p.description,
+            date: p.date
+          },
+          score: { final: 1, detail: {} },
+          searchScore: 1
+        })),
+        total: matches.length,
+        time: now
+      });
+      return;
+    } catch {
+      reply.code(200);
+      sendEmptySearch(reply);
+      return;
+    }
+  }
+
   if (searchUpstream.baseUrl !== defaultUpstream.baseUrl) {
     const u = new URL(`${searchUpstream.baseUrl}/-/v1/search`);
     u.searchParams.set("text", text);
@@ -461,15 +825,157 @@ async function proxyGroupNpm(
   groupEnc: string,
   restPath: string
 ): Promise<void> {
-  const packageName = extractPackageName(restPath);
-  const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
-  const upstreamUrl = getUpstreamBaseForGroup(upstream, groupEnc, restPath);
+  const normalizedRest = restPath.replace(/^\/+/, "");
   const headers = buildUpstreamHeaders(req.headers as any);
+
+  if (normalizedRest.startsWith("npm/")) {
+    const parts = normalizedRest.split("/").filter(Boolean);
+    if (parts.length >= 4 && parts[2] === "-") {
+      const decodedName = decodeURIComponent(parts[1] ?? "");
+      const decodedFile = decodeURIComponent(parts[3] ?? "");
+      const prefix = `${decodedName}-`;
+      if (decodedName && decodedFile.startsWith(prefix) && decodedFile.endsWith(".tgz")) {
+        const decodedVersion = decodedFile.slice(prefix.length, -4);
+        const handled = await serveVpmTarball(
+          req,
+          reply,
+          normalizedRest,
+          decodedName,
+          decodedVersion,
+          decodedFile,
+          headers
+        );
+        if (handled) {
+          return;
+        }
+      }
+    }
+  }
+
+  if (normalizedRest.startsWith("vpm/")) {
+    const parts = normalizedRest.split("/").filter(Boolean);
+    const encodedName = parts[1] ?? "";
+    const encodedVersion = parts[2] ?? "";
+    const decodedName = decodeURIComponent(encodedName);
+    const decodedFile = decodeURIComponent(encodedVersion);
+    let decodedVersion = "";
+    let cacheKey = "";
+    if (decodedFile.endsWith(".tgz")) {
+      const base = decodedFile.slice(0, -4);
+      const prefix = `${decodedName}-`;
+      decodedVersion = base.startsWith(prefix) ? base.slice(prefix.length) : base;
+      cacheKey = decodedFile;
+    } else {
+      decodedVersion = decodedFile;
+      cacheKey = decodedFile ? `${decodedFile}.tgz` : "";
+    }
+
+    if (!decodedName) {
+      reply.code(404).send();
+      return;
+    }
+
+    if (!decodedVersion || !cacheKey) {
+      reply.code(404).send();
+      return;
+    }
+
+    const handled = await serveVpmTarball(
+      req,
+      reply,
+      normalizedRest,
+      decodedName,
+      decodedVersion,
+      cacheKey,
+      headers
+    );
+    if (!handled) {
+      reply.code(404).send();
+    }
+    return;
+  }
+
+  const packageName = extractPackageName(normalizedRest);
+  const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
+  const upstreamUrl = getUpstreamBaseForGroup(upstream, groupEnc, normalizedRest);
+
+  if (upstream.type === "vpm") {
+    if (!packageName) {
+      reply.code(404).send();
+      return;
+    }
+
+    try {
+      const index = await fetchVpmIndex(upstream, headers);
+      const versions = index.packages?.[packageName]?.versions;
+      if (!versions) {
+        await deletePackageCache(upstream, packageName);
+        reply.code(404).send();
+        return;
+      }
+
+      const latestVersion = pickLatestVpmVersion(versions);
+      const cached = await readMetadataCache(upstream.host, packageName);
+      if (cached && latestVersion && cached.latestVersion === latestVersion) {
+        const response = JSON.parse(JSON.stringify(cached.metadata));
+        if (response?.versions && typeof response.versions === "object") {
+          for (const [version, node] of Object.entries<any>(response.versions)) {
+            node.dist = node.dist ?? {};
+            node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, packageName, version);
+          }
+        }
+        try {
+          await writeMetadataCache(upstream.host, packageName, {
+            latestVersion: cached.latestVersion,
+            author: cached.author,
+            displayName: cached.displayName,
+            metadata: response
+          });
+        } catch {
+          // cache update is best-effort
+        }
+        reply.code(200);
+        reply.type("application/json").send(stripVpmOriginal(filterMetadataByShasum(response)));
+        return;
+      }
+
+      const metadata = buildNpmMetadataFromVpm(packageName, versions);
+      const cachedForMerge = await readMetadataCache(upstream.host, packageName);
+      if (cachedForMerge?.metadata) {
+        mergeShasumFromCache(metadata, cachedForMerge.metadata);
+      }
+      if (metadata?.versions && typeof metadata.versions === "object") {
+        for (const [version, node] of Object.entries<any>(metadata.versions)) {
+          node.dist = node.dist ?? {};
+          node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, packageName, version);
+        }
+      }
+
+      if (latestVersion) {
+        await writeMetadataCache(upstream.host, packageName, {
+          latestVersion,
+          author: extractAuthor(metadata?.author),
+          displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+          metadata
+        });
+      }
+
+      reply.code(200);
+      reply.header("cache-control", "no-cache");
+      reply.type("application/json").send(stripVpmOriginal(filterMetadataByShasum(metadata)));
+      return;
+    } catch {
+      reply.code(404).send();
+      return;
+    }
+  }
 
   const method = req.method.toUpperCase();
   const body = method === "GET" || method === "HEAD" ? undefined : (req.body as any);
-  const isTarball = (method === "GET" || method === "HEAD") && restPath.endsWith(".tgz");
-  const tarballFilename = isTarball ? extractTarballFilenameFromPath(restPath) : null;
+  const isTarball =
+    (method === "GET" || method === "HEAD") &&
+    (normalizedRest.endsWith(".tgz") || normalizedRest.endsWith(".zip"));
+  const tarballFilename = isTarball ? extractTarballFilenameFromPath(normalizedRest) : null;
 
   if (isTarball && packageName && tarballFilename) {
     const cachedBuffer = await readTarballCache(upstream.host, packageName, tarballFilename);
@@ -543,6 +1049,10 @@ async function proxyGroupNpm(
 }
 
 const routes: FastifyPluginAsync = async (app) => {
+  app.addHook("onRequest", async (req, _reply) => {
+    req.log.info({ method: req.method, url: req.url }, "req_in");
+  });
+
   app.register(
     async (r) => {
       r.get<{

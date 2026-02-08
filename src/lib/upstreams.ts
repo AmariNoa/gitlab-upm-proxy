@@ -12,11 +12,13 @@ export type UpstreamEntry = {
   baseUrl: string;
   scopes?: string[];
   host: string;
+  type: "npm" | "vpm";
 };
 
 type RawEntry = {
   baseUrl?: string;
   scopes?: string[];
+  type?: string;
 };
 
 type RawConfig = {
@@ -39,10 +41,13 @@ function toEntry(raw: RawEntry, context: string): UpstreamEntry {
   }
   const normalized = normalizeBaseUrl(raw.baseUrl);
   const host = new URL(normalized).host;
+  const rawType = typeof raw.type === "string" ? raw.type.toLowerCase() : "npm";
+  const type = rawType === "vpm" ? "vpm" : "npm";
   return {
     baseUrl: normalized,
     scopes: raw.scopes ?? [],
-    host
+    host,
+    type
   };
 }
 
