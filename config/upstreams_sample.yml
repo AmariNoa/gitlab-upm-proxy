@@ -8,3 +8,7 @@ upstreams:
   - baseUrl: https://package.openupm.com
     scopes:
       - com.fuga.*
+  - baseUrl: https://vpm.example.com/vpm.json
+    scopes:
+      - com.example.*
+    type: vpm

@@ -135,6 +135,7 @@ function sendEmptySearch(reply: any): void {
 }
 
 type VpmIndex = {
+  author?: unknown;
   packages?: Record<string, { versions?: Record<string, any> }>;
 };
 
@@ -224,7 +225,7 @@ function buildNpmMetadataFromVpm(
       version: String(node?.version ?? version),
       description: typeof node?.description === "string" ? node.description : "",
       displayName: typeof node?.displayName === "string" ? node.displayName : undefined,
-      author: node?.author ?? undefined,
+      author: normalizeAuthor(node?.author),
       dependencies: Object.keys(normalizedDeps).length > 0 ? normalizedDeps : undefined,
       dist: {
         tarball: "",
@@ -239,6 +240,24 @@ function buildNpmMetadataFromVpm(
   }
 
   return out;
+}
+
+function normalizeAuthor(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value === "string") {
+    return { name: value };
+  }
+  if (value && typeof value === "object" && "name" in value) {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function applyAuthorIfMissing(node: any, authorValue: unknown): void {
+  if (!node || node.author) return;
+  const normalized = normalizeAuthor(authorValue);
+  if (normalized && typeof normalized.name === "string" && normalized.name.length > 0) {
+    node.author = normalized;
+  }
 }
 
 function mergeShasumFromCache(target: any, cached: any): void {
@@ -274,6 +293,37 @@ function filterMetadataByShasum(metadata: any): any {
   return metadata;
 }
 
+async function fillAuthorFromTgzIfNeeded(
+  upstream: UpstreamEntry,
+  packageName: string,
+  version: string,
+  node: any
+): Promise<void> {
+  if (node?.author) return;
+  const cacheKey = `${packageName}-${version}.tgz`;
+  const hasCache = await hasTarballCache(upstream.host, packageName, cacheKey);
+  if (!hasCache) return;
+  const tgzPath = getTarballCachePath(upstream.host, packageName, cacheKey);
+  const info = await readPackageInfoFromTarballPath(tgzPath);
+  if (info.author) {
+    node.author = { name: info.author };
+  }
+}
+
+async function refreshCachedVpmMetadata(
+  upstream: UpstreamEntry,
+  packageName: string,
+  metadata: any
+): Promise<void> {
+  const latestVersion = pickLatestVpmVersion(metadata?.versions);
+  await writeMetadataCache(upstream.host, packageName, {
+    latestVersion: latestVersion ?? "",
+    author: extractAuthor(metadata?.author),
+    displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+    metadata
+  });
+}
+
 function buildVpmTarballProxyUrl(
   groupEnc: string,
   packageName: string,
@@ -295,7 +345,8 @@ async function unzipToDirectory(zipPath: string, targetDir: string): Promise<voi
 async function convertZipBufferToTgz(
   zipBuffer: Buffer,
   targetTgzPath: string,
-  tempRoot: string
+  tempRoot: string,
+  vpmAuthor?: unknown
 ): Promise<void> {
   await mkdir(tempRoot, { recursive: true });
   await mkdir(dirname(targetTgzPath), { recursive: true });
@@ -307,6 +358,27 @@ async function convertZipBufferToTgz(
     await writeFile(zipPath, zipBuffer);
     await unzipToDirectory(zipPath, extractDir);
     const rootDir = await findPackageRoot(extractDir);
+    if (vpmAuthor) {
+      const packageJsonPath = join(rootDir, "package.json");
+      try {
+        const raw = await readFile(packageJsonPath, "utf-8");
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (!parsed.author) {
+          const normalized =
+            typeof vpmAuthor === "string"
+              ? { name: vpmAuthor }
+              : vpmAuthor && typeof vpmAuthor === "object" && "name" in vpmAuthor
+                ? vpmAuthor
+                : null;
+          if (normalized) {
+            parsed.author = normalized;
+          }
+          await writeFile(packageJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
+        }
+      } catch {
+        // ignore when package.json is missing or invalid
+      }
+    }
     const entries = await readdir(rootDir);
     await tar.c(
       {
@@ -329,6 +401,9 @@ function stripVpmOriginal(metadata: any): any {
     if (v?.dist && typeof v.dist === "object" && "original" in v.dist) {
       delete v.dist.original;
     }
+  }
+  if ("_vpmAuthor" in metadata) {
+    delete metadata._vpmAuthor;
   }
   return metadata;
 }
@@ -370,6 +445,7 @@ async function serveVpmTarball(
     cachedMetadata?.metadata?.versions && typeof cachedMetadata.metadata.versions === "object"
       ? cachedMetadata.metadata.versions[decodedVersion]
       : undefined;
+  const vpmAuthor = cachedMetadata?.metadata?._vpmAuthor;
   const tarballUrl = typeof versionNode?.dist?.original === "string" ? versionNode.dist.original : "";
   if (!tarballUrl) {
     reply.code(404).send();
@@ -379,7 +455,7 @@ async function serveVpmTarball(
   try {
     const buffer = await fetchBufferWithRedirects(tarballUrl, headers);
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
-    await convertZipBufferToTgz(buffer, tgzPath, TARBALL_CACHE_DIR);
+    await convertZipBufferToTgz(buffer, tgzPath, TARBALL_CACHE_DIR, vpmAuthor);
     const tgzBuffer = await readFile(tgzPath);
     const shasum = computeSha1(tgzBuffer);
 
@@ -387,6 +463,7 @@ async function serveVpmTarball(
       const cachedVersionNode = cachedMetadata.metadata.versions[decodedVersion];
       if (cachedVersionNode?.dist) {
         cachedVersionNode.dist.shasum = shasum;
+        applyAuthorIfMissing(cachedVersionNode, vpmAuthor);
         await writeMetadataCache(vpmUpstream.host, decodedName, {
           latestVersion: cachedMetadata.latestVersion,
           author: cachedMetadata.author,
@@ -690,6 +767,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
     const headers = buildUpstreamHeaders(req.headers as any);
     try {
       const index = await fetchVpmIndex(searchUpstream, headers);
+      const vpmAuthor = index.author;
       const packages = index.packages ?? {};
       const matches = Object.entries(packages)
         .filter(([name]) => (text ? name.includes(text) : true))
@@ -703,6 +781,9 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
         const latestVersion = pickLatestVpmVersion(versions);
         if (!latestVersion) continue;
         const metadata = buildNpmMetadataFromVpm(name, versions);
+        if (vpmAuthor) {
+          metadata._vpmAuthor = vpmAuthor;
+        }
         const cached = await readMetadataCache(searchUpstream.host, name);
         if (cached?.metadata) {
           mergeShasumFromCache(metadata, cached.metadata);
@@ -932,6 +1013,7 @@ async function proxyGroupNpm(
 
     try {
       const index = await fetchVpmIndex(upstream, headers);
+      const vpmAuthor = index.author;
       const versions = index.packages?.[packageName]?.versions;
       if (!versions) {
         await deletePackageCache(upstream, packageName);
@@ -947,15 +1029,11 @@ async function proxyGroupNpm(
           for (const [version, node] of Object.entries<any>(response.versions)) {
             node.dist = node.dist ?? {};
             node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, packageName, version);
+            await fillAuthorFromTgzIfNeeded(upstream, packageName, version, node);
           }
         }
         try {
-          await writeMetadataCache(upstream.host, packageName, {
-            latestVersion: cached.latestVersion,
-            author: cached.author,
-            displayName: cached.displayName,
-            metadata: response
-          });
+          await refreshCachedVpmMetadata(upstream, packageName, response);
         } catch {
           // cache update is best-effort
         }
@@ -965,6 +1043,9 @@ async function proxyGroupNpm(
       }
 
       const metadata = buildNpmMetadataFromVpm(packageName, versions);
+      if (vpmAuthor) {
+        metadata._vpmAuthor = vpmAuthor;
+      }
       const cachedForMerge = await readMetadataCache(upstream.host, packageName);
       if (cachedForMerge?.metadata) {
         mergeShasumFromCache(metadata, cachedForMerge.metadata);
@@ -973,16 +1054,12 @@ async function proxyGroupNpm(
         for (const [version, node] of Object.entries<any>(metadata.versions)) {
           node.dist = node.dist ?? {};
           node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, packageName, version);
+          await fillAuthorFromTgzIfNeeded(upstream, packageName, version, node);
         }
       }
 
       if (latestVersion) {
-        await writeMetadataCache(upstream.host, packageName, {
-          latestVersion,
-          author: extractAuthor(metadata?.author),
-          displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-          metadata
-        });
+        await refreshCachedVpmMetadata(upstream, packageName, metadata);
       }
 
       reply.code(200);

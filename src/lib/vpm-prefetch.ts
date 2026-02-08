@@ -10,6 +10,7 @@ import { getTarballCachePath, readMetadataCache, writeMetadataCache } from "./ca
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 
 type VpmIndex = {
+  author?: unknown;
   packages?: Record<string, { versions?: Record<string, any> }>;
 };
 
@@ -81,10 +82,30 @@ async function findPackageRoot(extractDir: string): Promise<string> {
   return extractDir;
 }
 
+async function readAuthorFromTgz(tgzPath: string): Promise<unknown> {
+  const tempDir = await mkdtemp(join(dirname(tgzPath), "extract-"));
+  try {
+    await tar.x({
+      file: tgzPath,
+      cwd: tempDir,
+      filter: (p) => p === "package/package.json"
+    });
+    const packageJsonPath = join(tempDir, "package", "package.json");
+    const raw = await readFile(packageJsonPath, "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return parsed.author;
+  } catch {
+    return undefined;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 async function convertZipBufferToTgz(
   zipBuffer: Buffer,
   targetTgzPath: string,
-  tempRoot: string
+  tempRoot: string,
+  vpmAuthor?: unknown
 ): Promise<Buffer> {
   await mkdir(tempRoot, { recursive: true });
   await mkdir(dirname(targetTgzPath), { recursive: true });
@@ -96,6 +117,27 @@ async function convertZipBufferToTgz(
     await writeFile(zipPath, zipBuffer);
     await unzipToDirectory(zipPath, extractDir);
     const rootDir = await findPackageRoot(extractDir);
+    if (vpmAuthor) {
+      const packageJsonPath = join(rootDir, "package.json");
+      try {
+        const raw = await readFile(packageJsonPath, "utf-8");
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        if (!parsed.author) {
+          const normalized =
+            typeof vpmAuthor === "string"
+              ? { name: vpmAuthor }
+              : vpmAuthor && typeof vpmAuthor === "object" && "name" in vpmAuthor
+                ? vpmAuthor
+                : null;
+          if (normalized) {
+            parsed.author = normalized;
+          }
+          await writeFile(packageJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
+        }
+      } catch {
+        // ignore when package.json is missing or invalid
+      }
+    }
     const entries = await readdir(rootDir);
     await tar.c(
       {
@@ -149,7 +191,7 @@ function buildNpmMetadataFromVpm(
       version: String(node?.version ?? version),
       description: typeof node?.description === "string" ? node.description : "",
       displayName: typeof node?.displayName === "string" ? node.displayName : undefined,
-      author: node?.author ?? undefined,
+      author: normalizeAuthor(node?.author),
       dist: {
         tarball: "",
         original: sourceUrl
@@ -158,6 +200,24 @@ function buildNpmMetadataFromVpm(
   }
 
   return out;
+}
+
+function normalizeAuthor(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value === "string") {
+    return { name: value };
+  }
+  if (value && typeof value === "object" && "name" in value) {
+    return value as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function applyAuthorIfMissing(node: any, authorValue: unknown): void {
+  if (!node || node.author) return;
+  const normalized = normalizeAuthor(authorValue);
+  if (normalized && typeof normalized.name === "string" && normalized.name.length > 0) {
+    node.author = normalized;
+  }
 }
 
 function shouldIncludePackage(name: string, scopes: string[] | undefined): boolean {
@@ -182,6 +242,7 @@ async function prefetchForUpstream(
   log: { info: (obj: any, msg?: string) => void }
 ): Promise<void> {
   const index = await fetchVpmIndex(upstream);
+  const vpmAuthor = index.author;
   const packages = index.packages ?? {};
   const metadataByPackage = new Map<string, any>();
   const delay = async () => {
@@ -194,6 +255,9 @@ async function prefetchForUpstream(
     if (!versions) continue;
     const cached = await readMetadataCache(upstream.host, name);
     const metadata = cached?.metadata ?? buildNpmMetadataFromVpm(name, versions);
+    if (vpmAuthor) {
+      metadata._vpmAuthor = vpmAuthor;
+    }
     metadataByPackage.set(name, metadata);
 
     const versionEntries = Object.entries<any>(metadata.versions ?? {}).sort(([a], [b]) => {
@@ -209,14 +273,28 @@ async function prefetchForUpstream(
       const cacheKey = `${name}-${version}.tgz`;
       const tgzPath = getTarballCachePath(upstream.host, name, cacheKey);
       const exists = await stat(tgzPath).then(() => true).catch(() => false);
-      if (!exists) {
-        await delay();
-        const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
-        await convertZipBufferToTgz(zipBuffer, tgzPath, cacheRoot);
-        log.info({ packageName: name, version }, "vpm_prefetch_done");
+      const hasAuthor = !!node?.author;
+      let needsRebuild = !exists;
+      if (!needsRebuild && !hasAuthor && vpmAuthor) {
+        const currentAuthor = await readAuthorFromTgz(tgzPath);
+        if (!currentAuthor) {
+          needsRebuild = true;
+        }
+      }
+      if (needsRebuild) {
+        try {
+          await delay();
+          const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
+          await convertZipBufferToTgz(zipBuffer, tgzPath, cacheRoot, vpmAuthor);
+          log.info({ packageName: name, version }, "vpm_prefetch_done");
+        } catch (err) {
+          log.info({ err, packageName: name, version }, "vpm_prefetch_skip");
+          continue;
+        }
       }
       const tgzBuffer = await readFile(tgzPath);
       node.dist.shasum = computeSha1(tgzBuffer);
+      applyAuthorIfMissing(node, vpmAuthor);
       await writeMetadataCache(upstream.host, name, {
         latestVersion: pickLatestWithShasum(metadata),
         author: typeof metadata?.author === "string" ? metadata.author : undefined,
