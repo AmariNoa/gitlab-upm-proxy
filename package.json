@@ -1,6 +1,6 @@
 {
   "name": "gitlab-upm-proxy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "This project was bootstrapped with Fastify-CLI.",
   "main": "app.ts",
   "directories": {
@@ -12,7 +12,7 @@
     "build:ts": "tsc",
     "watch:ts": "tsc -w",
     "dev": "npm run build:ts && concurrently -k -p \"[{name}]\" -n \"TypeScript,App\" -c \"yellow.bold,cyan.bold\" \"npm:watch:ts\" \"npm:dev:start\"",
-    "dev:start": "fastify start --ignore-watch=.ts$ --ignore-watch=data -w -l info -P dist/app.js"
+    "dev:start": "fastify start -l info -P dist/app.js"
   },
   "keywords": [],
   "author": "AmariNoa",
@@ -20,7 +20,7 @@
   "dependencies": {
     "@fastify/autoload": "^6.0.0",
     "@fastify/sensible": "^6.0.0",
-    "fastify": "^5.0.0",
+    "fastify": "^5.7.3",
     "fastify-cli": "^7.4.1",
     "fastify-plugin": "^5.0.0",
     "semver": "^7.7.2",
