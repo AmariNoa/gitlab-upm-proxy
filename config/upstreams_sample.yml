@@ -1,5 +1,5 @@
 default:
-  - baseUrl: https://gitlab.sample.domain
+  - baseUrl: https://gitlab.example.com
 upstreams:
   - baseUrl: https://registry.npmjs.org
     scopes:

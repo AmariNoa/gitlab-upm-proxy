@@ -83,7 +83,7 @@ Sample config (`config/upstreams_sample.yml`). Copy this to `config/upstreams.ym
 
 ````
 default:
-  - baseUrl: https://gitlab.sample.domain
+  - baseUrl: https://gitlab.example.com
 upstreams:
   - baseUrl: https://registry.npmjs.org
     scopes:
@@ -93,6 +93,192 @@ upstreams:
     scopes:
       - com.fuga.*
 ````
+
+---
+
+## Installation Guide (Ubuntu Server + n)
+
+This guide assumes a fresh Ubuntu Server and uses `n` to manage Node.js.  
+All steps are manual (no files are modified by this README).
+
+### 1) System prerequisites
+
+```bash
+sudo apt-get update
+sudo apt-get upgrade -y
+sudo apt-get install -y git curl build-essential
+```
+
+### 2) Install npm (bootstrap)
+
+```bash
+sudo apt-get install -y npm
+```
+
+### 3) Node.js with `n`
+
+```bash
+sudo npm install -g n
+sudo n 20
+node -v
+npm -v
+```
+
+### 4) Install `fastify-cli` globally
+
+```bash
+sudo npm install -g fastify-cli
+which fastify
+# Example: /usr/local/bin/fastify
+```
+
+### 5) Clone the repository
+
+```bash
+sudo mkdir -p /opt/gitlab-upm-proxy
+sudo chown -R $USER:$USER /opt/gitlab-upm-proxy
+git clone https://github.com/AmariNoa/gitlab-upm-proxy.git /opt/gitlab-upm-proxy
+cd /opt/gitlab-upm-proxy
+```
+
+### 6) Install dependencies and build
+
+```bash
+npm install
+npm run build:ts
+```
+
+### 7) Create `upstreams.yml`
+
+Create `/opt/gitlab-upm-proxy/config/upstreams.yml` and update the URLs/scopes:
+
+```yaml
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://registry.npmjs.org
+    scopes:
+      - jp.hoge.*
+      - com.piyo.*
+  - baseUrl: https://package.openupm.com
+    scopes:
+      - com.fuga.*
+```
+
+### 8) Create `dist/plugins`
+
+```bash
+mkdir -p /opt/gitlab-upm-proxy/dist/plugins
+```
+
+### 9) Create cache directory
+
+```bash
+sudo mkdir -p /var/lib/gitlab-upm-proxy/cache
+sudo chown -R $USER:$USER /var/lib/gitlab-upm-proxy /var/lib/gitlab-upm-proxy/cache
+```
+
+### 10) Create systemd service
+
+Create `/etc/systemd/system/gitlab-upm-proxy.service`:
+
+```
+[Unit]
+Description=gitlab-upm-proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gitlab-upm-proxy
+ExecStart=/usr/local/bin/fastify start -l info -a 0.0.0.0 -p 3000 /opt/gitlab-upm-proxy/dist/app.js
+Environment=PUBLIC_BASE_URL=https://upm.example.com
+Environment=TARBALL_CACHE_DIR=/var/lib/gitlab-upm-proxy/cache
+Environment=UPSTREAM_CONFIG_PATH=/opt/gitlab-upm-proxy/config/upstreams.yml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable gitlab-upm-proxy
+sudo systemctl start gitlab-upm-proxy
+sudo systemctl status gitlab-upm-proxy
+```
+
+### 11) Nginx reverse proxy (HTTP -> HTTPS)
+
+```bash
+sudo apt-get install -y nginx
+```
+
+Create `/etc/nginx/sites-available/upm.example.com.conf`:
+
+```
+server {
+    listen 80;
+    server_name upm.example.com;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name upm.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/upm.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/upm.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 30s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}
+```
+
+Enable and reload:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/upm.example.com.conf /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### 12) HTTPS with Let’s Encrypt
+
+```bash
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d upm.example.com
+```
+
+### 13) Firewall (optional)
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status
+```
+
+### 14) Smoke test
+
+```bash
+curl -I https://upm.example.com
+curl "http://127.0.0.1:3000/api/v4/groups/<groupEnc>/-/v1/search?text=com.example&from=0&size=10"
+```
 
 ---
 
