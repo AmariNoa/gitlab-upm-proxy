@@ -195,12 +195,37 @@ function buildNpmMetadataFromVpm(
 
   for (const [version, node] of Object.entries<any>(versions)) {
     const sourceUrl = typeof node?.url === "string" ? node.url : "";
+    const deps =
+      node?.dependencies && typeof node.dependencies === "object" ? node.dependencies : undefined;
+    const vpmDeps =
+      node?.vpmDependencies && typeof node.vpmDependencies === "object"
+        ? node.vpmDependencies
+        : undefined;
+    const mergedDeps = { ...(deps ?? {}), ...(vpmDeps ?? {}) };
+    const normalizedDeps: Record<string, string> = {};
+    for (const [depName, depRange] of Object.entries(mergedDeps)) {
+      if (typeof depRange !== "string") continue;
+      const exact = semver.valid(depRange);
+      if (exact) {
+        normalizedDeps[depName] = exact;
+        continue;
+      }
+      const normalizedRange = depRange.replace(
+        /<(\d+\.\d+\.\d+)-[A-Za-z][^ ]*/g,
+        "<$1-0"
+      );
+      const min = semver.minVersion(normalizedRange);
+      if (min) {
+        normalizedDeps[depName] = min.version;
+      }
+    }
     out.versions[version] = {
       name: String(node?.name ?? packageName),
       version: String(node?.version ?? version),
       description: typeof node?.description === "string" ? node.description : "",
       displayName: typeof node?.displayName === "string" ? node.displayName : undefined,
       author: node?.author ?? undefined,
+      dependencies: Object.keys(normalizedDeps).length > 0 ? normalizedDeps : undefined,
       dist: {
         tarball: "",
         original: sourceUrl
