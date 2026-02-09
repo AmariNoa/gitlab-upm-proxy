@@ -286,14 +286,14 @@ async function prefetchForUpstream(
       const tgzPath = getTarballCachePath(upstream.host, name, cacheKey);
       const exists = await stat(tgzPath).then(() => true).catch(() => false);
       const hasAuthor = !!node?.author;
-      let needsRebuild = !exists;
-      if (!needsRebuild && !hasAuthor && vpmAuthor) {
+      let needsDownload = !exists;
+      if (!needsDownload && !hasAuthor && vpmAuthor) {
         const currentAuthor = await readAuthorFromTgz(tgzPath);
         if (!currentAuthor) {
-          needsRebuild = true;
+          needsDownload = true;
         }
       }
-      if (needsRebuild) {
+      if (needsDownload) {
         try {
           await delay();
           const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
@@ -359,14 +359,14 @@ async function prefetchForPackage(
     const tgzPath = getTarballCachePath(upstream.host, packageName, cacheKey);
     const exists = await stat(tgzPath).then(() => true).catch(() => false);
     const hasAuthor = !!node?.author;
-    let needsRebuild = !exists || !node?.dist?.shasum;
-    if (!needsRebuild && !hasAuthor && vpmAuthor) {
+    let needsDownload = !exists;
+    if (!needsDownload && !hasAuthor && vpmAuthor) {
       const currentAuthor = await readAuthorFromTgz(tgzPath);
       if (!currentAuthor) {
-        needsRebuild = true;
+        needsDownload = true;
       }
     }
-    if (needsRebuild) {
+    if (needsDownload) {
       if (intervalMs > 0) await sleep(intervalMs);
       try {
         const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
