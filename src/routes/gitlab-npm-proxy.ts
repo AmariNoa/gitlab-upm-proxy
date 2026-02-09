@@ -349,9 +349,8 @@ async function convertZipBufferToTgz(
   tempRoot: string,
   vpmAuthor?: unknown
 ): Promise<void> {
-  await mkdir(tempRoot, { recursive: true });
   await mkdir(dirname(targetTgzPath), { recursive: true });
-  const tempDir = await mkdtemp(join(tempRoot, "vpm-"));
+  const tempDir = await mkdtemp(join(dirname(targetTgzPath), "vpm-"));
   const zipPath = join(tempDir, "package.zip");
   const extractDir = join(tempDir, "extract");
   try {
