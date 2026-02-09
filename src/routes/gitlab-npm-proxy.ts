@@ -24,6 +24,7 @@ import {
   selectUpstreamForScopeText,
   UpstreamEntry
 } from "../lib/upstreams";
+import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
 
 function mustEnv(name: string): string {
   const v = process.env[name];
@@ -778,13 +779,21 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
         if (text && !name.includes(text)) continue;
         const versions = pkg?.versions;
         if (!versions) continue;
+        const cached = await readMetadataCache(searchUpstream.host, name);
+        const cachedVersions = cached?.metadata?.versions ?? {};
+        const needsPrefetch = Object.keys(versions).some((version) => {
+          const cachedNode = cachedVersions?.[version];
+          return !cachedNode?.dist?.shasum;
+        });
+        if (needsPrefetch) {
+          startVpmPrefetchForPackage(req.log, searchUpstream, name, versions, vpmAuthor);
+        }
         const latestVersion = pickLatestVpmVersion(versions);
         if (!latestVersion) continue;
         const metadata = buildNpmMetadataFromVpm(name, versions);
         if (vpmAuthor) {
           metadata._vpmAuthor = vpmAuthor;
         }
-        const cached = await readMetadataCache(searchUpstream.host, name);
         if (cached?.metadata) {
           mergeShasumFromCache(metadata, cached.metadata);
         }

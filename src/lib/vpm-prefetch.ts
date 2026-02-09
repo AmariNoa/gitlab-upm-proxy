@@ -220,6 +220,18 @@ function applyAuthorIfMissing(node: any, authorValue: unknown): void {
   }
 }
 
+function mergeMissingVersions(target: any, source: any): void {
+  if (!target?.versions || typeof target.versions !== "object") return;
+  if (!source?.versions || typeof source.versions !== "object") return;
+  for (const [version, node] of Object.entries<any>(source.versions)) {
+    if (!target.versions[version]) {
+      target.versions[version] = node;
+    }
+  }
+}
+
+const runningPrefetch = new Set<string>();
+
 function shouldIncludePackage(name: string, scopes: string[] | undefined): boolean {
   if (!scopes || scopes.length === 0) return true;
   return scopes.some((scope) => matchScope(name, scope));
@@ -314,6 +326,69 @@ async function prefetchForUpstream(
   }
 }
 
+async function prefetchForPackage(
+  upstream: UpstreamEntry,
+  packageName: string,
+  versions: Record<string, any>,
+  vpmAuthor: unknown,
+  cacheRoot: string,
+  intervalMs: number,
+  log: { info: (obj: any, msg?: string) => void }
+): Promise<void> {
+  const cached = await readMetadataCache(upstream.host, packageName);
+  const fresh = buildNpmMetadataFromVpm(packageName, versions);
+  const metadata = cached?.metadata ? cached.metadata : fresh;
+  if (cached?.metadata) {
+    mergeMissingVersions(metadata, fresh);
+  }
+  if (vpmAuthor) {
+    metadata._vpmAuthor = vpmAuthor;
+  }
+
+  const versionEntries = Object.entries<any>(metadata.versions ?? {}).sort(([a], [b]) => {
+    const aValid = semver.valid(a);
+    const bValid = semver.valid(b);
+    if (aValid && bValid) return semver.rcompare(aValid, bValid);
+    return b.localeCompare(a);
+  });
+
+  for (const [version, node] of versionEntries) {
+    const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
+    if (!sourceUrl) continue;
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const tgzPath = getTarballCachePath(upstream.host, packageName, cacheKey);
+    const exists = await stat(tgzPath).then(() => true).catch(() => false);
+    const hasAuthor = !!node?.author;
+    let needsRebuild = !exists || !node?.dist?.shasum;
+    if (!needsRebuild && !hasAuthor && vpmAuthor) {
+      const currentAuthor = await readAuthorFromTgz(tgzPath);
+      if (!currentAuthor) {
+        needsRebuild = true;
+      }
+    }
+    if (needsRebuild) {
+      if (intervalMs > 0) await sleep(intervalMs);
+      try {
+        const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
+        await convertZipBufferToTgz(zipBuffer, tgzPath, cacheRoot, vpmAuthor);
+        log.info({ packageName, version }, "vpm_prefetch_done");
+      } catch (err) {
+        log.info({ err, packageName, version }, "vpm_prefetch_skip");
+        continue;
+      }
+    }
+    const tgzBuffer = await readFile(tgzPath);
+    node.dist.shasum = computeSha1(tgzBuffer);
+    applyAuthorIfMissing(node, vpmAuthor);
+    await writeMetadataCache(upstream.host, packageName, {
+      latestVersion: pickLatestWithShasum(metadata),
+      author: typeof metadata?.author === "string" ? metadata.author : undefined,
+      displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+      metadata
+    });
+  }
+}
+
 async function prefetchVpmShasums(
   log: { info: (obj: any, msg?: string) => void }
 ): Promise<void> {
@@ -340,6 +415,30 @@ export function startVpmPrefetch(
       await prefetchVpmShasums(log);
     } catch (err) {
       log.info({ err }, "vpm_prefetch_failed");
+    }
+  })();
+}
+
+export function startVpmPrefetchForPackage(
+  log: { info: (obj: any, msg?: string) => void },
+  upstream: UpstreamEntry,
+  packageName: string,
+  versions: Record<string, any>,
+  vpmAuthor: unknown
+): void {
+  const key = `${upstream.host}|${packageName}`;
+  if (runningPrefetch.has(key)) return;
+  runningPrefetch.add(key);
+  void (async () => {
+    try {
+      const cacheRoot = mustEnv("TARBALL_CACHE_DIR");
+      const intervalSec = parseFloatEnv("VPM_PREFETCH_INTERVAL_SEC");
+      const intervalMs = Math.max(0, intervalSec * 1000);
+      await prefetchForPackage(upstream, packageName, versions, vpmAuthor, cacheRoot, intervalMs, log);
+    } catch (err) {
+      log.info({ err, packageName }, "vpm_prefetch_failed");
+    } finally {
+      runningPrefetch.delete(key);
     }
   })();
 }
