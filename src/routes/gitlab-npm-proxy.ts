@@ -21,7 +21,6 @@ import {
   extractPackageName,
   getUpstreamConfig,
   selectUpstream,
-  selectUpstreamForScopeText,
   UpstreamEntry
 } from "../lib/upstreams";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
@@ -124,15 +123,6 @@ function pickLatestByName(items: any[]): any[] {
   return Array.from(byName.values()).sort((a, b) =>
     String(a?.name ?? "").localeCompare(String(b?.name ?? ""))
   );
-}
-
-function sendEmptySearch(reply: any): void {
-  const now = new Date().toISOString();
-  reply.type("application/json").send({
-    objects: [],
-    total: 0,
-    time: now
-  });
 }
 
 type VpmIndex = {
@@ -326,13 +316,11 @@ async function refreshCachedVpmMetadata(
 }
 
 function buildVpmTarballProxyUrl(
-  groupEnc: string,
   packageName: string,
   version: string
 ): string {
-  const encodedName = encodeURIComponent(packageName);
   const encodedVersion = encodeURIComponent(`${packageName}-${version}.tgz`);
-  return `${PUBLIC_BASE_URL}/api/v4/groups/${groupEnc}/npm/${encodedName}/-/${encodedVersion}`;
+  return `${PUBLIC_BASE_URL}/-/${encodedVersion}`;
 }
 
 async function unzipToDirectory(zipPath: string, targetDir: string): Promise<void> {
@@ -350,7 +338,9 @@ async function convertZipBufferToTgz(
   vpmAuthor?: unknown
 ): Promise<void> {
   await mkdir(dirname(targetTgzPath), { recursive: true });
-  const tempDir = await mkdtemp(join(dirname(targetTgzPath), "vpm-"));
+  const tempDir = join(dirname(targetTgzPath), "temp");
+  await rm(tempDir, { recursive: true, force: true });
+  await mkdir(tempDir, { recursive: true });
   const zipPath = join(tempDir, "package.zip");
   const extractDir = join(tempDir, "extract");
   try {
@@ -758,120 +748,12 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   const groupEncOnce = encodeURIComponent(groupPath);
 
   const text = (req.query.text ?? "").toString();
-  const searchUpstream = text ? selectUpstreamForScopeText(text) : defaultUpstream;
   const from = Number.parseInt((req.query.from ?? "0").toString(), 10) || 0;
   const sizeRaw = Number.parseInt((req.query.size ?? "20").toString(), 10) || 20;
   const size = Math.min(Math.max(sizeRaw, 1), 250);
-
-  if (searchUpstream.type === "vpm") {
-    const headers = buildUpstreamHeaders(req.headers as any);
-    try {
-      const index = await fetchVpmIndex(searchUpstream, headers);
-      const vpmAuthor = index.author;
-      const packages = index.packages ?? {};
-      const matches = Object.entries(packages)
-        .filter(([name]) => (text ? name.includes(text) : true))
-        .map(([name, pkg]) => buildVpmSearchResult(name, pkg?.versions))
-        .filter((v): v is { name: string; version: string; description: string; date: string } => !!v);
-
-      for (const [name, pkg] of Object.entries(packages)) {
-        if (text && !name.includes(text)) continue;
-        const versions = pkg?.versions;
-        if (!versions) continue;
-        const cached = await readMetadataCache(searchUpstream.host, name);
-        const cachedVersions = cached?.metadata?.versions ?? {};
-        const needsPrefetch = Object.keys(versions).some((version) => {
-          const cachedNode = cachedVersions?.[version];
-          return !cachedNode?.dist?.shasum;
-        });
-        if (needsPrefetch) {
-          startVpmPrefetchForPackage(req.log, searchUpstream, name, versions, vpmAuthor);
-        }
-        const latestVersion = pickLatestVpmVersion(versions);
-        if (!latestVersion) continue;
-        const metadata = buildNpmMetadataFromVpm(name, versions);
-        if (vpmAuthor) {
-          metadata._vpmAuthor = vpmAuthor;
-        }
-        if (cached?.metadata) {
-          mergeShasumFromCache(metadata, cached.metadata);
-        }
-        if (metadata?.versions && typeof metadata.versions === "object") {
-          for (const [version, node] of Object.entries<any>(metadata.versions)) {
-            node.dist = node.dist ?? {};
-            node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, name, version);
-          }
-        }
-        await writeMetadataCache(searchUpstream.host, name, {
-          latestVersion,
-          author: extractAuthor(metadata?.author),
-          displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-          metadata
-        });
-      }
-
-      const sliced = matches.slice(from, from + size);
-      const now = new Date().toISOString();
-      reply.type("application/json").send({
-        objects: sliced.map((p) => ({
-          package: {
-            name: p.name,
-            version: p.version,
-            description: p.description,
-            date: p.date
-          },
-          score: { final: 1, detail: {} },
-          searchScore: 1
-        })),
-        total: matches.length,
-        time: now
-      });
-      return;
-    } catch {
-      reply.code(200);
-      sendEmptySearch(reply);
-      return;
-    }
-  }
-
-  if (searchUpstream.baseUrl !== defaultUpstream.baseUrl) {
-    const u = new URL(`${searchUpstream.baseUrl}/-/v1/search`);
-    u.searchParams.set("text", text);
-    u.searchParams.set("from", String(from));
-    u.searchParams.set("size", String(size));
-
-    const headers = buildUpstreamHeaders(req.headers as any);
-    let res;
-    try {
-      res = await request(u.toString(), { method: "GET", headers });
-    } catch {
-      reply.code(200);
-      sendEmptySearch(reply);
-      return;
-    }
-    const contentType = String(res.headers["content-type"] ?? "");
-
-    if (res.statusCode >= 400 || !contentType.includes("application/json")) {
-      reply.code(200);
-      sendEmptySearch(reply);
-      return;
-    }
-
-    try {
-      const payload = await res.body.json();
-      const normalized = normalizeSearchResponse(payload);
-      reply.code(200);
-      reply.type("application/json").send(normalized);
-    } catch {
-      reply.code(200);
-      sendEmptySearch(reply);
-    }
-    return;
-  }
-
-  const base = `${defaultUpstream.baseUrl}/api/v4/groups/${groupEncOnce}/packages`;
   const headers = buildUpstreamHeaders(req.headers as any);
 
+  const base = `${defaultUpstream.baseUrl}/api/v4/groups/${groupEncOnce}/packages`;
   const perPage = 100;
   const maxPages = 50;
   const all: any[] = [];
@@ -902,30 +784,127 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
     if (items.length < perPage) break;
   }
 
-  const filtered = all
+  const gitlabFiltered = all
     .filter((p) => p?.package_type === "npm")
     .filter((p) => {
       if (!text) return true;
       const name = String(p?.name ?? "");
       return name.includes(text);
     });
+  const gitlabLatest = pickLatestByName(gitlabFiltered).map((p) => ({
+    name: String(p?.name ?? ""),
+    version: String(p?.version ?? ""),
+    description: String(p?.description ?? ""),
+    date: p?.created_at ?? new Date().toISOString()
+  }));
 
-  const latestOnly = pickLatestByName(filtered);
-  const sliced = latestOnly.slice(from, from + size);
+  const upstreamResults: Array<{ name: string; version: string; description: string; date: string }> =
+    [];
+  const upstreams = upstreamConfig.upstreams.filter((u) => u.baseUrl !== defaultUpstream.baseUrl);
+
+  for (const upstream of upstreams) {
+    if (upstream.type === "vpm") {
+      try {
+        const index = await fetchVpmIndex(upstream, headers);
+        const vpmAuthor = index.author;
+        const packages = index.packages ?? {};
+        for (const [name, pkg] of Object.entries(packages)) {
+          if (text && !name.includes(text)) continue;
+          const versions = pkg?.versions;
+          if (!versions) continue;
+          const cached = await readMetadataCache(upstream.host, name);
+          const cachedVersions = cached?.metadata?.versions ?? {};
+          const needsPrefetch = Object.keys(versions).some((version) => {
+            const cachedNode = cachedVersions?.[version];
+            return !cachedNode?.dist?.shasum;
+          });
+          if (needsPrefetch) {
+            startVpmPrefetchForPackage(req.log, upstream, name, versions, vpmAuthor);
+          }
+          const latestVersion = pickLatestVpmVersion(versions);
+          if (!latestVersion) continue;
+          const metadata = buildNpmMetadataFromVpm(name, versions);
+          if (vpmAuthor) {
+            metadata._vpmAuthor = vpmAuthor;
+          }
+          if (cached?.metadata) {
+            mergeShasumFromCache(metadata, cached.metadata);
+          }
+          if (metadata?.versions && typeof metadata.versions === "object") {
+            for (const [version, node] of Object.entries<any>(metadata.versions)) {
+              node.dist = node.dist ?? {};
+              node.dist.tarball = buildVpmTarballProxyUrl(name, version);
+            }
+          }
+          await writeMetadataCache(upstream.host, name, {
+            latestVersion,
+            author: extractAuthor(metadata?.author),
+            displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+            metadata
+          });
+          const result = buildVpmSearchResult(name, versions);
+          if (result) {
+            upstreamResults.push(result);
+          }
+        }
+      } catch {
+        // ignore upstream failures
+      }
+      continue;
+    }
+
+    try {
+      const u = new URL(`${upstream.baseUrl}/-/v1/search`);
+      u.searchParams.set("text", text);
+      u.searchParams.set("from", "0");
+      u.searchParams.set("size", String(size));
+      const res = await request(u.toString(), { method: "GET", headers });
+      const contentType = String(res.headers["content-type"] ?? "");
+      if (res.statusCode >= 400 || !contentType.includes("application/json")) {
+        continue;
+      }
+      const payload = await res.body.json();
+      const normalized = normalizeSearchResponse(payload);
+      for (const obj of normalized.objects) {
+        const pkg = obj?.package ?? obj;
+        upstreamResults.push({
+          name: String(pkg?.name ?? ""),
+          version: String(pkg?.version ?? ""),
+          description: String(pkg?.description ?? ""),
+          date: pkg?.date ?? new Date().toISOString()
+        });
+      }
+    } catch {
+      // ignore upstream failures
+    }
+  }
+
+  const merged = new Map<string, { name: string; version: string; description: string; date: string }>();
+  for (const item of upstreamResults) {
+    if (!item.name) continue;
+    merged.set(item.name, item);
+  }
+  for (const item of gitlabLatest) {
+    if (!item.name) continue;
+    merged.set(item.name, item);
+  }
+
+  const mergedList = Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const sliced = mergedList.slice(from, from + size);
   const now = new Date().toISOString();
 
   reply.type("application/json").send({
     objects: sliced.map((p) => ({
       package: {
-        name: String(p?.name ?? ""),
-        version: String(p?.version ?? ""),
-        description: String(p?.description ?? ""),
-        date: p?.created_at ?? now
+        name: p.name,
+        version: p.version,
+        description: p.description,
+        date: p.date ?? now
       },
       score: { final: 1, detail: {} },
       searchScore: 1
     })),
-    total: latestOnly.length,
+    total: mergedList.length,
     time: now
   });
 }
@@ -1036,7 +1015,7 @@ async function proxyGroupNpm(
         if (response?.versions && typeof response.versions === "object") {
           for (const [version, node] of Object.entries<any>(response.versions)) {
             node.dist = node.dist ?? {};
-            node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, packageName, version);
+            node.dist.tarball = buildVpmTarballProxyUrl(packageName, version);
             await fillAuthorFromTgzIfNeeded(upstream, packageName, version, node);
           }
         }
@@ -1061,7 +1040,7 @@ async function proxyGroupNpm(
       if (metadata?.versions && typeof metadata.versions === "object") {
         for (const [version, node] of Object.entries<any>(metadata.versions)) {
           node.dist = node.dist ?? {};
-          node.dist.tarball = buildVpmTarballProxyUrl(groupEnc, packageName, version);
+          node.dist.tarball = buildVpmTarballProxyUrl(packageName, version);
           await fillAuthorFromTgzIfNeeded(upstream, packageName, version, node);
         }
       }
@@ -1158,9 +1137,65 @@ async function proxyGroupNpm(
   reply.send(buffer);
 }
 
+async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promise<void> {
+  const normalizedRest = restPath.replace(/^\/+/, "");
+  if (!normalizedRest.endsWith(".tgz")) {
+    reply.code(404).send();
+    return;
+  }
+
+  const filename = extractTarballFilenameFromPath(normalizedRest);
+  if (!filename) {
+    reply.code(404).send();
+    return;
+  }
+
+  const decodedFile = decodeURIComponent(filename);
+  if (!decodedFile.endsWith(".tgz")) {
+    reply.code(404).send();
+    return;
+  }
+
+  const base = decodedFile.slice(0, -4);
+  const lastDash = base.lastIndexOf("-");
+  if (lastDash <= 0) {
+    reply.code(404).send();
+    return;
+  }
+
+  const decodedName = base.slice(0, lastDash);
+  const decodedVersion = base.slice(lastDash + 1);
+  const upstream = selectUpstream(decodedName);
+  if (upstream.type !== "vpm") {
+    reply.code(404).send();
+    return;
+  }
+
+  const headers = buildUpstreamHeaders(req.headers as any);
+  const handled = await serveVpmTarball(
+    req,
+    reply,
+    `-/${decodedFile}`,
+    decodedName,
+    decodedVersion,
+    decodedFile,
+    headers
+  );
+  if (!handled) {
+    reply.code(404).send();
+  }
+}
+
 const routes: FastifyPluginAsync = async (app) => {
   app.addHook("onRequest", async (req, _reply) => {
     req.log.info({ method: req.method, url: req.url }, "req_in");
+  });
+
+  app.register(async (r) => {
+    r.all("/-/*", async (req, reply) => {
+      const restPath = (req.params as any)["*"] as string;
+      await proxyGlobalTarball(req, reply, restPath);
+    });
   });
 
   app.register(

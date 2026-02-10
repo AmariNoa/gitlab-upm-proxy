@@ -20,6 +20,16 @@ function mustEnv(name: string): string {
   return v;
 }
 
+function getPublicBaseUrl(): string {
+  return mustEnv("PUBLIC_BASE_URL").replace(/\/+$/, "");
+}
+
+function buildTarballUrl(packageName: string, version: string): string {
+  const base = getPublicBaseUrl();
+  const encodedVersion = encodeURIComponent(`${packageName}-${version}.tgz`);
+  return `${base}/-/${encodedVersion}`;
+}
+
 function getVpmIndexUrl(upstream: UpstreamEntry): string {
   return upstream.baseUrl.endsWith(".json")
     ? upstream.baseUrl
@@ -108,7 +118,9 @@ async function convertZipBufferToTgz(
   vpmAuthor?: unknown
 ): Promise<Buffer> {
   await mkdir(dirname(targetTgzPath), { recursive: true });
-  const tempDir = await mkdtemp(join(dirname(targetTgzPath), "vpm-"));
+  const tempDir = join(dirname(targetTgzPath), "temp");
+  await rm(tempDir, { recursive: true, force: true });
+  await mkdir(tempDir, { recursive: true });
   const zipPath = join(tempDir, "package.zip");
   const extractDir = join(tempDir, "extract");
   try {
@@ -185,14 +197,39 @@ function buildNpmMetadataFromVpm(
 
   for (const [version, node] of Object.entries<any>(versions)) {
     const sourceUrl = typeof node?.url === "string" ? node.url : "";
+    const deps =
+      node?.dependencies && typeof node.dependencies === "object" ? node.dependencies : undefined;
+    const vpmDeps =
+      node?.vpmDependencies && typeof node.vpmDependencies === "object"
+        ? node.vpmDependencies
+        : undefined;
+    const mergedDeps = { ...(deps ?? {}), ...(vpmDeps ?? {}) };
+    const normalizedDeps: Record<string, string> = {};
+    for (const [depName, depRange] of Object.entries(mergedDeps)) {
+      if (typeof depRange !== "string") continue;
+      const exact = semver.valid(depRange);
+      if (exact) {
+        normalizedDeps[depName] = exact;
+        continue;
+      }
+      const normalizedRange = depRange.replace(
+        /<(\d+\.\d+\.\d+)-[A-Za-z][^ ]*/g,
+        "<$1-0"
+      );
+      const min = semver.minVersion(normalizedRange);
+      if (min) {
+        normalizedDeps[depName] = min.version;
+      }
+    }
     out.versions[version] = {
       name: String(node?.name ?? packageName),
       version: String(node?.version ?? version),
       description: typeof node?.description === "string" ? node.description : "",
       displayName: typeof node?.displayName === "string" ? node.displayName : undefined,
       author: normalizeAuthor(node?.author),
+      dependencies: Object.keys(normalizedDeps).length > 0 ? normalizedDeps : undefined,
       dist: {
-        tarball: "",
+        tarball: buildTarballUrl(packageName, version),
         original: sourceUrl
       }
     };
@@ -223,8 +260,21 @@ function mergeMissingVersions(target: any, source: any): void {
   if (!target?.versions || typeof target.versions !== "object") return;
   if (!source?.versions || typeof source.versions !== "object") return;
   for (const [version, node] of Object.entries<any>(source.versions)) {
-    if (!target.versions[version]) {
+    const targetNode = target.versions[version];
+    if (!targetNode) {
       target.versions[version] = node;
+      continue;
+    }
+    if (!targetNode.dependencies && node?.dependencies) {
+      targetNode.dependencies = node.dependencies;
+    }
+    if (!targetNode.dist?.tarball && node?.dist?.tarball) {
+      targetNode.dist = targetNode.dist ?? {};
+      targetNode.dist.tarball = node.dist.tarball;
+    }
+    if (!targetNode.dist?.original && node?.dist?.original) {
+      targetNode.dist = targetNode.dist ?? {};
+      targetNode.dist.original = node.dist.original;
     }
   }
 }
@@ -281,6 +331,8 @@ async function prefetchForUpstream(
     for (const [version, node] of versionEntries) {
       const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
       if (!sourceUrl) continue;
+      node.dist = node.dist ?? {};
+      node.dist.tarball = node.dist.tarball || buildTarballUrl(name, version);
       const cacheKey = `${name}-${version}.tgz`;
       const tgzPath = getTarballCachePath(upstream.host, name, cacheKey);
       const exists = await stat(tgzPath).then(() => true).catch(() => false);
@@ -354,6 +406,8 @@ async function prefetchForPackage(
   for (const [version, node] of versionEntries) {
     const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
     if (!sourceUrl) continue;
+    node.dist = node.dist ?? {};
+    node.dist.tarball = node.dist.tarball || buildTarballUrl(packageName, version);
     const cacheKey = `${packageName}-${version}.tgz`;
     const tgzPath = getTarballCachePath(upstream.host, packageName, cacheKey);
     const exists = await stat(tgzPath).then(() => true).catch(() => false);
