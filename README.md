@@ -73,6 +73,12 @@ TARBALL_CACHE_DIR=./data/cache
 UPSTREAM_CONFIG_PATH=config/upstreams.yml
 ````
 
+Required for VPM prefetch:
+
+````
+VPM_PREFETCH_INTERVAL_SEC=0.5
+````
+
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 
@@ -103,6 +109,20 @@ upstreams:
     scopes:
       - dev.example.*
 ````
+
+### VPM Behavior
+
+- VPM packages are converted to npm-style metadata (`metadata.json`) and cached under `TARBALL_CACHE_DIR`.
+- `dependencies` merges `dependencies` and `vpmDependencies`, then normalizes ranges to Unity-compatible values.
+- `dist.tarball` is rewritten to `PUBLIC_BASE_URL/-/<package>-<version>.tgz`.
+- Only versions with `dist.shasum` are returned in VPM metadata responses.
+- Author is normalized to `{ "name": "..." }`. If missing, it is injected into the tgz `package.json` from the VPM index author.
+
+### Auth Enforcement
+
+- Every request must include a valid GitLab PAT; the proxy validates it against the default GitLab (`/api/v4/user`).
+- If the PAT is missing or invalid, the proxy returns `401`.
+- PAT headers are forwarded only to the default GitLab upstream. Other upstreams receive no auth headers.
 
 ---
 
