@@ -77,6 +77,62 @@ function buildUpstreamHeaders(reqHeaders: Record<string, unknown>): Record<strin
   return out;
 }
 
+function buildUpstreamHeadersFor(
+  upstream: UpstreamEntry,
+  reqHeaders: Record<string, unknown>
+): Record<string, string> {
+  const headers = buildUpstreamHeaders(reqHeaders);
+  if (upstream.baseUrl !== defaultUpstream.baseUrl) {
+    delete headers["Authorization"];
+    delete headers["PRIVATE-TOKEN"];
+  }
+  return headers;
+}
+
+function extractPat(reqHeaders: Record<string, unknown>): string | null {
+  const auth =
+    (typeof reqHeaders["authorization"] === "string" ? (reqHeaders["authorization"] as string) : "") ||
+    (typeof reqHeaders["Authorization"] === "string" ? (reqHeaders["Authorization"] as string) : "");
+  if (auth) return auth;
+  const token =
+    (typeof reqHeaders["private-token"] === "string" ? (reqHeaders["private-token"] as string) : "") ||
+    (typeof reqHeaders["PRIVATE-TOKEN"] === "string" ? (reqHeaders["PRIVATE-TOKEN"] as string) : "") ||
+    (typeof reqHeaders["Private-Token"] === "string" ? (reqHeaders["Private-Token"] as string) : "");
+  if (token) return `PRIVATE-TOKEN ${token}`;
+  return null;
+}
+
+async function validateGitlabPat(req: any, reply: any): Promise<boolean> {
+  const pat = extractPat(req.headers as Record<string, unknown>);
+  if (!pat) {
+    reply.code(401).send({ error: "missing_token" });
+    return false;
+  }
+
+  const headers: Record<string, string> = {};
+  if (pat.startsWith("PRIVATE-TOKEN ")) {
+    headers["PRIVATE-TOKEN"] = pat.slice("PRIVATE-TOKEN ".length);
+  } else {
+    headers["Authorization"] = pat;
+  }
+
+  try {
+    const res = await request(`${defaultUpstream.baseUrl}/api/v4/user`, {
+      method: "GET",
+      headers
+    });
+    if (res.statusCode >= 400) {
+      reply.code(401).send({ error: "invalid_token" });
+      return false;
+    }
+  } catch {
+    reply.code(401).send({ error: "token_check_failed" });
+    return false;
+  }
+
+  return true;
+}
+
 function applyUpstreamHeaders(
   reply: any,
   headers: Record<string, unknown>,
@@ -337,51 +393,57 @@ async function convertZipBufferToTgz(
   tempRoot: string,
   vpmAuthor?: unknown
 ): Promise<void> {
-  await mkdir(dirname(targetTgzPath), { recursive: true });
-  const tempDir = join(dirname(targetTgzPath), "temp");
-  await rm(tempDir, { recursive: true, force: true });
-  await mkdir(tempDir, { recursive: true });
-  const zipPath = join(tempDir, "package.zip");
-  const extractDir = join(tempDir, "extract");
-  try {
-    await mkdir(extractDir, { recursive: true });
-    await writeFile(zipPath, zipBuffer);
-    await unzipToDirectory(zipPath, extractDir);
-    const rootDir = await findPackageRoot(extractDir);
-    if (vpmAuthor) {
-      const packageJsonPath = join(rootDir, "package.json");
-      try {
-        const raw = await readFile(packageJsonPath, "utf-8");
-        const parsed = JSON.parse(raw) as Record<string, unknown>;
-        if (!parsed.author) {
-          const normalized =
-            typeof vpmAuthor === "string"
-              ? { name: vpmAuthor }
-              : vpmAuthor && typeof vpmAuthor === "object" && "name" in vpmAuthor
-                ? vpmAuthor
-                : null;
-          if (normalized) {
-            parsed.author = normalized;
+  await withTempLock(dirname(targetTgzPath), async () => {
+    await mkdir(dirname(targetTgzPath), { recursive: true });
+    const tempDir = join(dirname(targetTgzPath), "temp");
+    await rm(tempDir, { recursive: true, force: true });
+    await mkdir(tempDir, { recursive: true });
+    const zipPath = join(tempDir, "package.zip");
+    const extractDir = join(tempDir, "extract");
+    try {
+      await mkdir(extractDir, { recursive: true });
+      await writeFile(zipPath, zipBuffer);
+      await unzipToDirectory(zipPath, extractDir);
+      const rootDir = await findPackageRoot(extractDir);
+      if (vpmAuthor) {
+        const packageJsonPath = join(rootDir, "package.json");
+        try {
+          const raw = await readFile(packageJsonPath, "utf-8");
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          if (!parsed.author) {
+            const normalized =
+              typeof vpmAuthor === "string"
+                ? { name: vpmAuthor }
+                : vpmAuthor && typeof vpmAuthor === "object" && "name" in vpmAuthor
+                  ? vpmAuthor
+                  : null;
+            if (normalized) {
+              parsed.author = normalized;
+            }
+            await writeFile(packageJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
           }
-          await writeFile(packageJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
+        } catch {
+          // ignore when package.json is missing or invalid
         }
+      }
+      const entries = await readdir(rootDir);
+      await tar.c(
+        {
+          gzip: true,
+          file: targetTgzPath,
+          cwd: rootDir,
+          prefix: "package/"
+        },
+        entries
+      );
+    } finally {
+      try {
+        await rm(tempDir, { recursive: true, force: true });
       } catch {
-        // ignore when package.json is missing or invalid
+        // ignore cleanup errors on Windows
       }
     }
-    const entries = await readdir(rootDir);
-    await tar.c(
-      {
-        gzip: true,
-        file: targetTgzPath,
-        cwd: rootDir,
-        prefix: "package/"
-      },
-      entries
-    );
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+  });
 }
 
 function stripVpmOriginal(metadata: any): any {
@@ -400,6 +462,26 @@ function stripVpmOriginal(metadata: any): any {
 
 function computeSha1(buffer: Buffer): string {
   return createHash("sha1").update(buffer).digest("hex");
+}
+
+const tempLocks = new Map<string, Promise<void>>();
+
+async function withTempLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const prev = tempLocks.get(dir) ?? Promise.resolve();
+  let release = () => {};
+  const next = new Promise<void>((resolve) => {
+    release = () => resolve();
+  });
+  tempLocks.set(dir, prev.then(() => next));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (tempLocks.get(dir) === next) {
+      tempLocks.delete(dir);
+    }
+  }
 }
 
 async function serveVpmTarball(
@@ -751,7 +833,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   const from = Number.parseInt((req.query.from ?? "0").toString(), 10) || 0;
   const sizeRaw = Number.parseInt((req.query.size ?? "20").toString(), 10) || 20;
   const size = Math.min(Math.max(sizeRaw, 1), 250);
-  const headers = buildUpstreamHeaders(req.headers as any);
+  const headers = buildUpstreamHeadersFor(defaultUpstream, req.headers as any);
 
   const base = `${defaultUpstream.baseUrl}/api/v4/groups/${groupEncOnce}/packages`;
   const perPage = 100;
@@ -805,7 +887,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   for (const upstream of upstreams) {
     if (upstream.type === "vpm") {
       try {
-        const index = await fetchVpmIndex(upstream, headers);
+        const index = await fetchVpmIndex(upstream, buildUpstreamHeadersFor(upstream, req.headers as any));
         const vpmAuthor = index.author;
         const packages = index.packages ?? {};
         for (const [name, pkg] of Object.entries(packages)) {
@@ -858,7 +940,10 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       u.searchParams.set("text", text);
       u.searchParams.set("from", "0");
       u.searchParams.set("size", String(size));
-      const res = await request(u.toString(), { method: "GET", headers });
+      const res = await request(u.toString(), {
+        method: "GET",
+        headers: buildUpstreamHeadersFor(upstream, req.headers as any)
+      });
       const contentType = String(res.headers["content-type"] ?? "");
       if (res.statusCode >= 400 || !contentType.includes("application/json")) {
         continue;
@@ -919,7 +1004,7 @@ async function proxyGroupNpm(
   restPath: string
 ): Promise<void> {
   const normalizedRest = restPath.replace(/^\/+/, "");
-  const headers = buildUpstreamHeaders(req.headers as any);
+  const headers = buildUpstreamHeadersFor(defaultUpstream, req.headers as any);
 
   if (normalizedRest.startsWith("npm/")) {
     const parts = normalizedRest.split("/").filter(Boolean);
@@ -973,6 +1058,7 @@ async function proxyGroupNpm(
       return;
     }
 
+    const vpmUpstream = selectUpstream(decodedName);
     const handled = await serveVpmTarball(
       req,
       reply,
@@ -980,7 +1066,7 @@ async function proxyGroupNpm(
       decodedName,
       decodedVersion,
       cacheKey,
-      headers
+      buildUpstreamHeadersFor(vpmUpstream, req.headers as any)
     );
     if (!handled) {
       reply.code(404).send();
@@ -999,7 +1085,7 @@ async function proxyGroupNpm(
     }
 
     try {
-      const index = await fetchVpmIndex(upstream, headers);
+      const index = await fetchVpmIndex(upstream, buildUpstreamHeadersFor(upstream, req.headers as any));
       const vpmAuthor = index.author;
       const versions = index.packages?.[packageName]?.versions;
       if (!versions) {
@@ -1081,7 +1167,11 @@ async function proxyGroupNpm(
     }
   }
 
-  const res = await request(upstreamUrl, { method, headers, body: body as any });
+  const res = await request(upstreamUrl, {
+    method,
+    headers: buildUpstreamHeadersFor(upstream, req.headers as any),
+    body: body as any
+  });
   const contentType = String(res.headers["content-type"] ?? "");
 
   if (res.statusCode === 404 && packageName) {
@@ -1171,7 +1261,7 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
     return;
   }
 
-  const headers = buildUpstreamHeaders(req.headers as any);
+  const headers = buildUpstreamHeadersFor(upstream, req.headers as any);
   const handled = await serveVpmTarball(
     req,
     reply,
@@ -1187,8 +1277,10 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
 }
 
 const routes: FastifyPluginAsync = async (app) => {
-  app.addHook("onRequest", async (req, _reply) => {
+  app.addHook("onRequest", async (req, reply) => {
     req.log.info({ method: req.method, url: req.url }, "req_in");
+    const ok = await validateGitlabPat(req, reply);
+    if (!ok) return reply;
   });
 
   app.register(async (r) => {
