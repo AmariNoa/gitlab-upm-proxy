@@ -224,6 +224,7 @@ ExecStart=/usr/local/bin/fastify start -l info -a 0.0.0.0 -p 3000 /opt/gitlab-up
 Environment=PUBLIC_BASE_URL=https://upm.example.com
 Environment=TARBALL_CACHE_DIR=/var/lib/gitlab-upm-proxy/cache
 Environment=UPSTREAM_CONFIG_PATH=/opt/gitlab-upm-proxy/config/upstreams.yml
+Environment=VPM_PREFETCH_INTERVAL_SEC=5
 Restart=on-failure
 RestartSec=3
 
