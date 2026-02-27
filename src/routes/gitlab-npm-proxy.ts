@@ -1276,6 +1276,28 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
   }
 }
 
+async function proxyDefaultGitlabApi(req: any, reply: any): Promise<void> {
+  const rawUrl = typeof req.raw?.url === "string" ? req.raw.url : req.url;
+  const upstreamUrl = `${defaultUpstream.baseUrl}${rawUrl}`;
+  const method = req.method.toUpperCase();
+  const body = method === "GET" || method === "HEAD" ? undefined : (req.body as any);
+
+  const res = await request(upstreamUrl, {
+    method,
+    headers: buildUpstreamHeadersFor(defaultUpstream, req.headers as any),
+    body: body as any
+  });
+
+  reply.code(res.statusCode);
+  applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
+  if (method === "HEAD") {
+    reply.send();
+    return;
+  }
+  const buffer = Buffer.from(await res.body.arrayBuffer());
+  reply.send(buffer);
+}
+
 const routes: FastifyPluginAsync = async (app) => {
   app.addHook("onRequest", async (req, reply) => {
     req.log.info({ method: req.method, url: req.url }, "req_in");
@@ -1289,6 +1311,15 @@ const routes: FastifyPluginAsync = async (app) => {
       await proxyGlobalTarball(req, reply, restPath);
     });
   });
+
+  app.register(
+    async (r) => {
+      r.all("/self", async (req, reply) => {
+        await proxyDefaultGitlabApi(req, reply);
+      });
+    },
+    { prefix: "/api/v4/personal_access_tokens" }
+  );
 
   app.register(
     async (r) => {
