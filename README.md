@@ -116,6 +116,11 @@ upstreams:
 - `dependencies` merges `dependencies` and `vpmDependencies`, then normalizes ranges to Unity-compatible values.
 - `dist.tarball` is rewritten to `PUBLIC_BASE_URL/-/<package>-<version>.tgz`.
 - Only versions with `dist.shasum` are returned in VPM metadata responses.
+- Converted VPM tarballs are re-signed by this proxy with npm ECDSA registry signatures (`dist.integrity` and `dist.signatures`). Only VPM-derived tarballs are signed; responses from npm-type upstreams and GitLab are passed through unchanged.
+- Signatures are computed once per tarball (during prefetch or on first download) and stored in the cached `metadata.json`. Cached versions signed with the current key are not re-signed on later requests; rotating the key triggers re-signing.
+- The proxy publishes its signing key at `/-/npm/v1/keys` and `/api/v4/groups/<group>/-/npm/v1/keys`. The response also merges the keys advertised by configured npm-type upstreams (`<baseUrl>/-/npm/v1/keys`) so clients can verify passthrough packages with a single keys endpoint. Unreachable upstreams are skipped.
+- The project-scoped endpoint (`/api/v4/projects/:projectId/packages/npm/*`) does not serve VPM packages and is not signed.
+- Set `NPM_SIGNATURE_PRIVATE_KEY_PEM` or `NPM_SIGNATURE_KEY_PATH` to keep the signing key stable across deployments. If neither is set, a key is generated under `TARBALL_CACHE_DIR`.
 - Author is normalized to `{ "name": "..." }`. If missing, it is injected into the tgz `package.json` from the VPM index author.
 
 ### Auth Enforcement
