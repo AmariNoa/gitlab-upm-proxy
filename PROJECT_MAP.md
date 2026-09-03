@@ -1,0 +1,81 @@
+# PROJECT_MAP — gitlab-upm-proxy
+
+Fastify 5 + TypeScript 製の Unity Package Manager 向け GitLab npm レジストリプロキシ。
+本ファイルは構造探索の起点となる骨子であり、ファイル一覧の網羅はしない。実態とずれを見つけたらその場で直す。
+
+## ディレクトリ構成
+
+| パス | 役割 |
+|------|------|
+| src/app.ts | Fastify 起点。VPM prefetch を起動し、AutoLoad で plugins/ と routes/ を読み込む |
+| src/routes/gitlab-npm-proxy.ts | PAT 検証フック、search、npm / VPM 中継、tarball 配信、署名適用、全ルート登録（約 1,500 行。最大のファイル） |
+| src/lib/cache.ts | metadata.json と tarball のファイルキャッシュ I/O |
+| src/lib/upstreams.ts | upstreams 設定ファイル（YAML / JSON）の読込、スコープマッチ、パッケージ名抽出 |
+| src/lib/vpm-prefetch.ts | 起動時に VPM インデックスを走査し zip から tgz へ変換・shasum・署名を先行付与 |
+| src/lib/npm-signatures.ts | 署名鍵の生成・読込、tarball 署名、上流 npm の /-/npm/v1/keys 取得とマージ |
+| test/helper.ts | fastify-cli の helper.build で src/app.ts を起動するテストヘルパ |
+| test/lib/ | ライブラリ単体テスト（*.test.ts）と test 専用の補助モジュール |
+| test/routes/ | ルート統合テスト（*.test.ts）。配置先として予約（整備は進行中） |
+| config/upstreams_sample.yml | upstreams 設定のサンプル。実設定 config/upstreams.yml は Git 管理外 |
+
+## 言語・フレームワーク・依存バージョン（package-lock.json の解決済みバージョン）
+
+| パッケージ | バージョン |
+|-----------|-----------|
+| fastify | 5.7.3 |
+| fastify-cli | 7.x（package.json: ^7.4.1） |
+| typescript | 5.9.3 |
+| undici | 7.18.2 |
+| semver | 7.7.3 |
+| tar | 7.5.9 |
+| yaml | 2.8.2 |
+| unzipper | 0.12.3 |
+| dotenv | 17.2.3 |
+
+Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
+
+## エントリポイント
+
+- アプリケーション: src/app.ts（fastify-cli が読み込む Fastify プラグイン。package.json の main）
+- 開発起動: `npm run dev`（tsc watch と fastify start -P を並行実行）
+- 本番起動: `npm start`（`npm run build:ts` の後に `fastify start -l info dist/app.js`）
+
+## ビルド・テスト・lint
+
+| 操作 | コマンド | 状態 |
+|------|---------|------|
+| ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
+| 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
+| テスト | `npm test` | 整備中。2026-09-03 時点の main は tsx を参照するが tsx は未インストールで、テストファイルも欠落していた |
+| lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
+
+## テストファイル
+
+- 配置: test/ 配下に src/ の構成をミラーする（test/lib/、test/routes/）。ファイル名は `<対象>.test.ts`
+- テストランナー: node:test と node:assert/strict。上流 HTTP は undici の MockAgent でモックし、実ネットワークへ出さない
+- テスト専用の補助モジュール（例: test/lib/signing-key-env.ts）は `.test.ts` を付けない
+
+## 設定・環境
+
+### 環境変数
+
+| 変数 | 必須か | 役割 |
+|------|--------|------|
+| PUBLIC_BASE_URL | 必須 | プロキシの公開 URL（例: https://upm.example.com）。tarball URL の書き換え基点 |
+| TARBALL_CACHE_DIR | 必須 | tarball / metadata キャッシュと署名鍵の既定置き場（cache.ts と npm-signatures.ts のみ ./data/cache へフォールバック） |
+| UPSTREAM_CONFIG_PATH | 必須 | upstreams 設定ファイルのパス |
+| VPM_PREFETCH_INTERVAL_SEC | 条件付き必須 | VPM prefetch の取得間隔（秒）。VPM 型 upstream があるとき必須 |
+| NPM_SIGNATURE_KEY_PATH | 任意 | 署名鍵 PEM のパス（既定: TARBALL_CACHE_DIR/npm-signing-key.pem） |
+| NPM_SIGNATURE_PRIVATE_KEY_PEM | 任意 | 署名鍵 PEM を直接注入（KEY_PATH より優先） |
+
+### 設定ファイル
+
+- upstreams 設定: config/upstreams.yml（Git 管理外）。書式は config/upstreams_sample.yml と README を参照
+- TypeScript: tsconfig.json（fastify-tsconfig を extends。module NodeNext、outDir dist、sourceMap）。test/tsconfig.json は noEmit で src と test を含む
+- 環境変数ファイル: .env（Git 管理外。sample.env が雛形）、test/.env.test（テスト用。DOTENV_CONFIG_PATH で指定）
+- Git 管理外（.gitignore）: dist/、node_modules/、coverage/、.env、data/*、config/upstreams.yml、AGENTS.md、CLAUDE.md、docs/orchestration.md、docs/checkpoint.md
+
+## ドキュメント
+
+- README.md: 概要、対応エンドポイント、設定、VPM の挙動、認証、Ubuntu Server へのインストール・更新手順
+- docs/orchestration.md、docs/checkpoint.md: エージェント運用の共有コーディネーションファイル（Git 管理外）
