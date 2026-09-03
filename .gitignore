@@ -69,3 +69,7 @@ markdown/*
 .env
 data/*
 config/upstreams.yml
+
+# agent rules (local only)
+AGENTS.md
+CLAUDE.md
