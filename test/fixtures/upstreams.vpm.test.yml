@@ -1,0 +1,7 @@
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://vpm.example.com/index.json
+    scopes:
+      - com.example.vpm.*
+    type: vpm
