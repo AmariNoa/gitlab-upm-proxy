@@ -1,0 +1,6 @@
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://npm.example.org
+    scopes:
+      - com.example.other.*
