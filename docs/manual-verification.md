@@ -1,0 +1,290 @@
+# 実機確認手順書（manual verification）
+
+自動テストで確認できない範囲を、実際のサーバーと実際のレジストリに対して人手で確認するための手順書。
+
+## 目的と前提
+
+- 対象: gitlab-upm-proxy の npm ECDSA 署名機能（VPM 由来 tarball の署名、`/-/npm/v1/keys` の公開、署名のキャッシュ永続化と再利用）と、既存の中継・認証・キャッシュの基本動作。
+- 実施環境: **検証系のサーバーで実施する**。本番系では実施しない（キャッシュディレクトリの内容を確認・削除する手順を含むため）。
+- 自動テストで確認済みの範囲: `npm test`（ルート中継、PAT 認証、署名の生成・検証・キャッシュ再利用、鍵エンドポイントのマージ）は上流をモックして実行しており、実サーバー・実レジストリ・実クライアントに対する動作は含まない。本手順書はその差分を埋めるためのもの。
+- 実施者: 人間。エージェントは本手順書の記述までを担当し、実機での実行と結果の判定は行わない。
+- 表記: 実環境の値はすべてプレースホルダで書いている。実施時に自分の環境の値へ読み替える。
+
+| プレースホルダ | 意味 |
+|---|---|
+| `/opt/gitlab-upm-proxy` | プロキシの配置ディレクトリ |
+| `/var/lib/gitlab-upm-proxy/cache` | `TARBALL_CACHE_DIR` の実体 |
+| `https://upm.example.com` | プロキシの公開 URL（`PUBLIC_BASE_URL`） |
+| `https://gitlab.example.com` | 既定 GitLab の URL（`config/upstreams.yml` の `default`） |
+| `https://vpm.example.com/index.json` | VPM 型 upstream の index URL |
+| `my-group` | GitLab のグループパス（URL エンコード前） |
+| `com.example.vpm.pkg` | 検証に使う VPM 由来パッケージ名 |
+| `1.0.0` | 検証に使うバージョン |
+| `123` | GitLab のプロジェクト ID |
+
+## 事前準備
+
+### P-1 認証情報の用意
+
+GitLab の Personal Access Token（`read_api` と `read_package_registry` を含むスコープ）を用意し、実施するシェルの環境変数へ入れる。**トークンをコマンドライン引数へ直接書かない。手順書・ログ・チャットへ値を貼らない。**
+
+```bash
+read -rs GITLAB_PAT && export GITLAB_PAT
+```
+
+シェル履歴に残さないため `read -rs` を使う。作業終了後は `unset GITLAB_PAT` する。
+
+### P-2 ビルドと配置
+
+```bash
+cd /opt/gitlab-upm-proxy
+git status --short
+npm run build:ts
+mkdir -p /opt/gitlab-upm-proxy/dist/plugins
+```
+
+`git status --short` で作業ツリーがクリーンであること（検証したいコミットの状態であること）を先に確認する。
+
+### P-3 設定
+
+`config/upstreams.yml` に、既定 GitLab と、検証に使う VPM 型 upstream が設定されていることを確認する。
+
+```bash
+grep -nE '^(default|upstreams):|baseUrl|type|scopes' /opt/gitlab-upm-proxy/config/upstreams.yml
+```
+
+環境変数（systemd の場合は `/etc/systemd/system/gitlab-upm-proxy.service` の `Environment=` 行）に次が設定されていることを確認する。
+
+| 変数 | 必須 | 備考 |
+|---|---|---|
+| `PUBLIC_BASE_URL` | 必須 | tarball URL の書き換え基点 |
+| `TARBALL_CACHE_DIR` | 必須 | キャッシュと署名鍵の置き場 |
+| `UPSTREAM_CONFIG_PATH` | 必須 | upstreams 設定のパス |
+| `VPM_PREFETCH_INTERVAL_SEC` | VPM 型 upstream があるとき必須 | prefetch の取得間隔（秒） |
+| `NPM_SIGNATURE_KEY_PATH` | 任意（推奨） | 署名鍵を固定するパス。未設定だと `TARBALL_CACHE_DIR/npm-signing-key.pem` に自動生成される |
+
+```bash
+sudo systemctl cat gitlab-upm-proxy | grep -n '^Environment='
+```
+
+### P-4 署名鍵の固定（推奨）
+
+署名鍵はデプロイをまたいで同一である必要がある（鍵が変わるとクライアント側の検証が失敗する）。`NPM_SIGNATURE_KEY_PATH` を設定し、その PEM ファイルをバックアップ対象に含める。
+
+```bash
+sudo ls -l /var/lib/gitlab-upm-proxy/cache/npm-signing-key.pem
+```
+
+ファイルの権限が所有者のみ（600）であることを確認する。**中身は表示しない。**
+
+---
+
+## M-1 サーバーの起動
+
+**前提条件**: P-2 と P-3 が完了していること。
+
+**操作手順**
+
+```bash
+sudo systemctl restart gitlab-upm-proxy
+sudo systemctl status gitlab-upm-proxy --no-pager
+sudo journalctl -u gitlab-upm-proxy -n 50 --no-pager
+```
+
+**期待される結果**
+
+- `systemctl status` が `active (running)` を示す。
+- 起動ログに例外・スタックトレースが出ていない。
+- 必須の環境変数が欠けている場合は `Missing env: <変数名>` のエラーで即座に停止する（設定漏れが黙って無視されない）。
+- VPM 型 upstream を設定している場合、`vpm_prefetch_start` に続いて `vpm_prefetch_done` または `vpm_prefetch_skip` のログが出る（起動時の prefetch が動いている）。
+
+---
+
+## M-2 PAT 認証
+
+**前提条件**: M-1 が成功していること。P-1 で `GITLAB_PAT` を設定していること。
+
+**操作手順**
+
+```bash
+# (1) ヘッダ無し
+curl -s -o /dev/null -w '%{http_code}\n' "https://upm.example.com/api/v4/groups/my-group/-/v1/search?text=example&from=0&size=10"
+
+# (2) 無効なトークン
+curl -s -H 'PRIVATE-TOKEN: invalid-token-for-testing' "https://upm.example.com/api/v4/groups/my-group/-/v1/search?text=example&from=0&size=10"
+
+# (3) 有効なトークン
+curl -s -o /dev/null -w '%{http_code}\n' -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/-/v1/search?text=example&from=0&size=10"
+```
+
+**期待される結果**
+
+| 手順 | HTTP | レスポンスボディ |
+|---|---|---|
+| (1) | 401 | `{"error":"missing_token"}` |
+| (2) | 401 | `{"error":"invalid_token"}` |
+| (3) | 200 | 検索結果の JSON |
+
+既定 GitLab へ到達できない場合、(2)(3) は 401 `{"error":"token_check_failed"}` になる。この場合はネットワーク・`config/upstreams.yml` の `default` を確認してから再実行する。
+
+---
+
+## M-3 検索とメタデータ取得
+
+**前提条件**: M-2 の (3) が 200 であること。
+
+**操作手順**
+
+```bash
+# 検索
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/-/v1/search?text=com.example&from=0&size=10" | head -c 2000
+
+# メタデータ取得（GitLab 由来のパッケージ名で実行する）
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/com.example.somepkg" | head -c 2000
+```
+
+**期待される結果**
+
+- 検索は `objects` 配列と `total` を含む JSON を返す（npm search v1 互換の形）。
+- メタデータは `name`、`dist-tags`、`versions` を含む JSON を返す。
+- `versions.<version>.dist.tarball` が `https://upm.example.com/` で始まる URL に書き換わっている（クライアントがプロキシ経由で取得できる形になっている）。
+
+---
+
+## M-4 VPM 署名の付与・永続化・再利用
+
+本機能の中心。**キャッシュを一度空にしてから実施する**（前回の残骸による誤判定を避けるため）。
+
+**前提条件**: `config/upstreams.yml` に `type: vpm` の upstream があり、`com.example.vpm.pkg` がそのスコープに一致すること。
+
+**操作手順**
+
+```bash
+# (1) 対象パッケージのキャッシュだけを削除する（cache 全体を消さない）
+sudo systemctl stop gitlab-upm-proxy
+sudo ls -la /var/lib/gitlab-upm-proxy/cache/vpm.example.com/
+sudo rm -rf /var/lib/gitlab-upm-proxy/cache/vpm.example.com/com.example.vpm.pkg
+sudo systemctl start gitlab-upm-proxy
+
+# (2) 1 回目の取得
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg" > /tmp/vpm-meta-1.json
+python3 -c "import json;d=json.load(open('/tmp/vpm-meta-1.json'));v=d['versions']['1.0.0']['dist'];print(v.get('integrity'));print(json.dumps(v.get('signatures')))"
+
+# (3) ディスク上のキャッシュを確認
+sudo python3 -c "import json;d=json.load(open('/var/lib/gitlab-upm-proxy/cache/vpm.example.com/com.example.vpm.pkg/metadata.json'));v=d['metadata']['versions']['1.0.0']['dist'];print(v.get('integrity'));print(json.dumps(v.get('signatures')))"
+
+# (4) 2 回目の取得（署名が再計算されないことの確認）
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg" > /tmp/vpm-meta-2.json
+diff <(python3 -c "import json;print(json.dumps(json.load(open('/tmp/vpm-meta-1.json'))['versions']['1.0.0']['dist'],sort_keys=True))") <(python3 -c "import json;print(json.dumps(json.load(open('/tmp/vpm-meta-2.json'))['versions']['1.0.0']['dist'],sort_keys=True))") && echo "IDENTICAL"
+
+# (5) tarball の取得と integrity の突き合わせ
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" -o /tmp/vpm-pkg.tgz "https://upm.example.com/-/com.example.vpm.pkg-1.0.0.tgz"
+echo "sha512-$(openssl dgst -sha512 -binary /tmp/vpm-pkg.tgz | base64 -w0)"
+```
+
+**期待される結果**
+
+- (2) `dist.integrity` が `sha512-` で始まる文字列、`dist.signatures` が `[{"keyid":"SHA256:...","sig":"..."}]` の形で返る。
+- (3) ディスクの `metadata.json` にも (2) と同じ `integrity` と `signatures` が保存されている（署名が永続化されている）。
+- (4) `diff` が差分なしで `IDENTICAL` を表示する（2 回目に署名が作り直されていない）。
+- (5) 計算した `sha512-...` が (2) の `dist.integrity` と一致する（署名対象が実際に配信される tarball と同一）。
+- 一連の操作で 500 系のエラーが出ない。
+
+**判定の注意**: (4) は「値が同じ」ことしか示さない。再計算そのものが行われていないかを厳密に見るなら、(4) の実行前後で CPU 時間やレスポンス時間の差、あるいは `journalctl` のログ量を併せて観察する。
+
+---
+
+## M-5 署名鍵エンドポイント
+
+**前提条件**: M-1 が成功していること。
+
+**操作手順**
+
+```bash
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/-/npm/v1/keys"
+curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/-/npm/v1/keys"
+```
+
+**期待される結果**
+
+- どちらも `{"keys":[...]}` の JSON を返す。
+- 配列に、`keytype` と `scheme` がともに `ecdsa-sha2-nistp256`、`expires` が `null`、`keyid` が `SHA256:` で始まる要素が少なくとも 1 つある。
+- その `keyid` が M-4 (2) の `signatures[0].keyid` と一致する（配信した署名の鍵が公開されている）。
+- `config/upstreams.yml` に npm 型の upstream（例: 公開 npm レジストリ）がある場合、その upstream が公開する鍵も配列にマージされている。upstream が到達不能でも、本エンドポイント自体は 200 を返す（片方の失敗が全体を壊さない）。
+- 認証必須である（PAT ヘッダ無しで呼ぶと 401）。
+
+---
+
+## M-6 npm クライアントによる署名検証
+
+**前提条件**: M-4 と M-5 が期待どおりであること。npm が使える環境であること。
+
+**操作手順**
+
+```bash
+# 作業用の一時ディレクトリで行う（既存プロジェクトの .npmrc を書き換えない）
+WORKDIR=$(mktemp -d) && cd "$WORKDIR"
+npm init -y >/dev/null
+
+# レジストリと認証を一時ディレクトリ内の .npmrc にのみ設定する
+{
+  echo "@scope:registry=https://upm.example.com/api/v4/groups/my-group/"
+  echo "registry=https://upm.example.com/api/v4/groups/my-group/"
+  echo "//upm.example.com/api/v4/groups/my-group/:_authToken=\${GITLAB_PAT}"
+} > "$WORKDIR/.npmrc"
+
+npm install com.example.vpm.pkg@1.0.0
+npm audit signatures
+```
+
+**期待される結果**
+
+- `npm install` が成功し、`node_modules/com.example.vpm.pkg` が作られる。
+- `npm audit signatures` が対象パッケージについて署名を検証し、`verified` の趣旨の結果を返す（`missing signature` や `invalid signature` にならない）。
+
+**後始末**
+
+```bash
+cd / && rm -rf "$WORKDIR" && unset WORKDIR
+```
+
+**判定の注意**: npm のバージョンによって `npm audit signatures` の出力文言と、レジストリ URL の指定方法（末尾スラッシュの要否）が異なる。実施時の npm のバージョンを記録し、想定と異なる場合は出力全文を控えてから判定する。
+
+---
+
+## M-7 Unity Package Manager からの取得
+
+**前提条件**: M-3 または M-4 が期待どおりであること。Unity エディタが使えること。
+
+**操作手順**
+
+1. Unity の認証情報ファイル（ユーザーのホームディレクトリの `.upmconfig.toml`）に、プロキシの URL とトークンの設定を追加する。値はエディタで直接編集し、ファイルの権限を所有者のみにする。
+2. Unity プロジェクトの設定で Scoped Registry を追加する。URL にはプロキシのグループスコープの URL（`https://upm.example.com/api/v4/groups/my-group/`）を、スコープには対象パッケージのスコープ（`com.example`）を指定する。
+   - **注意**: 設定画面のメニュー名・項目名は Unity のバージョンで異なる。実施時に画面で確認し、本手順書の記述と食い違う場合は実際の文言に合わせて本書を更新する（本項の文言は未検証）。
+3. Package Manager を開き、追加したレジストリのパッケージ一覧を表示する。
+4. 対象パッケージをインストールし、プロジェクトに取り込まれることを確認する。
+
+**期待される結果**
+
+- パッケージ一覧に対象パッケージとバージョンが表示される。
+- インストールが成功し、`Packages/manifest.json` に依存として追加される。
+- Unity のコンソールとプロキシのログ（`sudo journalctl -u gitlab-upm-proxy -n 100 --no-pager`）に、認証エラー・404・整合性エラーが出ていない。
+- 依存パッケージがある場合、それらも解決される（`dependencies` と `vpmDependencies` のマージが機能している）。
+
+---
+
+## 結果記録表
+
+実施のたびに行を追加する。**エージェントはこの表を代筆しない**（実機確認は実施者本人の観察に基づく記録とするため）。
+
+| ケース | 実施日 | 実施者 | 対象コミット | 結果 | 備考 |
+|---|---|---|---|---|---|
+| M-1 サーバー起動 | | | | | |
+| M-2 PAT 認証 | | | | | |
+| M-3 検索・メタデータ | | | | | |
+| M-4 VPM 署名の付与・永続化・再利用 | | | | | |
+| M-5 署名鍵エンドポイント | | | | | |
+| M-6 npm クライアントでの署名検証 | | | | | |
+| M-7 Unity からの取得 | | | | | |
+
+不合格だったケースは、対象コミット・実行したコマンド・出力（秘密情報を除く）・ログの該当箇所を控えたうえで報告する。
