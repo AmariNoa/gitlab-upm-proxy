@@ -27,7 +27,7 @@ import {
   mergeSigningKeys
 } from "../lib/npm-signatures";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
-import { computeSha1, convertZipBufferToTgz, createTempLockRunner } from "../lib/tgz";
+import { computeSha1, convertZipBufferToTgz, runTempLocked } from "../lib/tgz";
 
 function mustEnv(name: string): string {
   const v = process.env[name];
@@ -440,8 +440,6 @@ async function applyVpmSignaturesFromCache(
   return changed;
 }
 
-const runLocked = createTempLockRunner();
-
 async function serveVpmTarball(
   req: any,
   reply: any,
@@ -485,7 +483,7 @@ async function serveVpmTarball(
   try {
     const buffer = await fetchBufferWithRedirects(tarballUrl, headers);
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
-    await convertZipBufferToTgz(buffer, tgzPath, runLocked, vpmAuthor);
+    await convertZipBufferToTgz(buffer, tgzPath, runTempLocked, vpmAuthor);
     const tgzBuffer = await readFile(tgzPath);
     const shasum = computeSha1(tgzBuffer);
 

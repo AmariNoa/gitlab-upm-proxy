@@ -6,7 +6,7 @@ import * as semver from "semver";
 import { getTarballCachePath, readMetadataCache, writeMetadataCache } from "./cache";
 import { applyPackageSignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
-import { computeSha1, convertZipBufferToTgz, createTempLockRunner } from "./tgz";
+import { computeSha1, convertZipBufferToTgz, runTempLocked } from "./tgz";
 
 type VpmIndex = {
   author?: unknown;
@@ -55,8 +55,6 @@ async function fetchVpmIndex(upstream: UpstreamEntry): Promise<VpmIndex> {
   }
   return (await res.body.json()) as VpmIndex;
 }
-
-const runLocked = createTempLockRunner();
 
 async function readAuthorFromTgz(tgzPath: string): Promise<unknown> {
   const tempDir = await mkdtemp(join(dirname(tgzPath), "extract-"));
@@ -264,7 +262,7 @@ async function prefetchForUpstream(
         try {
           await delay();
           const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
-          await convertZipBufferToTgz(zipBuffer, tgzPath, runLocked, vpmAuthor);
+          await convertZipBufferToTgz(zipBuffer, tgzPath, runTempLocked, vpmAuthor);
           log.info({ packageName: name, version }, "vpm_prefetch_done");
         } catch (err) {
           log.info({ err, packageName: name, version }, "vpm_prefetch_skip");
@@ -340,7 +338,7 @@ async function prefetchForPackage(
       if (intervalMs > 0) await sleep(intervalMs);
       try {
         const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
-        await convertZipBufferToTgz(zipBuffer, tgzPath, runLocked, vpmAuthor);
+        await convertZipBufferToTgz(zipBuffer, tgzPath, runTempLocked, vpmAuthor);
         log.info({ packageName, version }, "vpm_prefetch_done");
       } catch (err) {
         log.info({ err, packageName, version }, "vpm_prefetch_skip");

@@ -45,9 +45,8 @@ export function computeSha1(buffer: Buffer): string {
 
 export type TempLockRunner = <T>(dir: string, fn: () => Promise<T>) => Promise<T>;
 
-// Creates a per-directory lock table. Callers hold their own runner instance, which
-// preserves the behaviour these helpers had while they lived in each calling module.
-export function createTempLockRunner(): TempLockRunner {
+// Creates a per-directory lock table.
+function createTempLockRunner(): TempLockRunner {
   const tempLocks = new Map<string, Promise<void>>();
 
   return async function withTempLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
@@ -68,6 +67,11 @@ export function createTempLockRunner(): TempLockRunner {
     }
   };
 }
+
+// One lock table shared by every caller. Serving a tarball on request and prefetching it
+// in the background use the same temp directory for the same package, so they have to
+// serialize against each other, not only against themselves.
+export const runTempLocked: TempLockRunner = createTempLockRunner();
 
 // Converts a downloaded zip buffer into an npm-style tgz at targetTgzPath, optionally
 // filling in a missing package.json author from the VPM index. Returns the tgz contents.
