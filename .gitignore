@@ -73,3 +73,7 @@ config/upstreams.yml
 # agent rules (local only)
 AGENTS.md
 CLAUDE.md
+
+# shared coordination files (local only)
+docs/orchestration.md
+docs/checkpoint.md
