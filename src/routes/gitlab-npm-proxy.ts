@@ -1,11 +1,8 @@
-import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import type { FastifyPluginAsync } from "fastify";
 import * as semver from "semver";
 import * as tar from "tar";
-import * as unzipper from "unzipper";
 import { request } from "undici";
 import {
   deleteMetadataCache,
@@ -30,6 +27,7 @@ import {
   mergeSigningKeys
 } from "../lib/npm-signatures";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
+import { computeSha1, convertZipBufferToTgz, createTempLockRunner } from "../lib/tgz";
 
 function mustEnv(name: string): string {
   const v = process.env[name];
@@ -390,73 +388,6 @@ function buildVpmTarballProxyUrl(
   return `${PUBLIC_BASE_URL}/-/${encodedVersion}`;
 }
 
-async function unzipToDirectory(zipPath: string, targetDir: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(zipPath).pipe(unzipper.Extract({ path: targetDir }));
-    stream.on("close", () => resolve());
-    stream.on("error", (err) => reject(err));
-  });
-}
-
-async function convertZipBufferToTgz(
-  zipBuffer: Buffer,
-  targetTgzPath: string,
-  tempRoot: string,
-  vpmAuthor?: unknown
-): Promise<void> {
-  await withTempLock(dirname(targetTgzPath), async () => {
-    await mkdir(dirname(targetTgzPath), { recursive: true });
-    const tempDir = join(dirname(targetTgzPath), "temp");
-    await rm(tempDir, { recursive: true, force: true });
-    await mkdir(tempDir, { recursive: true });
-    const zipPath = join(tempDir, "package.zip");
-    const extractDir = join(tempDir, "extract");
-    try {
-      await mkdir(extractDir, { recursive: true });
-      await writeFile(zipPath, zipBuffer);
-      await unzipToDirectory(zipPath, extractDir);
-      const rootDir = await findPackageRoot(extractDir);
-      if (vpmAuthor) {
-        const packageJsonPath = join(rootDir, "package.json");
-        try {
-          const raw = await readFile(packageJsonPath, "utf-8");
-          const parsed = JSON.parse(raw) as Record<string, unknown>;
-          if (!parsed.author) {
-            const normalized =
-              typeof vpmAuthor === "string"
-                ? { name: vpmAuthor }
-                : vpmAuthor && typeof vpmAuthor === "object" && "name" in vpmAuthor
-                  ? vpmAuthor
-                  : null;
-            if (normalized) {
-              parsed.author = normalized;
-            }
-            await writeFile(packageJsonPath, JSON.stringify(parsed, null, 2), "utf-8");
-          }
-        } catch {
-          // ignore when package.json is missing or invalid
-        }
-      }
-      const entries = await readdir(rootDir);
-      await tar.c(
-        {
-          gzip: true,
-          file: targetTgzPath,
-          cwd: rootDir,
-          prefix: "package/"
-        },
-        entries
-      );
-    } finally {
-      try {
-        await rm(tempDir, { recursive: true, force: true });
-      } catch {
-        // ignore cleanup errors on Windows
-      }
-    }
-  });
-}
-
 function stripVpmOriginal(metadata: any): any {
   if (!metadata || typeof metadata !== "object") return metadata;
   if (!metadata.versions || typeof metadata.versions !== "object") return metadata;
@@ -469,10 +400,6 @@ function stripVpmOriginal(metadata: any): any {
     delete metadata._vpmAuthor;
   }
   return metadata;
-}
-
-function computeSha1(buffer: Buffer): string {
-  return createHash("sha1").update(buffer).digest("hex");
 }
 
 function hasProxySignature(dist: any): boolean {
@@ -513,25 +440,7 @@ async function applyVpmSignaturesFromCache(
   return changed;
 }
 
-const tempLocks = new Map<string, Promise<void>>();
-
-async function withTempLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
-  const prev = tempLocks.get(dir) ?? Promise.resolve();
-  let release = () => {};
-  const next = new Promise<void>((resolve) => {
-    release = () => resolve();
-  });
-  tempLocks.set(dir, prev.then(() => next));
-  await prev;
-  try {
-    return await fn();
-  } finally {
-    release();
-    if (tempLocks.get(dir) === next) {
-      tempLocks.delete(dir);
-    }
-  }
-}
+const runLocked = createTempLockRunner();
 
 async function serveVpmTarball(
   req: any,
@@ -576,7 +485,7 @@ async function serveVpmTarball(
   try {
     const buffer = await fetchBufferWithRedirects(tarballUrl, headers);
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
-    await convertZipBufferToTgz(buffer, tgzPath, TARBALL_CACHE_DIR, vpmAuthor);
+    await convertZipBufferToTgz(buffer, tgzPath, runLocked, vpmAuthor);
     const tgzBuffer = await readFile(tgzPath);
     const shasum = computeSha1(tgzBuffer);
 
@@ -649,29 +558,6 @@ async function fetchBufferWithRedirects(
     return Buffer.from(await res.body.arrayBuffer());
   }
   throw new Error("zip_download_redirects_exceeded");
-}
-
-async function findPackageRoot(extractDir: string): Promise<string> {
-  try {
-    await stat(join(extractDir, "package.json"));
-    return extractDir;
-  } catch {
-    // continue
-  }
-
-  const entries = await readdir(extractDir, { withFileTypes: true });
-  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
-  if (dirs.length === 1) {
-    const candidate = join(extractDir, dirs[0]);
-    try {
-      await stat(join(candidate, "package.json"));
-      return candidate;
-    } catch {
-      return candidate;
-    }
-  }
-
-  return extractDir;
 }
 
 function normalizeSearchResponse(payload: any): { objects: any[]; total: number; time: string } {
