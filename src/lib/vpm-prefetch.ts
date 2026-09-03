@@ -7,6 +7,7 @@ import * as unzipper from "unzipper";
 import { request } from "undici";
 import * as semver from "semver";
 import { getTarballCachePath, readMetadataCache, writeMetadataCache } from "./cache";
+import { applyPackageSignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 
 type VpmIndex = {
@@ -387,6 +388,7 @@ async function prefetchForUpstream(
       }
       const tgzBuffer = await readFile(tgzPath);
       node.dist.shasum = computeSha1(tgzBuffer);
+      applyPackageSignature(name, version, tgzBuffer, node.dist);
       applyAuthorIfMissing(node, vpmAuthor);
       await writeMetadataCache(upstream.host, name, {
         latestVersion: pickLatestWithShasum(metadata),
@@ -462,6 +464,7 @@ async function prefetchForPackage(
     }
     const tgzBuffer = await readFile(tgzPath);
     node.dist.shasum = computeSha1(tgzBuffer);
+    applyPackageSignature(packageName, version, tgzBuffer, node.dist);
     applyAuthorIfMissing(node, vpmAuthor);
     await writeMetadataCache(upstream.host, packageName, {
       latestVersion: pickLatestWithShasum(metadata),

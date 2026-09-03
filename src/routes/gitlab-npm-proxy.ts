@@ -23,6 +23,12 @@ import {
   selectUpstream,
   UpstreamEntry
 } from "../lib/upstreams";
+import {
+  applyPackageSignature,
+  fetchUpstreamSigningKeys,
+  getProxySigningKey,
+  mergeSigningKeys
+} from "../lib/npm-signatures";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
 
 function mustEnv(name: string): string {
@@ -313,9 +319,14 @@ function mergeShasumFromCache(target: any, cached: any): void {
   for (const [version, node] of Object.entries<any>(target.versions)) {
     if (!node?.dist || node.dist.shasum) continue;
     const cachedNode = cached.versions[version];
-    const cachedShasum = cachedNode?.dist?.shasum;
-    if (cachedShasum) {
-      node.dist.shasum = cachedShasum;
+    const cachedDist = cachedNode?.dist;
+    if (!cachedDist?.shasum) continue;
+    node.dist.shasum = cachedDist.shasum;
+    // Signatures computed earlier (prefetch / tarball download) are reused so that
+    // metadata responses do not re-sign every cached tarball on each request.
+    if (typeof cachedDist.integrity === "string" && Array.isArray(cachedDist.signatures)) {
+      node.dist.integrity = cachedDist.integrity;
+      node.dist.signatures = cachedDist.signatures;
     }
   }
 }
@@ -464,6 +475,44 @@ function computeSha1(buffer: Buffer): string {
   return createHash("sha1").update(buffer).digest("hex");
 }
 
+function hasProxySignature(dist: any): boolean {
+  if (!dist || typeof dist.integrity !== "string" || !Array.isArray(dist.signatures)) return false;
+  const keyid = getProxySigningKey().keyid;
+  return dist.signatures.some(
+    (entry: any) => entry && entry.keyid === keyid && typeof entry.sig === "string"
+  );
+}
+
+/**
+ * Signs cached VPM tarballs that are not yet signed with the current proxy key.
+ * Versions already carrying a signature by this key are left untouched so the
+ * (expensive) hashing and signing runs once per tarball, not once per request.
+ * Returns true when at least one version was signed.
+ */
+async function applyVpmSignaturesFromCache(
+  upstream: UpstreamEntry,
+  packageName: string,
+  metadata: any
+): Promise<boolean> {
+  if (!metadata?.versions || typeof metadata.versions !== "object") return false;
+  let changed = false;
+  for (const [version, node] of Object.entries<any>(metadata.versions)) {
+    if (!node?.dist?.shasum) continue;
+    if (hasProxySignature(node.dist)) continue;
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const cachedBuffer = await readTarballCache(upstream.host, packageName, cacheKey);
+    if (!cachedBuffer) continue;
+    applyPackageSignature(
+      String(node.name ?? packageName),
+      String(node.version ?? version),
+      cachedBuffer,
+      node.dist
+    );
+    changed = true;
+  }
+  return changed;
+}
+
 const tempLocks = new Map<string, Promise<void>>();
 
 async function withTempLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
@@ -535,6 +584,7 @@ async function serveVpmTarball(
       const cachedVersionNode = cachedMetadata.metadata.versions[decodedVersion];
       if (cachedVersionNode?.dist) {
         cachedVersionNode.dist.shasum = shasum;
+        applyPackageSignature(decodedName, decodedVersion, tgzBuffer, cachedVersionNode.dist);
         applyAuthorIfMissing(cachedVersionNode, vpmAuthor);
         await writeMetadataCache(vpmUpstream.host, decodedName, {
           latestVersion: cachedMetadata.latestVersion,
@@ -557,6 +607,26 @@ async function serveVpmTarball(
     reply.code(404).send();
     return true;
   }
+}
+
+async function handleNpmSigningKeys(req: any, reply: any): Promise<void> {
+  const keys = [getProxySigningKey()];
+
+  for (const upstream of upstreamConfig.upstreams) {
+    if (upstream.type !== "npm") continue;
+    try {
+      const upstreamKeys = await fetchUpstreamSigningKeys(
+        upstream,
+        buildUpstreamHeadersFor(upstream, req.headers as any)
+      );
+      keys.push(...upstreamKeys);
+    } catch {
+      // Missing keys on one upstream must not break signatures from other registries.
+    }
+  }
+
+  reply.code(200);
+  reply.type("application/json").send(mergeSigningKeys(keys));
 }
 
 async function fetchBufferWithRedirects(
@@ -1105,6 +1175,8 @@ async function proxyGroupNpm(
             await fillAuthorFromTgzIfNeeded(upstream, packageName, version, node);
           }
         }
+        // Sign before refreshing the cache so signatures persist and are not recomputed next time.
+        await applyVpmSignaturesFromCache(upstream, packageName, response);
         try {
           await refreshCachedVpmMetadata(upstream, packageName, response);
         } catch {
@@ -1131,6 +1203,8 @@ async function proxyGroupNpm(
         }
       }
 
+      // Sign before refreshing the cache so signatures persist and are not recomputed next time.
+      await applyVpmSignaturesFromCache(upstream, packageName, metadata);
       if (latestVersion) {
         await refreshCachedVpmMetadata(upstream, packageName, metadata);
       }
@@ -1306,6 +1380,10 @@ const routes: FastifyPluginAsync = async (app) => {
   });
 
   app.register(async (r) => {
+    r.get("/-/npm/v1/keys", async (req, reply) => {
+      await handleNpmSigningKeys(req, reply);
+    });
+
     r.all("/-/*", async (req, reply) => {
       const restPath = (req.params as any)["*"] as string;
       await proxyGlobalTarball(req, reply, restPath);
@@ -1328,6 +1406,10 @@ const routes: FastifyPluginAsync = async (app) => {
         Querystring: { text?: string; from?: string; size?: string };
       }>("/-/v1/search", async (req, reply) => {
         await handleSearch(req, reply, req.params.groupEnc);
+      });
+
+      r.get("/-/npm/v1/keys", async (req, reply) => {
+        await handleNpmSigningKeys(req, reply);
       });
 
       r.all("/*", async (req, reply) => {
