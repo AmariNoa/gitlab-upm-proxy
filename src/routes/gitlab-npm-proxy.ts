@@ -1055,6 +1055,9 @@ async function proxyGroupNpm(
           }
         }
         // Sign before refreshing the cache so signatures persist and are not recomputed next time.
+        // The cache deliberately keeps the unfiltered metadata: stripVpmOriginal would drop the
+        // dist.original that tarball requests resolve from, and filterMetadataByShasum would drop
+        // versions whose tgz has not been fetched yet. Both filters apply to the response only.
         await applyVpmSignaturesFromCache(upstream, packageName, response);
         try {
           await refreshCachedVpmMetadata(upstream, packageName, response);

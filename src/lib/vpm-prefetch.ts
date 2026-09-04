@@ -207,7 +207,6 @@ function pickLatestWithShasum(metadata: any): string {
 
 async function prefetchForUpstream(
   upstream: UpstreamEntry,
-  cacheRoot: string,
   intervalMs: number,
   log: { info: (obj: any, msg?: string) => void }
 ): Promise<void> {
@@ -292,7 +291,6 @@ async function prefetchForPackage(
   packageName: string,
   versions: Record<string, any>,
   vpmAuthor: unknown,
-  cacheRoot: string,
   intervalMs: number,
   log: { info: (obj: any, msg?: string) => void }
 ): Promise<void> {
@@ -360,13 +358,12 @@ async function prefetchVpmShasums(
   const upstreams = [config.default, ...config.upstreams].filter((u) => u.type === "vpm");
   if (upstreams.length === 0) return;
 
-  const cacheRoot = mustEnv("TARBALL_CACHE_DIR");
   const intervalSec = parseFloatEnv("VPM_PREFETCH_INTERVAL_SEC");
   const intervalMs = Math.max(0, intervalSec * 1000);
 
   for (const upstream of upstreams) {
     log.info({ host: upstream.host }, "vpm_prefetch_start");
-    await prefetchForUpstream(upstream, cacheRoot, intervalMs, log);
+    await prefetchForUpstream(upstream, intervalMs, log);
     log.info({ host: upstream.host }, "vpm_prefetch_complete");
   }
 }
@@ -395,10 +392,9 @@ export function startVpmPrefetchForPackage(
   runningPrefetch.add(key);
   void (async () => {
     try {
-      const cacheRoot = mustEnv("TARBALL_CACHE_DIR");
       const intervalSec = parseFloatEnv("VPM_PREFETCH_INTERVAL_SEC");
       const intervalMs = Math.max(0, intervalSec * 1000);
-      await prefetchForPackage(upstream, packageName, versions, vpmAuthor, cacheRoot, intervalMs, log);
+      await prefetchForPackage(upstream, packageName, versions, vpmAuthor, intervalMs, log);
     } catch (err) {
       log.info({ err, packageName }, "vpm_prefetch_failed");
     } finally {
