@@ -13,6 +13,8 @@ Fastify 5 + TypeScript 製の Unity Package Manager 向け GitLab npm レジス�
 | src/lib/upstreams.ts | upstreams 設定ファイル（YAML / JSON）の読込、スコープマッチ、パッケージ名抽出 |
 | src/lib/vpm-prefetch.ts | 起動時に VPM インデックスを走査し zip から tgz へ変換・shasum・署名を先行付与 |
 | src/lib/npm-signatures.ts | 署名鍵の生成・読込、tarball 署名、上流 npm の /-/npm/v1/keys 取得とマージ |
+| src/lib/tgz.ts | zip から tgz への変換、展開、パッケージ root の判定、一時ディレクトリのロック、sha1 計算 |
+| src/lib/env.ts | 必須環境変数の読み出し（未設定なら即座に失敗する mustEnv） |
 | test/helper.ts | fastify-cli の helper.build で src/app.ts を起動するテストヘルパ |
 | test/lib/ | ライブラリ単体テスト（*.test.ts）と test 専用の補助モジュール |
 | test/routes/ | ルート統合テスト（*.test.ts）。配置先として予約（整備は進行中） |
@@ -62,7 +64,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 | 変数 | 必須か | 役割 |
 |------|--------|------|
 | PUBLIC_BASE_URL | 必須 | プロキシの公開 URL（例: https://upm.example.com）。tarball URL の書き換え基点 |
-| TARBALL_CACHE_DIR | 必須 | tarball / metadata キャッシュと署名鍵の既定置き場（cache.ts と npm-signatures.ts のみ ./data/cache へフォールバック） |
+| TARBALL_CACHE_DIR | 必須 | tarball / metadata キャッシュと署名鍵の既定置き場。全モジュールが必須扱いで、未設定なら起動時に `Missing env: TARBALL_CACHE_DIR` で停止する |
 | UPSTREAM_CONFIG_PATH | 必須 | upstreams 設定ファイルのパス |
 | VPM_PREFETCH_INTERVAL_SEC | 条件付き必須 | VPM prefetch の取得間隔（秒）。VPM 型 upstream があるとき必須 |
 | NPM_SIGNATURE_KEY_PATH | 任意 | 署名鍵 PEM のパス（既定: TARBALL_CACHE_DIR/npm-signing-key.pem） |

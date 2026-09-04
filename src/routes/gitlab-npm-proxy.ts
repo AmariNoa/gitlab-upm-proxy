@@ -1055,9 +1055,10 @@ async function proxyGroupNpm(
           }
         }
         // Sign before refreshing the cache so signatures persist and are not recomputed next time.
-        // The cache deliberately keeps the unfiltered metadata: stripVpmOriginal would drop the
-        // dist.original that tarball requests resolve from, and filterMetadataByShasum would drop
-        // versions whose tgz has not been fetched yet. Both filters apply to the response only.
+        // The cache write has to stay ahead of the response filters below: both mutate this very
+        // object, and the cache needs what they remove. filterMetadataByShasum drops versions
+        // whose tgz has not been fetched yet, and stripVpmOriginal drops the dist.original that
+        // tarball requests resolve from plus the _vpmAuthor used to fill in a missing author.
         await applyVpmSignaturesFromCache(upstream, packageName, response);
         try {
           await refreshCachedVpmMetadata(upstream, packageName, response);
@@ -1086,9 +1087,10 @@ async function proxyGroupNpm(
       }
 
       // Sign before refreshing the cache so signatures persist and are not recomputed next time.
-      // As on the cache-hit path above, the cache keeps the unfiltered metadata on purpose:
-      // stripVpmOriginal would drop the dist.original that tarball requests resolve from, and
-      // filterMetadataByShasum would drop versions whose tgz has not been fetched yet.
+      // As on the cache-hit path above, the cache write has to stay ahead of the response filters
+      // below, which mutate this very object and remove what the cache needs: versions without a
+      // tgz yet, the dist.original that tarball requests resolve from, and the _vpmAuthor used to
+      // fill in a missing author.
       await applyVpmSignaturesFromCache(upstream, packageName, metadata);
       if (latestVersion) {
         await refreshCachedVpmMetadata(upstream, packageName, metadata);
