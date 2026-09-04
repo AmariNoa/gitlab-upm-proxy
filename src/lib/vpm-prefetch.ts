@@ -6,18 +6,13 @@ import * as semver from "semver";
 import { getTarballCachePath, readMetadataCache, writeMetadataCache } from "./cache";
 import { applyPackageSignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
+import { mustEnv } from "./env";
 import { computeSha1, convertZipBufferToTgz, runTempLocked } from "./tgz";
 
 type VpmIndex = {
   author?: unknown;
   packages?: Record<string, { versions?: Record<string, any> }>;
 };
-
-function mustEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
 
 function getPublicBaseUrl(): string {
   return mustEnv("PUBLIC_BASE_URL").replace(/\/+$/, "");

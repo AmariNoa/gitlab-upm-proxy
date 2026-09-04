@@ -1,12 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
-
-function mustEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
+import { mustEnv } from "./env";
 
 export type UpstreamEntry = {
   baseUrl: string;

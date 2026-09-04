@@ -1,7 +1,8 @@
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { mustEnv } from "./env";
 
-const CACHE_DIR = process.env.TARBALL_CACHE_DIR ?? "./data/cache";
+const CACHE_DIR = mustEnv("TARBALL_CACHE_DIR");
 
 export type MetadataCache = {
   latestVersion: string;
