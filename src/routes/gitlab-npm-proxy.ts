@@ -28,12 +28,7 @@ import {
 } from "../lib/npm-signatures";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
 import { computeSha1, convertZipBufferToTgz, runTempLocked } from "../lib/tgz";
-
-function mustEnv(name: string): string {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
+import { mustEnv } from "../lib/env";
 
 const PUBLIC_BASE_URL = mustEnv("PUBLIC_BASE_URL").replace(/\/+$/, "");
 const TARBALL_CACHE_DIR = mustEnv("TARBALL_CACHE_DIR");

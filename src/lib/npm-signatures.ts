@@ -8,6 +8,7 @@ import {
   sign as cryptoSign
 } from "node:crypto";
 import { request } from "undici";
+import { mustEnv } from "./env";
 import { UpstreamEntry } from "./upstreams";
 
 type NpmSigningKey = {
@@ -22,8 +23,8 @@ type NpmKeysResponse = {
   keys: NpmSigningKey[];
 };
 
-const CACHE_DIR = process.env.TARBALL_CACHE_DIR ?? "./data/cache";
-const KEY_PATH = process.env.NPM_SIGNATURE_KEY_PATH ?? join(CACHE_DIR, "npm-signing-key.pem");
+const KEY_PATH =
+  process.env.NPM_SIGNATURE_KEY_PATH ?? join(mustEnv("TARBALL_CACHE_DIR"), "npm-signing-key.pem");
 
 let cachedPrivateKeyPem: string | null = null;
 let cachedPublicKey: NpmSigningKey | null = null;
