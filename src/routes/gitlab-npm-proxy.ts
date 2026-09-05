@@ -24,6 +24,8 @@ import {
   applyPackageSignature,
   fetchUpstreamSigningKeys,
   getProxySigningKey,
+  hasProxySignature,
+  isAuthenticUpstreamSigningKey,
   mergeSigningKeys
 } from "../lib/npm-signatures";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
@@ -407,14 +409,6 @@ function stripVpmOriginal(metadata: any): any {
   return metadata;
 }
 
-function hasProxySignature(dist: any): boolean {
-  if (!dist || typeof dist.integrity !== "string" || !Array.isArray(dist.signatures)) return false;
-  const keyid = getProxySigningKey().keyid;
-  return dist.signatures.some(
-    (entry: any) => entry && entry.keyid === keyid && typeof entry.sig === "string"
-  );
-}
-
 /**
  * Signs cached VPM tarballs that are not yet signed with the current proxy key.
  * Versions already carrying a signature by this key are left untouched so the
@@ -538,17 +532,40 @@ async function serveVpmTarball(
   }
 }
 
-async function handleNpmSigningKeys(req: any, reply: any): Promise<void> {
-  const keys = [getProxySigningKey()];
+// The keys endpoint publishes public key material only, so no upstream needs (or should
+// receive) the caller's credentials for it: forwarding Authorization/PRIVATE-TOKEN/Cookie
+// etc. here would leak them to unrelated registries for no benefit.
+const SIGNING_KEY_REQUEST_HEADERS: Record<string, string> = { accept: "application/json" };
 
-  for (const upstream of upstreamConfig.upstreams) {
+/** Collects every configured npm-type upstream (default included), de-duplicated by baseUrl. */
+function collectNpmUpstreams(): UpstreamEntry[] {
+  const seen = new Set<string>();
+  const result: UpstreamEntry[] = [];
+  for (const upstream of [defaultUpstream, ...upstreamConfig.upstreams]) {
     if (upstream.type !== "npm") continue;
+    if (seen.has(upstream.baseUrl)) continue;
+    seen.add(upstream.baseUrl);
+    result.push(upstream);
+  }
+  return result;
+}
+
+async function handleNpmSigningKeys(_req: any, reply: any): Promise<void> {
+  const proxyKey = getProxySigningKey();
+  const keys = [proxyKey];
+
+  for (const upstream of collectNpmUpstreams()) {
     try {
-      const upstreamKeys = await fetchUpstreamSigningKeys(
-        upstream,
-        buildUpstreamHeadersFor(upstream, req.headers as any)
-      );
-      keys.push(...upstreamKeys);
+      const upstreamKeys = await fetchUpstreamSigningKeys(upstream, SIGNING_KEY_REQUEST_HEADERS);
+      for (const key of upstreamKeys) {
+        // The proxy's own key always wins: an upstream must never be able to shadow it by
+        // claiming the same keyid, and any key that cannot prove it actually owns the
+        // keyid it advertises (wrong curve, malformed material, or a hash mismatch) is
+        // dropped rather than trusted.
+        if (key.keyid === proxyKey.keyid) continue;
+        if (!isAuthenticUpstreamSigningKey(key)) continue;
+        keys.push(key);
+      }
     } catch {
       // Missing keys on one upstream must not break signatures from other registries.
     }

@@ -1,0 +1,21 @@
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  # Same baseUrl as default on purpose: exercises de-duplication when collecting
+  # npm-type upstreams for the /-/npm/v1/keys aggregation.
+  - baseUrl: https://gitlab.example.com
+    scopes:
+      - com.example.dup.*
+  - baseUrl: https://npm-a.example.org
+    scopes:
+      - com.example.a.*
+  - baseUrl: https://npm-b.example.org
+    scopes:
+      - com.example.b.*
+  - baseUrl: https://npm-c.example.org
+    scopes:
+      - com.example.c.*
+  - baseUrl: https://vpm.example.com
+    scopes:
+      - com.example.vpm.*
+    type: vpm
