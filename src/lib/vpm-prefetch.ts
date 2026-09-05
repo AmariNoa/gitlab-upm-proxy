@@ -4,7 +4,7 @@ import * as tar from "tar";
 import { request } from "undici";
 import * as semver from "semver";
 import { getTarballCachePath, readMetadataCache, updateMetadataCache, type MetadataCache } from "./cache";
-import { applyPackageSignature } from "./npm-signatures";
+import { applyPackageSignature, hasProxySignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 import { mustEnv } from "./env";
 import { computeSha1, convertZipBufferToTgz, runTempLocked } from "./tgz";
@@ -287,7 +287,9 @@ async function prefetchForUpstream(
       }
       const tgzBuffer = await readFile(tgzPath);
       node.dist.shasum = computeSha1(tgzBuffer);
-      applyPackageSignature(name, version, tgzBuffer, node.dist);
+      if (!hasProxySignature(node.dist)) {
+        applyPackageSignature(name, version, tgzBuffer, node.dist);
+      }
       applyAuthorIfMissing(node, vpmAuthor);
       // Re-read the cache under the lock instead of blindly writing our locally-built
       // `metadata` snapshot: another writer (a request handler serving this package's
@@ -314,7 +316,10 @@ async function prefetchForUpstream(
   }
 }
 
-async function prefetchForPackage(
+// Exported (in addition to startVpmPrefetchForPackage) so tests can await a single
+// prefetch pass directly instead of polling the background fire-and-forget task started
+// by startVpmPrefetchForPackage for completion.
+export async function prefetchForPackage(
   upstream: UpstreamEntry,
   packageName: string,
   versions: Record<string, any>,
@@ -368,7 +373,9 @@ async function prefetchForPackage(
     }
     const tgzBuffer = await readFile(tgzPath);
     node.dist.shasum = computeSha1(tgzBuffer);
-    applyPackageSignature(packageName, version, tgzBuffer, node.dist);
+    if (!hasProxySignature(node.dist)) {
+      applyPackageSignature(packageName, version, tgzBuffer, node.dist);
+    }
     applyAuthorIfMissing(node, vpmAuthor);
     // Same re-read-and-merge as prefetchForUpstream above: only graft this version's
     // node onto whatever is currently on disk, so a concurrent writer's update to a
