@@ -11,7 +11,7 @@ import {
   hasTarballCache,
   readMetadataCache,
   readTarballCache,
-  writeMetadataCache,
+  updateMetadataCache,
   writeTarballCache
 } from "../lib/cache";
 import {
@@ -366,12 +366,22 @@ async function refreshCachedVpmMetadata(
   packageName: string,
   metadata: any
 ): Promise<void> {
-  const latestVersion = pickLatestVpmVersion(metadata?.versions);
-  await writeMetadataCache(upstream.host, packageName, {
-    latestVersion: latestVersion ?? "",
-    author: extractAuthor(metadata?.author),
-    displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-    metadata
+  // Re-read the cache under the lock and merge in whatever shasum/integrity/signatures
+  // are present there but missing on `metadata` (which was rebuilt from the VPM index,
+  // possibly using a metadata cache read that is now stale). Without this, a version
+  // signed/hashed by a concurrent request or prefetch pass between that earlier read and
+  // this write would have its dist fields silently discarded.
+  await updateMetadataCache(upstream.host, packageName, (current) => {
+    if (current?.metadata) {
+      mergeShasumFromCache(metadata, current.metadata);
+    }
+    const latestVersion = pickLatestVpmVersion(metadata?.versions);
+    return {
+      latestVersion: latestVersion ?? "",
+      author: extractAuthor(metadata?.author),
+      displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+      metadata
+    };
   });
 }
 
@@ -481,20 +491,37 @@ async function serveVpmTarball(
     await convertZipBufferToTgz(buffer, tgzPath, runTempLocked, vpmAuthor);
     const tgzBuffer = await readFile(tgzPath);
     const shasum = computeSha1(tgzBuffer);
+    const distUpdate: Record<string, unknown> = { shasum };
+    applyPackageSignature(decodedName, decodedVersion, tgzBuffer, distUpdate);
 
-    if (cachedMetadata?.metadata?.versions && typeof cachedMetadata.metadata.versions === "object") {
-      const cachedVersionNode = cachedMetadata.metadata.versions[decodedVersion];
-      if (cachedVersionNode?.dist) {
-        cachedVersionNode.dist.shasum = shasum;
-        applyPackageSignature(decodedName, decodedVersion, tgzBuffer, cachedVersionNode.dist);
-        applyAuthorIfMissing(cachedVersionNode, vpmAuthor);
-        await writeMetadataCache(vpmUpstream.host, decodedName, {
-          latestVersion: cachedMetadata.latestVersion,
-          author: cachedMetadata.author,
-          displayName: cachedMetadata.displayName,
-          metadata: cachedMetadata.metadata
-        });
-      }
+    const fallbackMetadata = cachedMetadata?.metadata;
+    if (fallbackMetadata?.versions && typeof fallbackMetadata.versions === "object") {
+      // Re-read the cache under the lock: `cachedMetadata` was read before the (slow)
+      // network fetch and tgz conversion above, so it may be stale by now. Only the
+      // freshly read version node's dist fields and author are set, so a concurrent
+      // update to a different version is not overwritten.
+      await updateMetadataCache(vpmUpstream.host, decodedName, (current) => {
+        const target = current?.metadata ?? fallbackMetadata;
+        const freshVersionNode =
+          target?.versions && typeof target.versions === "object"
+            ? target.versions[decodedVersion]
+            : undefined;
+        if (!freshVersionNode?.dist) return null;
+        freshVersionNode.dist.shasum = distUpdate.shasum;
+        if (typeof distUpdate.integrity === "string") {
+          freshVersionNode.dist.integrity = distUpdate.integrity;
+        }
+        if (Array.isArray(distUpdate.signatures)) {
+          freshVersionNode.dist.signatures = distUpdate.signatures;
+        }
+        applyAuthorIfMissing(freshVersionNode, vpmAuthor);
+        return {
+          latestVersion: current?.latestVersion ?? cachedMetadata?.latestVersion ?? "",
+          author: current?.author ?? cachedMetadata?.author,
+          displayName: current?.displayName ?? cachedMetadata?.displayName,
+          metadata: target
+        };
+      });
     }
 
     reply.code(200);
@@ -867,11 +894,19 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
               node.dist.tarball = buildVpmTarballProxyUrl(name, version);
             }
           }
-          await writeMetadataCache(upstream.host, name, {
-            latestVersion,
-            author: extractAuthor(metadata?.author),
-            displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-            metadata
+          // Re-read under the lock and merge in any shasum/integrity/signatures already
+          // on disk that `metadata` (rebuilt fresh from the VPM index) is missing, so a
+          // concurrent writer's update is not discarded by this write.
+          await updateMetadataCache(upstream.host, name, (current) => {
+            if (current?.metadata) {
+              mergeShasumFromCache(metadata, current.metadata);
+            }
+            return {
+              latestVersion,
+              author: extractAuthor(metadata?.author),
+              displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
+              metadata
+            };
           });
           const result = buildVpmSearchResult(name, versions);
           if (result) {
@@ -1161,11 +1196,19 @@ async function proxyGroupNpm(
         rewriteTarballUrlsInMetadata(json, upstream, groupEnc);
 
         if (latestVersion) {
-          await writeMetadataCache(upstream.host, packageName, {
-            latestVersion,
-            author: extractAuthor(json?.author),
-            displayName: typeof json?.displayName === "string" ? json.displayName : undefined,
-            metadata: cacheMetadata
+          // Re-read under the lock and merge in any shasum/integrity/signatures already
+          // on disk that `cacheMetadata` is missing, so a concurrent writer's update to
+          // this package is not discarded by this write.
+          await updateMetadataCache(upstream.host, packageName, (current) => {
+            if (current?.metadata) {
+              mergeShasumFromCache(cacheMetadata, current.metadata);
+            }
+            return {
+              latestVersion,
+              author: extractAuthor(json?.author),
+              displayName: typeof json?.displayName === "string" ? json.displayName : undefined,
+              metadata: cacheMetadata
+            };
           });
         }
       } else {

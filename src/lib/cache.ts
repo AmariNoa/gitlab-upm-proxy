@@ -1,4 +1,5 @@
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { mustEnv } from "./env";
 
@@ -13,6 +14,57 @@ export type MetadataCache = {
 
 function encodeSegment(value: string): string {
   return encodeURIComponent(value);
+}
+
+// Writes JSON to `path` atomically: the content lands in a uniquely-named temp file in
+// the same directory first, then an fs rename publishes it at `path`. A reader can never
+// observe a partially written file this way (rename is atomic within one filesystem).
+async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = join(dirname(path), `.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tempPath, JSON.stringify(data, null, 2), "utf-8");
+    await rename(tempPath, path);
+  } catch (err) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+type LockRunner = <T>(key: string, fn: () => Promise<T>) => Promise<T>;
+
+// Per-key async lock table, used to serialize metadata cache read-modify-write cycles
+// for the same (upstreamHost, packageName) pair. Mirrors the shape of
+// src/lib/tgz.ts's createTempLockRunner, but stores the exact chained promise it later
+// compares against so table entries are actually removed once the holder releases
+// (tgz.ts's original version compared against a different object and leaked entries).
+function createLockRunner(): LockRunner {
+  const locks = new Map<string, Promise<void>>();
+
+  return async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = locks.get(key) ?? Promise.resolve();
+    let release = () => {};
+    const next = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    const chained = prev.then(() => next);
+    locks.set(key, chained);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (locks.get(key) === chained) {
+        locks.delete(key);
+      }
+    }
+  };
+}
+
+const runMetadataLocked: LockRunner = createLockRunner();
+
+function metadataLockKey(upstreamHost: string, packageName: string): string {
+  return `${upstreamHost}|${packageName}`;
 }
 
 export function getPackageCacheDir(upstreamHost: string, packageName: string): string {
@@ -43,8 +95,30 @@ export async function writeMetadataCache(
   cache: MetadataCache
 ): Promise<void> {
   const path = getMetadataCachePath(upstreamHost, packageName);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(cache, null, 2), "utf-8");
+  await writeJsonAtomic(path, cache);
+}
+
+// Package-scoped read-modify-write: takes the per-package lock, re-reads the metadata
+// cache from disk (picking up whatever the most recent writer left, not a stale
+// snapshot the caller may have read earlier), lets `mutate` derive the next value from
+// that fresh read, and writes it back atomically. Returning null from `mutate` skips the
+// write entirely (used when the fresh read shows there is nothing left to update).
+//
+// Callers must keep network requests and tgz conversion OUTSIDE of `mutate` — it should
+// only do the (fast) work of merging fields into the freshly read value and the disk
+// write itself, so the lock is held for as short a time as possible.
+export async function updateMetadataCache(
+  upstreamHost: string,
+  packageName: string,
+  mutate: (current: MetadataCache | null) => MetadataCache | null | Promise<MetadataCache | null>
+): Promise<void> {
+  await runMetadataLocked(metadataLockKey(upstreamHost, packageName), async () => {
+    const current = await readMetadataCache(upstreamHost, packageName);
+    const next = await mutate(current);
+    if (next === null) return;
+    const path = getMetadataCachePath(upstreamHost, packageName);
+    await writeJsonAtomic(path, next);
+  });
 }
 
 export async function deleteMetadataCache(

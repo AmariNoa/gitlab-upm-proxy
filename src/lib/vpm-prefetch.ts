@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import * as tar from "tar";
 import { request } from "undici";
 import * as semver from "semver";
-import { getTarballCachePath, readMetadataCache, writeMetadataCache } from "./cache";
+import { getTarballCachePath, readMetadataCache, updateMetadataCache, type MetadataCache } from "./cache";
 import { applyPackageSignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 import { mustEnv } from "./env";
@@ -205,6 +205,28 @@ function pickLatestWithShasum(metadata: any): string {
   return keys.sort().at(-1) ?? "";
 }
 
+// Builds the MetadataCache record to persist from a full in-memory metadata object.
+function buildMetadataCacheEntry(target: any): MetadataCache {
+  return {
+    latestVersion: pickLatestWithShasum(target),
+    author: typeof target?.author === "string" ? target.author : undefined,
+    displayName: typeof target?.displayName === "string" ? target.displayName : undefined,
+    metadata: target
+  };
+}
+
+// Grafts the given version nodes onto `target.versions`, leaving every other key of
+// `target` (including versions this call does not know about) untouched. Used inside
+// updateMetadataCache's mutate callback so a freshly re-read cache entry only receives
+// the specific version updates this caller computed, instead of being replaced wholesale
+// by a possibly-stale in-memory snapshot.
+function mergeVersionsInto(target: any, versionNodes: Record<string, any>): void {
+  target.versions = target.versions && typeof target.versions === "object" ? target.versions : {};
+  for (const [version, node] of Object.entries(versionNodes)) {
+    target.versions[version] = node;
+  }
+}
+
 async function prefetchForUpstream(
   upstream: UpstreamEntry,
   intervalMs: number,
@@ -267,21 +289,27 @@ async function prefetchForUpstream(
       node.dist.shasum = computeSha1(tgzBuffer);
       applyPackageSignature(name, version, tgzBuffer, node.dist);
       applyAuthorIfMissing(node, vpmAuthor);
-      await writeMetadataCache(upstream.host, name, {
-        latestVersion: pickLatestWithShasum(metadata),
-        author: typeof metadata?.author === "string" ? metadata.author : undefined,
-        displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-        metadata
+      // Re-read the cache under the lock instead of blindly writing our locally-built
+      // `metadata` snapshot: another writer (a request handler serving this package's
+      // tarball, or another prefetch pass) may have updated a DIFFERENT version's dist
+      // fields on disk since we last read. Merge in only the version we just processed.
+      await updateMetadataCache(upstream.host, name, (current) => {
+        const target = current?.metadata ?? metadata;
+        if (target !== metadata) {
+          mergeVersionsInto(target, { [version]: node });
+        }
+        return buildMetadataCacheEntry(target);
       });
     }
   }
 
   for (const [name, metadata] of metadataByPackage.entries()) {
-    await writeMetadataCache(upstream.host, name, {
-      latestVersion: pickLatestWithShasum(metadata),
-      author: typeof metadata?.author === "string" ? metadata.author : undefined,
-      displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-      metadata
+    await updateMetadataCache(upstream.host, name, (current) => {
+      const target = current?.metadata ?? metadata;
+      if (target !== metadata) {
+        mergeVersionsInto(target, metadata.versions ?? {});
+      }
+      return buildMetadataCacheEntry(target);
     });
   }
 }
@@ -342,11 +370,15 @@ async function prefetchForPackage(
     node.dist.shasum = computeSha1(tgzBuffer);
     applyPackageSignature(packageName, version, tgzBuffer, node.dist);
     applyAuthorIfMissing(node, vpmAuthor);
-    await writeMetadataCache(upstream.host, packageName, {
-      latestVersion: pickLatestWithShasum(metadata),
-      author: typeof metadata?.author === "string" ? metadata.author : undefined,
-      displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
-      metadata
+    // Same re-read-and-merge as prefetchForUpstream above: only graft this version's
+    // node onto whatever is currently on disk, so a concurrent writer's update to a
+    // different version of this same package is not lost.
+    await updateMetadataCache(upstream.host, packageName, (current) => {
+      const target = current?.metadata ?? metadata;
+      if (target !== metadata) {
+        mergeVersionsInto(target, { [version]: node });
+      }
+      return buildMetadataCacheEntry(target);
     });
   }
 }
