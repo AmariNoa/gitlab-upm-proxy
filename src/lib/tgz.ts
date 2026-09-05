@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import * as tar from "tar";
 import * as unzipper from "unzipper";
 
@@ -55,13 +55,17 @@ function createTempLockRunner(): TempLockRunner {
     const next = new Promise<void>((resolve) => {
       release = () => resolve();
     });
-    tempLocks.set(dir, prev.then(() => next));
+    // Store the exact promise object referenced below so the `finally` block's identity
+    // check can actually match it (the previous code stored prev.then(() => next), a
+    // different object from `next`, so the check never matched and entries piled up).
+    const chained = prev.then(() => next);
+    tempLocks.set(dir, chained);
     await prev;
     try {
       return await fn();
     } finally {
       release();
-      if (tempLocks.get(dir) === next) {
+      if (tempLocks.get(dir) === chained) {
         tempLocks.delete(dir);
       }
     }
@@ -115,15 +119,26 @@ export async function convertZipBufferToTgz(
         }
       }
       const entries = await readdir(rootDir);
-      await tar.c(
-        {
-          gzip: true,
-          file: targetTgzPath,
-          cwd: rootDir,
-          prefix: "package/"
-        },
-        entries
-      );
+      // Write to a temp file in the same directory as targetTgzPath first, then rename it
+      // into place. rename is atomic within one filesystem, so a reader that bypasses the
+      // lock (readTarballCache in the request path, the stat() existence check in the
+      // background prefetch) never observes a partially written tgz at the final path.
+      const tempTgzPath = join(dirname(targetTgzPath), `${basename(targetTgzPath)}.tmp-${randomUUID()}`);
+      try {
+        await tar.c(
+          {
+            gzip: true,
+            file: tempTgzPath,
+            cwd: rootDir,
+            prefix: "package/"
+          },
+          entries
+        );
+        await rename(tempTgzPath, targetTgzPath);
+      } catch (err) {
+        await rm(tempTgzPath, { force: true }).catch(() => {});
+        throw err;
+      }
       return await readFile(targetTgzPath);
     } finally {
       try {
