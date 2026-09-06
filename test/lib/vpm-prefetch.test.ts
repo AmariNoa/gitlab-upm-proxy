@@ -10,19 +10,28 @@
 // startVpmPrefetchForPackage, so the prefetch pass can be awaited deterministically
 // instead of polled.
 import * as assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
+import { MockAgent, setGlobalDispatcher, getGlobalDispatcher, type Dispatcher } from "undici";
 
 const tarballCacheDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-vpm-prefetch-test-"));
 process.env.TARBALL_CACHE_DIR = tarballCacheDir;
 
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
-import { prefetchForPackage } from "../../src/lib/vpm-prefetch";
-import { writeMetadataCache, writeTarballCache, readMetadataCache, type MetadataCache } from "../../src/lib/cache";
+import { prefetchForPackage, prefetchForUpstream } from "../../src/lib/vpm-prefetch";
+import {
+  getMetadataCachePath,
+  readMetadataCache,
+  readTarballCache,
+  writeMetadataCache,
+  writeTarballCache,
+  type MetadataCache
+} from "../../src/lib/cache";
 import { computeSha1 } from "../../src/lib/tgz";
+import { buildStoredZip } from "./zip-fixture";
 import type { UpstreamEntry } from "../../src/lib/upstreams";
 
 const upstream: UpstreamEntry = {
@@ -40,7 +49,21 @@ const proxyPublicKey = createPublicKey({
 
 const noopLog = { info: () => {} };
 
-after(() => {
+const ZIP_ORIGIN = "https://vpm.example.com";
+
+let mockAgent: MockAgent;
+let originalDispatcher: Dispatcher;
+
+before(() => {
+  originalDispatcher = getGlobalDispatcher();
+  mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+});
+
+after(async () => {
+  setGlobalDispatcher(originalDispatcher);
+  await mockAgent.close();
   rmSync(tarballCacheDir, { recursive: true, force: true });
 });
 
@@ -155,5 +178,167 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
       true,
       "a stale-key cached signature must be replaced with a fresh, verifiable signature under the current proxy key"
     );
+  });
+
+  // Regression for the second review round: reusing the cached signature purely because
+  // it carries the current keyid is wrong when the archive itself was just rebuilt. The
+  // author-injection path deliberately re-downloads and re-converts an existing tgz, so
+  // its bytes change and the cached integrity - a hash of the previous archive - stops
+  // matching what the proxy now serves.
+  it("re-signs a version whose archive was regenerated to inject the VPM author", async () => {
+    const packageName = "com.example.prefetch.reconvert";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const sourceUrl = `${ZIP_ORIGIN}${zipPath}`;
+
+    // A cached "tgz" with no author inside: readAuthorFromTgz finds nothing, so the
+    // prefetch pass regenerates the archive from the zip below.
+    const staleBytes = Buffer.from("not-a-real-tgz-so-it-carries-no-author");
+    await writeTarballCache(upstream.host, packageName, cacheKey, staleBytes);
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version }, null, 2), "utf-8")
+      }
+    ]);
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: zipPath, method: "GET" })
+      .reply(200, zipBuffer, { headers: { "content-type": "application/zip" } });
+
+    // Signed under the current key, but for the STALE bytes.
+    const staleIntegrity = `sha512-${createHash("sha512").update(staleBytes).digest("base64")}`;
+    const seedCache: MetadataCache = {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            dist: {
+              tarball: "",
+              original: sourceUrl,
+              shasum: computeSha1(staleBytes),
+              integrity: staleIntegrity,
+              signatures: [{ keyid: proxyKey.keyid, sig: "SIGNATURE-OF-THE-OLD-ARCHIVE" }]
+            }
+          }
+        }
+      }
+    };
+    await writeMetadataCache(upstream.host, packageName, seedCache);
+
+    await prefetchForPackage(
+      upstream,
+      packageName,
+      { [version]: { name: packageName, version, url: sourceUrl } },
+      { name: "VPM Index Author" },
+      0,
+      noopLog
+    );
+
+    const served = await readTarballCache(upstream.host, packageName, cacheKey);
+    assert.ok(served, "expected the regenerated tgz on disk");
+    assert.notDeepEqual(served, staleBytes, "precondition: the archive must have been rebuilt");
+
+    const updated = await readMetadataCache(upstream.host, packageName);
+    const dist = updated?.metadata.versions[version].dist;
+    assert.ok(dist, "expected the version's dist to still be present");
+
+    const expectedIntegrity = `sha512-${createHash("sha512").update(served!).digest("base64")}`;
+    assert.equal(dist.shasum, computeSha1(served!));
+    assert.equal(dist.integrity, expectedIntegrity, "integrity must describe the archive actually served");
+    assert.notEqual(dist.signatures[0].sig, "SIGNATURE-OF-THE-OLD-ARCHIVE");
+    assert.equal(
+      cryptoVerify(
+        "sha256",
+        Buffer.from(`${packageName}@${version}:${expectedIntegrity}`),
+        proxyPublicKey,
+        Buffer.from(dist.signatures[0].sig, "base64")
+      ),
+      true,
+      "the regenerated archive must carry a signature that verifies against its own integrity"
+    );
+  });
+
+  // Regression for the second review round: the pass ends by flushing the snapshot it
+  // read at the start back to disk. Doing that as a wholesale replacement undid whatever
+  // another writer stored while the pass was running - here, the shasum and signature a
+  // request-path download had just written for a version this pass failed to fetch.
+  it("最終書き戻しは、パス実行中に別の書き手が更新したバージョンを上書きしない", async () => {
+    const packageName = "com.example.prefetch.flush";
+    const skipped = "1.0.0";
+    const zipPath = `/dl/${packageName}-${skipped}.zip`;
+    const sourceUrl = `${ZIP_ORIGIN}${zipPath}`;
+    const indexPath = "/flush-index.json";
+    const flushUpstream: UpstreamEntry = {
+      baseUrl: `${ZIP_ORIGIN}${indexPath}`,
+      host: "vpm-prefetch-flush.example.com",
+      type: "vpm"
+    };
+
+    const buildCache = (dist: Record<string, unknown>): MetadataCache => ({
+      latestVersion: skipped,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: skipped },
+        versions: { [skipped]: { name: packageName, version: skipped, dist } }
+      }
+    });
+
+    // What the pass reads at the start: no shasum, no signature yet.
+    await writeMetadataCache(
+      flushUpstream.host,
+      packageName,
+      buildCache({ tarball: "", original: sourceUrl })
+    );
+
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: indexPath, method: "GET" })
+      .reply(
+        200,
+        { packages: { [packageName]: { versions: { [skipped]: { name: packageName, version: skipped, url: sourceUrl } } } } },
+        { headers: { "content-type": "application/json" } }
+      );
+
+    // The download is where the concurrent writer lands: it stores a fully signed version
+    // node and then fails, so this pass skips the version and keeps its stale local copy.
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: zipPath, method: "GET" })
+      .reply(() => {
+        // Written synchronously (undici's reply callback cannot be async) straight to the
+        // metadata path, which already exists from the seed write above.
+        writeFileSync(
+          getMetadataCachePath(flushUpstream.host, packageName),
+          JSON.stringify(
+            buildCache({
+              tarball: "",
+              original: sourceUrl,
+              shasum: "2222222222222222222222222222222222222222",
+              integrity: "sha512-WRITTEN-BY-THE-CONCURRENT-WRITER",
+              signatures: [{ keyid: proxyKey.keyid, sig: "CONCURRENT-WRITER-SIGNATURE" }]
+            }),
+            null,
+            2
+          ),
+          "utf-8"
+        );
+        return { statusCode: 500, data: "" };
+      });
+
+    await prefetchForUpstream(flushUpstream, 0, noopLog);
+
+    const finalCache = await readMetadataCache(flushUpstream.host, packageName);
+    const dist = finalCache?.metadata.versions[skipped].dist;
+    assert.ok(dist, "expected the version to still be present");
+    assert.equal(dist.integrity, "sha512-WRITTEN-BY-THE-CONCURRENT-WRITER", "the concurrent writer's integrity must survive the final flush");
+    assert.equal(dist.signatures[0].sig, "CONCURRENT-WRITER-SIGNATURE", "the concurrent writer's signature must survive the final flush");
+    assert.equal(dist.shasum, "2222222222222222222222222222222222222222");
   });
 });
