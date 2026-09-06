@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { FastifyPluginAsync } from "fastify";
 import * as semver from "semver";
 import * as tar from "tar";
@@ -8,7 +8,9 @@ import {
   deleteMetadataCache,
   getPackageCacheDir,
   getTarballCachePath,
+  getUpstreamCacheDir,
   hasTarballCache,
+  isSafePackageName,
   readMetadataCache,
   readTarballCache,
   updateMetadataCache,
@@ -88,6 +90,33 @@ function buildUpstreamHeadersFor(
     delete headers["PRIVATE-TOKEN"];
   }
   return headers;
+}
+
+// Credentials belong to the upstream the caller authenticated against, and to nobody
+// else. A VPM package's dist.original points at whatever host the VPM index names (a
+// release asset host, a CDN, an arbitrary third party), so the caller's PAT must not ride
+// along on that download - nor on a redirect that leaves the origin we started from.
+function withoutCredentials(headers: Record<string, string>): Record<string, string> {
+  const stripped = { ...headers };
+  delete stripped["Authorization"];
+  delete stripped["PRIVATE-TOKEN"];
+  return stripped;
+}
+
+function isSameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+function headersForDownload(
+  targetUrl: string,
+  upstream: UpstreamEntry,
+  headers: Record<string, string>
+): Record<string, string> {
+  return isSameOrigin(targetUrl, upstream.baseUrl) ? headers : withoutCredentials(headers);
 }
 
 function extractPat(reqHeaders: Record<string, unknown>): string | null {
@@ -480,7 +509,10 @@ async function serveVpmTarball(
   }
 
   try {
-    const buffer = await fetchBufferWithRedirects(tarballUrl, headers);
+    const buffer = await fetchBufferWithRedirects(
+      tarballUrl,
+      headersForDownload(tarballUrl, vpmUpstream, headers)
+    );
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
     await convertZipBufferToTgz(buffer, tgzPath, runTempLocked, vpmAuthor);
     const tgzBuffer = await readFile(tgzPath);
@@ -581,11 +613,17 @@ async function fetchBufferWithRedirects(
   maxRedirects = 5
 ): Promise<Buffer> {
   let current = url;
+  let currentHeaders = headers;
   for (let i = 0; i <= maxRedirects; i++) {
-    const res = await request(current, { method: "GET", headers });
+    const res = await request(current, { method: "GET", headers: currentHeaders });
     const status = res.statusCode;
     if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
       const next = new URL(res.headers.location, current).toString();
+      // Follow-the-credentials is how tokens end up in someone else's logs: once the
+      // redirect chain leaves the origin we were authorized for, drop them for good.
+      if (!isSameOrigin(next, url)) {
+        currentHeaders = withoutCredentials(currentHeaders);
+      }
       current = next;
       continue;
     }
@@ -699,8 +737,17 @@ function rewriteTarballUrlsInMetadata(
 }
 
 async function deletePackageCache(upstream: UpstreamEntry, packageName: string): Promise<void> {
+  // Second line of defence behind isSafePackageName: the recursive delete must only ever
+  // run on a strict descendant of this upstream's cache directory. A path that escaped
+  // would take the sibling packages - and the signing key stored under
+  // TARBALL_CACHE_DIR - with it.
+  const dir = getPackageCacheDir(upstream.host, packageName);
+  const rel = relative(getUpstreamCacheDir(upstream.host), dir);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`Refusing to delete outside the package cache: ${JSON.stringify(packageName)}`);
+  }
   await deleteMetadataCache(upstream.host, packageName);
-  await rm(getPackageCacheDir(upstream.host, packageName), { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true });
 }
 
 function extractTarballFilenameFromUrl(url: string): string | null {
@@ -1015,6 +1062,11 @@ async function proxyGroupNpm(
       const prefix = `${decodedName}-`;
       if (decodedName && decodedFile.startsWith(prefix) && decodedFile.endsWith(".tgz")) {
         const decodedVersion = decodedFile.slice(prefix.length, -4);
+        // Build the headers for the upstream that actually owns this package, the same
+        // way the vpm/ branch below does. `headers` above targets the default upstream
+        // and carries the caller's PAT; handing those to a VPM download would send them
+        // to whatever host the VPM index points at.
+        const npmFormVpmUpstream = selectUpstream(decodedName);
         const handled = await serveVpmTarball(
           req,
           reply,
@@ -1022,7 +1074,7 @@ async function proxyGroupNpm(
           decodedName,
           decodedVersion,
           decodedFile,
-          headers
+          buildUpstreamHeadersFor(npmFormVpmUpstream, req.headers as any)
         );
         if (handled) {
           return;
@@ -1076,6 +1128,13 @@ async function proxyGroupNpm(
   }
 
   const packageName = extractPackageName(normalizedRest);
+  // A dot-segment package name has no valid cache path, and every downstream helper
+  // would throw on it. Answer 404 here so the request fails as "no such package"
+  // instead of surfacing as a 500.
+  if (packageName && !isSafePackageName(packageName)) {
+    reply.code(404).send();
+    return;
+  }
   const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
   const upstreamUrl = getUpstreamBaseForGroup(upstream, groupEnc, normalizedRest);
 
@@ -1374,6 +1433,10 @@ const routes: FastifyPluginAsync = async (app) => {
         const projectId = (req.params as any).projectId as string;
         const restPath = (req.params as any)["*"] as string;
         const packageName = extractPackageName(restPath);
+        if (packageName && !isSafePackageName(packageName)) {
+          reply.code(404).send();
+          return;
+        }
 
         const upstreamUrl = `${defaultUpstream.baseUrl}/api/v4/projects/${projectId}/packages/npm/${restPath}`;
         const headers = buildUpstreamHeaders(req.headers as any);

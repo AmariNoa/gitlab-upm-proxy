@@ -73,9 +73,30 @@ function metadataLockKey(upstreamHost: string, packageName: string): string {
   return `${upstreamHost}|${packageName}`;
 }
 
+export function getUpstreamCacheDir(upstreamHost: string): string {
+  return join(CACHE_DIR, upstreamHost.replace(/:/g, "_"));
+}
+
+// encodeURIComponent leaves "." and ".." untouched, so a package name that decodes to a
+// dot segment would not stay inside its own directory: join() normalizes it away and
+// getPackageCacheDir would hand back the upstream directory (or CACHE_DIR itself for a
+// scoped-looking "..\/.."). Every filesystem helper in this module routes through
+// getPackageCacheDir, so rejecting the name here closes the whole class at once -
+// including the recursive delete the routes layer performs on an upstream 404, which
+// would otherwise wipe the cache and the signing key stored next to it. Names that only
+// *contain* dots or slashes are fine: encodeSegment escapes the separators, leaving a
+// single (odd-looking but harmless) directory name.
+export function isSafePackageName(packageName: string): boolean {
+  if (!packageName) return false;
+  const encoded = encodeSegment(packageName);
+  return encoded !== "." && encoded !== "..";
+}
+
 export function getPackageCacheDir(upstreamHost: string, packageName: string): string {
-  const safeHost = upstreamHost.replace(/:/g, "_");
-  return join(CACHE_DIR, safeHost, encodeSegment(packageName));
+  if (!isSafePackageName(packageName)) {
+    throw new Error(`Unsafe package name for cache path: ${JSON.stringify(packageName)}`);
+  }
+  return join(getUpstreamCacheDir(upstreamHost), encodeSegment(packageName));
 }
 
 export function getMetadataCachePath(upstreamHost: string, packageName: string): string {
