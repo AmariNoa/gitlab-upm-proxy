@@ -12,18 +12,58 @@
 // constraint documented in test/routes/vpm-tarball-convert.test.ts).
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
 const tarballCacheDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-cache-update-test-"));
 process.env.TARBALL_CACHE_DIR = tarballCacheDir;
 
-import { readMetadataCache, updateMetadataCache, writeMetadataCache, type MetadataCache } from "../../src/lib/cache";
+import {
+  getPackageCacheDir,
+  getUpstreamCacheDir,
+  isSafePackageName,
+  readMetadataCache,
+  updateMetadataCache,
+  writeMetadataCache,
+  type MetadataCache
+} from "../../src/lib/cache";
 
 after(() => {
   rmSync(tarballCacheDir, { recursive: true, force: true });
 });
+
+test(
+  "ドットセグメントのパッケージ名はキャッシュパスへ解決されず、getPackageCacheDirが失敗する",
+  () => {
+    const host = "gitlab.dot-segment.example.com";
+
+    // encodeURIComponent leaves these untouched, so join() would normalize them into the
+    // upstream directory or the cache root itself.
+    for (const unsafe of ["", ".", ".."]) {
+      assert.equal(isSafePackageName(unsafe), false, `expected ${JSON.stringify(unsafe)} to be rejected`);
+      assert.throws(
+        () => getPackageCacheDir(host, unsafe),
+        /Unsafe package name/,
+        `expected getPackageCacheDir to refuse ${JSON.stringify(unsafe)}`
+      );
+    }
+
+    // Names that merely contain dots or separators stay inside their own directory: the
+    // separators are percent-encoded, so they cannot climb out.
+    const upstreamDir = getUpstreamCacheDir(host);
+    for (const safe of ["...", "a..b", "../../x", "@scope/name", "com.example.pkg"]) {
+      assert.equal(isSafePackageName(safe), true, `expected ${JSON.stringify(safe)} to be accepted`);
+      const dir = getPackageCacheDir(host, safe);
+      assert.equal(
+        dirname(dir),
+        upstreamDir,
+        `expected ${JSON.stringify(safe)} to resolve directly under the upstream directory`
+      );
+      assert.notEqual(dir, upstreamDir);
+    }
+  }
+);
 
 test(
   "updateMetadataCacheへの並行呼び出しは互いの更新を失わずディスクへ残す(fix B)",
