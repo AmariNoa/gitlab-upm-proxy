@@ -750,6 +750,28 @@ async function deletePackageCache(upstream: UpstreamEntry, packageName: string):
   await rm(dir, { recursive: true, force: true });
 }
 
+/**
+ * Splits "<name>-<version>" (a tarball filename without its .tgz suffix) back into its
+ * two parts. Splitting at the LAST dash is wrong for prerelease versions: it turns
+ * "com.example.pkg-1.0.0-beta.1" into the package "com.example.pkg-1.0.0" at version
+ * "beta.1", so a URL this proxy generated itself could not be resolved back and answered
+ * 404. Candidates are tried from the earliest dash so the longest valid version wins,
+ * and a candidate only counts when its version half is a complete semver. The last-dash
+ * split is kept as a fallback so filenames whose version is not valid semver resolve
+ * exactly as they did before.
+ */
+function splitTarballBasename(base: string): { name: string; version: string } | null {
+  for (let i = base.indexOf("-"); i > 0; i = base.indexOf("-", i + 1)) {
+    const version = base.slice(i + 1);
+    if (semver.valid(version)) {
+      return { name: base.slice(0, i), version };
+    }
+  }
+  const lastDash = base.lastIndexOf("-");
+  if (lastDash <= 0) return null;
+  return { name: base.slice(0, lastDash), version: base.slice(lastDash + 1) };
+}
+
 function extractTarballFilenameFromUrl(url: string): string | null {
   try {
     const parsed = new URL(url);
@@ -1327,14 +1349,13 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
   }
 
   const base = decodedFile.slice(0, -4);
-  const lastDash = base.lastIndexOf("-");
-  if (lastDash <= 0) {
+  const split = splitTarballBasename(base);
+  if (!split) {
     reply.code(404).send();
     return;
   }
 
-  const decodedName = base.slice(0, lastDash);
-  const decodedVersion = base.slice(lastDash + 1);
+  const { name: decodedName, version: decodedVersion } = split;
   const upstream = selectUpstream(decodedName);
   if (upstream.type !== "vpm") {
     reply.code(404).send();

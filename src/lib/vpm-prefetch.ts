@@ -227,7 +227,25 @@ function mergeVersionsInto(target: any, versionNodes: Record<string, any>): void
   }
 }
 
-async function prefetchForUpstream(
+// Insert-only counterpart of mergeVersionsInto: leaves every version already present on
+// disk exactly as it is. Used for the final flush, whose source is the snapshot this pass
+// read at the start. Versions this pass actually processed have been merged one by one
+// already; replacing the rest wholesale would undo whatever another writer (a request
+// serving the tarball, or another prefetch) stored while this pass was running - dropping
+// the shasum and signature it had just written, which in turn hides the version from
+// filtered metadata.
+function insertMissingVersionsInto(target: any, versionNodes: Record<string, any>): void {
+  target.versions = target.versions && typeof target.versions === "object" ? target.versions : {};
+  for (const [version, node] of Object.entries(versionNodes)) {
+    if (target.versions[version] === undefined) {
+      target.versions[version] = node;
+    }
+  }
+}
+
+// Exported (like prefetchForPackage below) so tests can await one full pass over an
+// upstream deterministically, instead of polling the fire-and-forget background task.
+export async function prefetchForUpstream(
   upstream: UpstreamEntry,
   intervalMs: number,
   log: { info: (obj: any, msg?: string) => void }
@@ -287,7 +305,9 @@ async function prefetchForUpstream(
       }
       const tgzBuffer = await readFile(tgzPath);
       node.dist.shasum = computeSha1(tgzBuffer);
-      if (!hasProxySignature(node.dist)) {
+      // See prefetchForPackage: a regenerated archive invalidates the cached integrity,
+      // so only an untouched archive may reuse its existing signature.
+      if (needsDownload || !hasProxySignature(node.dist)) {
         applyPackageSignature(name, version, tgzBuffer, node.dist);
       }
       applyAuthorIfMissing(node, vpmAuthor);
@@ -305,11 +325,14 @@ async function prefetchForUpstream(
     }
   }
 
+  // Final flush: make sure every package seen in the index has a cache entry, including
+  // packages whose versions were all skipped. Insert-only, so it never overwrites a
+  // version node that is already on disk.
   for (const [name, metadata] of metadataByPackage.entries()) {
     await updateMetadataCache(upstream.host, name, (current) => {
       const target = current?.metadata ?? metadata;
       if (target !== metadata) {
-        mergeVersionsInto(target, metadata.versions ?? {});
+        insertMissingVersionsInto(target, metadata.versions ?? {});
       }
       return buildMetadataCacheEntry(target);
     });
@@ -373,7 +396,12 @@ export async function prefetchForPackage(
     }
     const tgzBuffer = await readFile(tgzPath);
     node.dist.shasum = computeSha1(tgzBuffer);
-    if (!hasProxySignature(node.dist)) {
+    // Re-sign whenever the archive was just (re)built: needsDownload is also set when a
+    // tgz already existed but had to be regenerated to inject the author, and those new
+    // bytes make the cached integrity - which is a hash of the OLD archive - wrong. Only
+    // an untouched archive may keep the signature it already carries under the current
+    // key; leaving a stale integrity in place makes every client reject the download.
+    if (needsDownload || !hasProxySignature(node.dist)) {
       applyPackageSignature(packageName, version, tgzBuffer, node.dist);
     }
     applyAuthorIfMissing(node, vpmAuthor);

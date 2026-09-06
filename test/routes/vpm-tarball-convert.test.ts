@@ -33,6 +33,7 @@ process.env.PUBLIC_BASE_URL = "https://proxy.vpm-convert.example.net";
 process.env.VPM_PREFETCH_INTERVAL_SEC = "0";
 
 import { build, TestContext } from "../helper";
+import { buildStoredZip } from "../lib/zip-fixture";
 import { getTarballCachePath, readMetadataCache, writeMetadataCache, type MetadataCache } from "../../src/lib/cache";
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
 
@@ -75,88 +76,6 @@ after(async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
-
-// ---------------------------------------------------------------------------------
-// Minimal, dependency-free ZIP (stored/uncompressed, method 0) builder: local file
-// headers + data, followed by a central directory and an End Of Central Directory
-// record. No directory entries are written; unzipper.Extract creates parent
-// directories from file paths on its own. CRC-32 is computed with the standard
-// bit-by-bit algorithm (fast enough for the tiny fixtures used here).
-// ---------------------------------------------------------------------------------
-function crc32(buf: Buffer): number {
-  let crc = ~0;
-  for (let i = 0; i < buf.length; i++) {
-    crc ^= buf[i];
-    for (let j = 0; j < 8; j++) {
-      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
-    }
-  }
-  return (~crc) >>> 0;
-}
-
-function buildStoredZip(entries: Array<{ name: string; data: Buffer }>): Buffer {
-  const localParts: Buffer[] = [];
-  const centralParts: Buffer[] = [];
-  let offset = 0;
-
-  for (const entry of entries) {
-    const nameBuf = Buffer.from(entry.name, "utf-8");
-    const crc = crc32(entry.data);
-    const size = entry.data.length;
-
-    const localHeader = Buffer.alloc(30);
-    localHeader.writeUInt32LE(0x04034b50, 0); // local file header signature
-    localHeader.writeUInt16LE(20, 4); // version needed to extract
-    localHeader.writeUInt16LE(0, 6); // general purpose bit flag
-    localHeader.writeUInt16LE(0, 8); // compression method: 0 = stored
-    localHeader.writeUInt16LE(0, 10); // last mod file time
-    localHeader.writeUInt16LE(0, 12); // last mod file date
-    localHeader.writeUInt32LE(crc, 14);
-    localHeader.writeUInt32LE(size, 18); // compressed size
-    localHeader.writeUInt32LE(size, 22); // uncompressed size
-    localHeader.writeUInt16LE(nameBuf.length, 26);
-    localHeader.writeUInt16LE(0, 28); // extra field length
-    localParts.push(localHeader, nameBuf, entry.data);
-
-    const centralHeader = Buffer.alloc(46);
-    centralHeader.writeUInt32LE(0x02014b50, 0); // central file header signature
-    centralHeader.writeUInt16LE(20, 4); // version made by
-    centralHeader.writeUInt16LE(20, 6); // version needed to extract
-    centralHeader.writeUInt16LE(0, 8); // general purpose bit flag
-    centralHeader.writeUInt16LE(0, 10); // compression method
-    centralHeader.writeUInt16LE(0, 12); // last mod file time
-    centralHeader.writeUInt16LE(0, 14); // last mod file date
-    centralHeader.writeUInt32LE(crc, 16);
-    centralHeader.writeUInt32LE(size, 20); // compressed size
-    centralHeader.writeUInt32LE(size, 24); // uncompressed size
-    centralHeader.writeUInt16LE(nameBuf.length, 28);
-    centralHeader.writeUInt16LE(0, 30); // extra field length
-    centralHeader.writeUInt16LE(0, 32); // file comment length
-    centralHeader.writeUInt16LE(0, 34); // disk number start
-    centralHeader.writeUInt16LE(0, 36); // internal file attributes
-    centralHeader.writeUInt32LE(0, 38); // external file attributes
-    centralHeader.writeUInt32LE(offset, 42); // relative offset of local header
-    centralParts.push(centralHeader, nameBuf);
-
-    offset += localHeader.length + nameBuf.length + entry.data.length;
-  }
-
-  const centralDirectory = Buffer.concat(centralParts);
-  const centralDirOffset = offset;
-  const centralDirSize = centralDirectory.length;
-
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0); // end of central directory signature
-  eocd.writeUInt16LE(0, 4); // number of this disk
-  eocd.writeUInt16LE(0, 6); // disk where central directory starts
-  eocd.writeUInt16LE(entries.length, 8); // number of central directory records on this disk
-  eocd.writeUInt16LE(entries.length, 10); // total number of central directory records
-  eocd.writeUInt32LE(centralDirSize, 12);
-  eocd.writeUInt32LE(centralDirOffset, 16);
-  eocd.writeUInt16LE(0, 20); // comment length
-
-  return Buffer.concat([...localParts, centralDirectory, eocd]);
-}
 
 // ---------------------------------------------------------------------------------
 // Test helpers
@@ -377,5 +296,53 @@ test(
     // The rest of the original package.json content must be preserved.
     assert.equal(extractedPackageJson.name, packageName);
     assert.equal(extractedPackageJson.version, version);
+  }
+);
+
+// ---------------------------------------------------------------------------------
+// (d) プレリリース版（バージョンにダッシュを含む）
+// ---------------------------------------------------------------------------------
+// Regression for the second review round: the filename was split at the LAST dash, so
+// "com.example.vpm.pre-1.0.0-beta.1.tgz" was read as the package
+// "com.example.vpm.pre-1.0.0" at version "beta.1". That package matches no VPM scope, so
+// a URL this proxy generated itself answered 404.
+test(
+  "バージョンにダッシュを含むプレリリース版でも、パッケージ名と版が正しく分割される",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.pre";
+    const version = "1.0.0-beta.1";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2), "utf-8")
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "a prerelease tarball URL must resolve");
+    const bodyBuffer = res.rawPayload;
+    assert.ok(bodyBuffer.length > 2 && bodyBuffer[0] === 0x1f && bodyBuffer[1] === 0x8b, "response body must be gzip-compressed");
+
+    // It must have been filed under the prerelease version, not under a truncated name.
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, bodyBuffer);
+
+    const diskMetadata = await readMetadataCache(VPM_HOST, packageName);
+    const dist = diskMetadata?.metadata.versions[version].dist;
+    assert.ok(dist, "the prerelease version's dist must be the one updated");
+    assert.equal(dist.signatures[0].keyid, proxyKeyid);
   }
 );
