@@ -96,7 +96,8 @@ sudo journalctl -u gitlab-upm-proxy -n 50 --no-pager
 
 - `systemctl status` が `active (running)` を示す。
 - 起動ログに例外・スタックトレースが出ていない。
-- 必須の環境変数が欠けている場合は `Missing env: <変数名>` のエラーで即座に停止する（設定漏れが黙って無視されない）。
+- `PUBLIC_BASE_URL`・`TARBALL_CACHE_DIR`・`UPSTREAM_CONFIG_PATH` のいずれかが欠けている場合は、モジュール読み込みの時点で `Missing env: <変数名>` のエラーとなり、プロセスが起動しない（設定漏れが黙って無視されない）。
+- `VPM_PREFETCH_INTERVAL_SEC` はこれらと扱いが異なる。読み出しが背景の prefetch の中で行われ、そこでの例外は捕捉されて `vpm_prefetch_failed` のログになるだけなので、**欠けていてもサーバーは起動して動き続ける**。VPM 型 upstream を設定しているのにこのログが出ている場合は、prefetch が一度も動いていないことを意味するため、設定を確認する。
 - VPM 型 upstream を設定している場合、`vpm_prefetch_start` に続いて `vpm_prefetch_done` または `vpm_prefetch_skip` のログが出る（起動時の prefetch が動いている）。
 
 ---

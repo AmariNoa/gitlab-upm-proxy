@@ -66,7 +66,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 | PUBLIC_BASE_URL | 必須 | プロキシの公開 URL（例: https://upm.example.com）。tarball URL の書き換え基点 |
 | TARBALL_CACHE_DIR | 必須 | tarball / metadata キャッシュと署名鍵の既定置き場。全モジュールが必須扱いで、未設定なら起動時に `Missing env: TARBALL_CACHE_DIR` で停止する |
 | UPSTREAM_CONFIG_PATH | 必須 | upstreams 設定ファイルのパス |
-| VPM_PREFETCH_INTERVAL_SEC | 条件付き必須 | VPM prefetch の取得間隔（秒）。VPM 型 upstream があるとき必須 |
+| VPM_PREFETCH_INTERVAL_SEC | 条件付き必須 | VPM prefetch の取得間隔（秒）。VPM 型 upstream があるとき必須だが、読み出しは背景 prefetch の中で行われ、欠けていても起動は止まらず `vpm_prefetch_failed` のログになるだけ |
 | NPM_SIGNATURE_KEY_PATH | 任意 | 署名鍵 PEM のパス（既定: TARBALL_CACHE_DIR/npm-signing-key.pem） |
 | NPM_SIGNATURE_PRIVATE_KEY_PEM | 任意 | 署名鍵 PEM を直接注入（KEY_PATH より優先） |
 
