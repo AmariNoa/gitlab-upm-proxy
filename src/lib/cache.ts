@@ -38,6 +38,12 @@ type LockRunner = <T>(key: string, fn: () => Promise<T>) => Promise<T>;
 // src/lib/tgz.ts's createTempLockRunner, but stores the exact chained promise it later
 // compares against so table entries are actually removed once the holder releases
 // (tgz.ts's original version compared against a different object and leaked entries).
+//
+// The table lives in this process's memory, so the serialization it provides is
+// in-process only: two processes pointed at the same TARBALL_CACHE_DIR can still
+// interleave their read-modify-write cycles and lose one of the two updates. The proxy
+// is written for a single writer per cache directory (see PROJECT_MAP.md, "並行性の前提").
+// Sharing one cache directory across processes would need a filesystem-level lock here.
 function createLockRunner(): LockRunner {
   const locks = new Map<string, Promise<void>>();
 

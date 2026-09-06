@@ -133,6 +133,15 @@ export function hasProxySignature(dist: any): boolean {
   );
 }
 
+/**
+ * Fetches an upstream's advertised npm signing keys. The returned entries have only been
+ * checked for structural validity (isNpmSigningKey): the key material itself is NOT
+ * verified here, so an upstream can still hand back a key whose keyid does not match its
+ * own public key, or that claims the proxy's keyid. Callers that publish or trust these
+ * keys must filter them with isAuthenticUpstreamSigningKey and drop anything colliding
+ * with getProxySigningKey().keyid first (see handleNpmSigningKeys in
+ * src/routes/gitlab-npm-proxy.ts).
+ */
 export async function fetchUpstreamSigningKeys(
   upstream: UpstreamEntry,
   headers: Record<string, string>

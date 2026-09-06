@@ -75,6 +75,11 @@ function createTempLockRunner(): TempLockRunner {
 // One lock table shared by every caller. Serving a tarball on request and prefetching it
 // in the background use the same temp directory for the same package, so they have to
 // serialize against each other, not only against themselves.
+//
+// Like the metadata lock in src/lib/cache.ts, this table is in-process only: it cannot
+// stop a second process working in the same temp directory from clobbering the extract
+// (see PROJECT_MAP.md, "並行性の前提"). The final tgz is still published by rename, so a
+// concurrent reader never sees a half-written archive either way.
 export const runTempLocked: TempLockRunner = createTempLockRunner();
 
 // Converts a downloaded zip buffer into an npm-style tgz at targetTgzPath, optionally

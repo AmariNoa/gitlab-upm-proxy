@@ -17,7 +17,7 @@ Fastify 5 + TypeScript 製の Unity Package Manager 向け GitLab npm レジス�
 | src/lib/env.ts | 必須環境変数の読み出し（未設定なら即座に失敗する mustEnv） |
 | test/helper.ts | fastify-cli の helper.build で src/app.ts を起動するテストヘルパ |
 | test/lib/ | ライブラリ単体テスト（*.test.ts）と test 専用の補助モジュール |
-| test/routes/ | ルート統合テスト（*.test.ts）。配置先として予約（整備は進行中） |
+| test/routes/ | ルート統合テスト（*.test.ts）。helper.build でアプリを起動し、上流は MockAgent で差し替える |
 | config/upstreams_sample.yml | upstreams 設定のサンプル。実設定 config/upstreams.yml は Git 管理外 |
 
 ## 言語・フレームワーク・依存バージョン（package-lock.json の解決済みバージョン）
@@ -48,7 +48,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 整備中。2026-09-03 時点の main は tsx を参照するが tsx は未インストールで、テストファイルも欠落していた |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-07 時点で 28 ケース（test/routes 13、test/lib 15）。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -76,6 +76,12 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 - TypeScript: tsconfig.json（fastify-tsconfig を extends。module NodeNext、outDir dist、sourceMap）。test/tsconfig.json は noEmit で src と test を含む
 - 環境変数ファイル: .env（Git 管理外。sample.env が雛形）、test/.env.test（テスト用。DOTENV_CONFIG_PATH で指定）
 - Git 管理外（.gitignore）: dist/、node_modules/、coverage/、.env、data/*、config/upstreams.yml、AGENTS.md、CLAUDE.md、docs/orchestration.md、docs/checkpoint.md
+
+### 並行性の前提（単一プロセス）
+
+- キャッシュディレクトリ（TARBALL_CACHE_DIR）を書き換えるのは 1 プロセスだけ、という前提で実装している。metadata の read-modify-write（src/lib/cache.ts の updateMetadataCache）と zip から tgz への変換（src/lib/tgz.ts の runTempLocked）は Promise ベースのロック表で直列化しているが、このロックはプロセス内でしか効かない。
+- したがって、同一の TARBALL_CACHE_DIR を複数プロセス（多重起動、複数インスタンス、クラスタ構成）で共有する構成は想定していない。共有が必要になった場合は、ファイルロック等のプロセス間排他を別途導入する必要がある。
+- ただし最終的な公開はいずれも一時ファイルへ書いてから rename する方式のため、ロックを取らない読み手（別プロセスを含む）が書きかけのファイルを読むことはない。失われうるのは同時更新のうち一方であり、壊れたファイルが残ることではない。
 
 ## ドキュメント
 
