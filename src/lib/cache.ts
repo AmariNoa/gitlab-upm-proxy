@@ -191,6 +191,11 @@ export async function readTarballCache(
   }
 }
 
+// Published the same way as the metadata and the converted VPM archives: written to a
+// uniquely-named temp file in the same directory, then renamed into place. Readers here
+// take no lock (hasTarballCache stats the path, readTarballCache reads it), so a plain
+// write to the final path let a concurrent request observe - and serve - a truncated
+// tarball while another request was still filling it in.
 export async function writeTarballCache(
   upstreamHost: string,
   packageName: string,
@@ -199,6 +204,13 @@ export async function writeTarballCache(
 ): Promise<string> {
   const path = getTarballCachePath(upstreamHost, packageName, filename);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, data);
+  const tempPath = join(dirname(path), `.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tempPath, data);
+    await rename(tempPath, path);
+  } catch (err) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw err;
+  }
   return path;
 }

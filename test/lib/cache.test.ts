@@ -11,6 +11,7 @@
 // src/lib/cache.ts, so it is assigned below BEFORE that module is imported (same
 // constraint documented in test/routes/vpm-tarball-convert.test.ts).
 import { mkdtempSync, rmSync } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -21,17 +22,64 @@ process.env.TARBALL_CACHE_DIR = tarballCacheDir;
 
 import {
   getPackageCacheDir,
+  getTarballCachePath,
   getUpstreamCacheDir,
   isSafePackageName,
   readMetadataCache,
+  readTarballCache,
   updateMetadataCache,
   writeMetadataCache,
+  writeTarballCache,
   type MetadataCache
 } from "../../src/lib/cache";
 
 after(() => {
   rmSync(tarballCacheDir, { recursive: true, force: true });
 });
+
+// Regression for the second review round: writeTarballCache used to write straight to the
+// final path, so a reader that takes no lock (hasTarballCache / readTarballCache) could
+// observe a half-written tarball. Publication now goes through a temp file and rename, so
+// the final path only ever holds a complete archive.
+test(
+  "writeTarballCacheは書き込み中の内容を最終パスへ晒さず、renameの後にのみ完全な内容が現れる",
+  async () => {
+    const host = "gitlab.atomic-tarball.example.com";
+    const packageName = "com.example.atomic";
+    const filename = "com.example.atomic-1.0.0.tgz";
+    // Large enough that a direct write would be observable in pieces.
+    const payload = Buffer.alloc(4 * 1024 * 1024, 0x41);
+
+    const finalPath = getTarballCachePath(host, packageName, filename);
+    const observedSizes: number[] = [];
+    let polling = true;
+    const poller = (async () => {
+      while (polling) {
+        try {
+          observedSizes.push((await stat(finalPath)).size);
+        } catch {
+          // not published yet
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+
+    await writeTarballCache(host, packageName, filename, payload);
+    polling = false;
+    await poller;
+
+    // Whenever the final path existed at all, it already held the complete archive.
+    for (const size of observedSizes) {
+      assert.equal(size, payload.length, "the final path must never expose a partial tarball");
+    }
+    const published = await readTarballCache(host, packageName, filename);
+    assert.equal(published?.length, payload.length);
+
+    // No temp file may be left behind next to it.
+    const leftovers = (await readdir(dirname(finalPath))).filter((name) => name.endsWith(".tmp"));
+    assert.deepEqual(leftovers, [], "the temp file must not survive a successful write");
+  }
+);
 
 test(
   "ドットセグメントのパッケージ名はキャッシュパスへ解決されず、getPackageCacheDirが失敗する",
