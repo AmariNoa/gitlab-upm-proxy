@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as tar from "tar";
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher, type Dispatcher } from "undici";
 
@@ -296,6 +297,60 @@ test(
     // The rest of the original package.json content must be preserved.
     assert.equal(extractedPackageJson.name, packageName);
     assert.equal(extractedPackageJson.version, version);
+  }
+);
+
+// ---------------------------------------------------------------------------------
+// (e) 旧形式エイリアス（/vpm/<package>/<version>）
+// ---------------------------------------------------------------------------------
+// Regression for the third review round: the bare-version spelling of this legacy URL keyed
+// its cache on "<version>.tgz" while metadata advertises "<name>-<version>.tgz". That is a
+// second archive for the same version, and serving it wrote its own integrity into the
+// version node the canonical archive is published under.
+test(
+  "旧形式の /vpm/<package>/<version> は正規のキャッシュキーを使い、別アーカイブを作らない",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.alias";
+    const version = "1.0.0";
+    const canonicalKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2), "utf-8")
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/vpm/${encodeURIComponent(packageName)}/${encodeURIComponent(version)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200);
+    const bodyBuffer = res.rawPayload;
+
+    // The bytes must be filed under the canonical name, and no "<version>.tgz" alias file
+    // may exist beside it.
+    const canonicalTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, canonicalKey));
+    assert.deepEqual(canonicalTgz, bodyBuffer, "the alias must publish the canonical archive");
+    await assert.rejects(
+      () => readFile(getTarballCachePath(VPM_HOST, packageName, `${version}.tgz`)),
+      "no separate archive may be written for the legacy alias"
+    );
+
+    // The signature stored for the version must describe those same canonical bytes.
+    const diskMetadata = await readMetadataCache(VPM_HOST, packageName);
+    const dist = diskMetadata?.metadata.versions[version].dist;
+    assert.ok(dist);
+    assert.equal(dist.integrity, `sha512-${createHash("sha512").update(canonicalTgz).digest("base64")}`);
+    assert.equal(dist.signatures[0].keyid, proxyKeyid);
   }
 );
 
