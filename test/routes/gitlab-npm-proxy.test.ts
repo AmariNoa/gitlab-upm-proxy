@@ -324,6 +324,73 @@ test("非defaultアップストリームのメタデータ補完で、tarball取
   );
 });
 
+// Regression for the fourth review round: the enrichment download is the proxy's own
+// request, but it was built from the caller's headers and cached anything below 400. A
+// caller's Range turned it into a 206 fragment, and a redirect's body was stored under the
+// tarball's name - either way a later request would be served that as the archive.
+test("メタデータ補完のダウンロードはRangeを転送せず、リダイレクトをキャッシュしない", async (t: TestContext) => {
+  mockValidUser();
+  const packageName = "com.example.other.narrow";
+  const version = "1.0.0";
+  const downloadPath = `/assets/${packageName}-${version}.tgz`;
+
+  const sourceDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-narrow-src-"));
+  mkdirSync(join(sourceDir, "package"), { recursive: true });
+  writeFileSync(
+    join(sourceDir, "package", "package.json"),
+    JSON.stringify({ name: packageName, version, author: { name: "Tarball Author" } }),
+    "utf-8"
+  );
+  const tgzPath = join(sourceDir, "package.tgz");
+  await tar.c({ gzip: true, file: tgzPath, cwd: sourceDir }, ["package"]);
+  const tgzBytes = readFileSync(tgzPath);
+  enrichTempDirs.push(sourceDir);
+
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({ path: `/${packageName}`, method: "GET" })
+    .reply(
+      200,
+      {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: { name: packageName, version, dist: { tarball: `${SCOPED_ORIGIN}${downloadPath}` } }
+        }
+      },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  let downloadHeaders: Record<string, string> = {};
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({
+      path: downloadPath,
+      method: "GET",
+      headers(headers) {
+        downloadHeaders = normalizeHeaders(headers);
+        return true;
+      }
+    })
+    .reply(200, tgzBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/my-group/${packageName}`,
+    // A metadata request carrying Range: the enrichment download must not inherit it.
+    headers: { "private-token": "valid-token", range: "bytes=0-9", "if-none-match": "\"etag\"" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.notDeepEqual(downloadHeaders, {}, "the enrichment download must have been attempted");
+  assert.equal(downloadHeaders["range"], undefined, "Range must not narrow the proxy's own download");
+  assert.equal(downloadHeaders["if-none-match"], undefined, "conditional headers must not be forwarded either");
+
+  const cachedPath = join(tarballCacheDir, "npm.example.org", packageName, `${packageName}-${version}.tgz`);
+  assert.deepEqual(readFileSync(cachedPath), tgzBytes, "the complete archive must be what lands in the cache");
+});
+
 // Regression for the third review round: the caller's Range header is forwarded upstream
 // (and the proxy advertises accept-ranges), while the cache-write condition accepted any
 // status below 400. A cold-cache ranged request therefore stored a few bytes as the whole

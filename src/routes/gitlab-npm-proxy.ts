@@ -126,6 +126,27 @@ function headersForDownload(
   return isSameOrigin(targetUrl, upstream.baseUrl) ? headers : withoutCredentials(headers);
 }
 
+// The proxy's own downloads are built from the caller's headers, which is convenient for
+// auth but wrong for anything that narrows the response. A caller's Range or conditional
+// headers would make the upstream answer with a fragment or a 304, and that is not what we
+// are asking for here: we always want the whole archive.
+const RESPONSE_NARROWING_HEADERS = [
+  "range",
+  "if-range",
+  "if-none-match",
+  "if-modified-since",
+  "if-match",
+  "if-unmodified-since"
+];
+
+function withoutResponseNarrowing(headers: Record<string, string>): Record<string, string> {
+  const out = { ...headers };
+  for (const name of Object.keys(out)) {
+    if (RESPONSE_NARROWING_HEADERS.includes(name.toLowerCase())) delete out[name];
+  }
+  return out;
+}
+
 function extractPat(reqHeaders: Record<string, unknown>): string | null {
   const auth =
     (typeof reqHeaders["authorization"] === "string" ? (reqHeaders["authorization"] as string) : "") ||
@@ -541,7 +562,7 @@ async function serveVpmTarball(
   try {
     const buffer = await fetchBufferWithRedirects(
       tarballUrl,
-      headersForDownload(tarballUrl, vpmUpstream, headers)
+      withoutResponseNarrowing(headersForDownload(tarballUrl, vpmUpstream, headers))
     );
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
     await convertZipBufferToTgz(buffer, tgzPath, runTempLocked, vpmAuthor);
@@ -849,7 +870,11 @@ async function downloadTarballToCache(
     throw new Error("Tarball filename not found");
   }
   const res = await request(tarballUrl, { method: "GET", headers });
-  if (res.statusCode >= 400) {
+  // This is the proxy's own download, not a relay of the caller's request, so anything but
+  // a complete 200 must not reach the cache. Redirects are not followed here: their body
+  // would otherwise be stored under the tarball's name and served as the archive, and a
+  // forwarded Range could turn the response into a 206 fragment.
+  if (!isCompleteTarballResponse(res.statusCode, res.headers as Record<string, unknown>)) {
     await res.body.dump();
     throw new Error(`Tarball download failed: ${res.statusCode}`);
   }
@@ -919,7 +944,7 @@ async function mergeMetadataIfNeeded(
             tarballUrl,
             upstream,
             packageName,
-            headersForDownload(tarballUrl, upstream, headers)
+            withoutResponseNarrowing(headersForDownload(tarballUrl, upstream, headers))
           );
         }
         const info = await readPackageInfoFromTarballPath(tarballPath);
