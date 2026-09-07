@@ -375,6 +375,22 @@ function applyAuthorIfMissing(node: any, authorValue: unknown): void {
   }
 }
 
+// mergeShasumFromCache only visits versions the snapshot already knows about, so a version
+// that appeared on disk after the snapshot was taken - published by a prefetch pass running
+// alongside this request - is simply absent from it. Writing that snapshot back therefore
+// deletes the version, and the next request rebuilds it from the index without the shasum
+// that was just discarded, so it is filtered out of every response until some other writer
+// restores it. Copying those versions in first keeps the write additive.
+function insertVersionsMissingFromSnapshot(target: any, cached: any): void {
+  if (!cached?.versions || typeof cached.versions !== "object") return;
+  target.versions = target.versions && typeof target.versions === "object" ? target.versions : {};
+  for (const [version, node] of Object.entries<any>(cached.versions)) {
+    if (target.versions[version] === undefined) {
+      target.versions[version] = node;
+    }
+  }
+}
+
 // Exported for tests: the interleaving this guards against (a snapshot written back over a
 // freshly re-signed archive) is impractical to drive through the HTTP routes.
 export function mergeShasumFromCache(target: any, cached: any): void {
@@ -443,7 +459,10 @@ async function fillAuthorFromTgzIfNeeded(
   }
 }
 
-async function refreshCachedVpmMetadata(
+// Exported for tests, like mergeShasumFromCache: the interleaving it has to survive (a
+// prefetch publishing a version between this request's snapshot and its write) cannot be
+// driven deterministically through the HTTP routes.
+export async function refreshCachedVpmMetadata(
   upstream: UpstreamEntry,
   packageName: string,
   metadata: any
@@ -456,7 +475,10 @@ async function refreshCachedVpmMetadata(
   await updateMetadataCache(upstream.host, packageName, (current) => {
     if (current?.metadata) {
       mergeShasumFromCache(metadata, current.metadata);
+      insertVersionsMissingFromSnapshot(metadata, current.metadata);
     }
+    // Chosen after the merge, so a version added by a concurrent writer can still be the
+    // latest one rather than being rolled back to whatever this snapshot knew.
     const latestVersion = pickLatestVpmVersion(metadata?.versions);
     return {
       latestVersion: latestVersion ?? "",
@@ -1123,9 +1145,10 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
           await updateMetadataCache(upstream.host, name, (current) => {
             if (current?.metadata) {
               mergeShasumFromCache(metadata, current.metadata);
+              insertVersionsMissingFromSnapshot(metadata, current.metadata);
             }
             return {
-              latestVersion,
+              latestVersion: pickLatestVpmVersion(metadata?.versions) ?? latestVersion,
               author: extractAuthor(metadata?.author),
               displayName: typeof metadata?.displayName === "string" ? metadata.displayName : undefined,
               metadata
