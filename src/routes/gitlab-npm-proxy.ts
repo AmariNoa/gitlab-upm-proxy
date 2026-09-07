@@ -389,6 +389,25 @@ function applyAuthorIfMissing(node: any, authorValue: unknown): void {
 // The baseline - the cache as this request first read it - separates the two: anything on
 // disk that the baseline did not have arrived concurrently and is kept; anything the
 // baseline did have is this request's to drop.
+// Removes the versions the upstream index no longer lists. Only versions the baseline knew
+// about are candidates: anything else appeared on disk after this request read the cache and
+// belongs to another writer, whose index may well be newer than the one read here.
+function dropVersionsWithdrawnFromIndex(
+  target: any,
+  indexVersions: Record<string, any> | undefined,
+  baseline: any
+): void {
+  if (!target?.versions || typeof target.versions !== "object") return;
+  if (!indexVersions || typeof indexVersions !== "object") return;
+  const baselineVersions =
+    baseline?.versions && typeof baseline.versions === "object" ? baseline.versions : {};
+  for (const version of Object.keys(target.versions)) {
+    if (indexVersions[version] !== undefined) continue;
+    if (baselineVersions[version] === undefined) continue;
+    delete target.versions[version];
+  }
+}
+
 function insertVersionsAddedSinceBaseline(target: any, cached: any, baseline: any): void {
   if (!cached?.versions || typeof cached.versions !== "object") return;
   const baselineVersions =
@@ -1189,9 +1208,13 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
           await updateMetadataCache(upstream.host, name, (current) => {
             if (current?.metadata) {
               mergeShasumFromCache(metadata, current.metadata);
-              // `cached` is this iteration's baseline: it was read before the index fetch
-              // above, so anything on disk that it did not contain arrived concurrently.
-              insertVersionsAddedSinceBaseline(metadata, current.metadata, cached?.metadata);
+              // No baseline here on purpose. Search walks packages out of an index it has
+              // already fetched, so any per-package cache read happens after that fetch and
+              // cannot tell a concurrent publication from a withdrawal - using it would
+              // delete versions another writer had just published. Everything on disk is
+              // kept instead, and withdrawals are reconciled by the metadata route, which
+              // does read its baseline before fetching the index.
+              insertVersionsAddedSinceBaseline(metadata, current.metadata, undefined);
             }
             return {
               latestVersion: pickLatestVpmVersion(metadata?.versions) ?? latestVersion,
@@ -1381,6 +1404,10 @@ async function proxyGroupNpm(
     }
 
     try {
+      // Read before the index fetch, not after: that request is slow enough for another
+      // writer to publish a version while it is in flight, and a version that appears on
+      // disk after this point must not be mistaken for one the upstream withdrew.
+      const baselineCache = await readMetadataCache(upstream.host, packageName);
       const index = await fetchVpmIndex(upstream, buildUpstreamHeadersFor(upstream, req.headers as any));
       const vpmAuthor = index.author;
       const versions = index.packages?.[packageName]?.versions;
@@ -1394,6 +1421,10 @@ async function proxyGroupNpm(
       const cached = await readMetadataCache(upstream.host, packageName);
       if (cached && latestVersion && cached.latestVersion === latestVersion) {
         const response = JSON.parse(JSON.stringify(cached.metadata));
+        // The cached copy is served as-is on this branch, so this is the only place that can
+        // notice a withdrawal which left the latest version untouched: without it, a version
+        // the upstream removed keeps being advertised for as long as `latest` stays put.
+        dropVersionsWithdrawnFromIndex(response, versions, baselineCache?.metadata);
         if (response?.versions && typeof response.versions === "object") {
           for (const [version, node] of Object.entries<any>(response.versions)) {
             node.dist = node.dist ?? {};
@@ -1408,7 +1439,7 @@ async function proxyGroupNpm(
         // tarball requests resolve from plus the _vpmAuthor used to fill in a missing author.
         await applyVpmSignaturesFromCache(upstream, packageName, response);
         try {
-          await refreshCachedVpmMetadata(upstream, packageName, response);
+          await refreshCachedVpmMetadata(upstream, packageName, response, baselineCache?.metadata);
         } catch {
           // cache update is best-effort
         }
@@ -1440,10 +1471,9 @@ async function proxyGroupNpm(
       // fill in a missing author.
       await applyVpmSignaturesFromCache(upstream, packageName, metadata);
       if (latestVersion) {
-        // cachedForMerge is the baseline: read before this rebuild, so a version on disk
-        // that it lacks was published concurrently and is kept, while one it had and the
-        // index no longer lists was withdrawn upstream and is allowed to go.
-        await refreshCachedVpmMetadata(upstream, packageName, metadata, cachedForMerge?.metadata);
+        // baselineCache, not cachedForMerge: the baseline has to predate the index fetch,
+        // or a version published while that request was in flight looks like a withdrawal.
+        await refreshCachedVpmMetadata(upstream, packageName, metadata, baselineCache?.metadata);
       }
 
       reply.code(200);
