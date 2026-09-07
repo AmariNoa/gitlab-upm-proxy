@@ -357,7 +357,10 @@ export async function prefetchForUpstream(
           // See prefetchForPackage: once the new archive is published, a failure to write
           // the metadata that describes it would leave the cache serving those bytes under
           // the previous signature, with nothing to repair it later. Drop the archive on
-          // that path instead.
+          // that path instead - and put this version's node back the way it was, because
+          // the final flush at the end of the pass would otherwise publish these signing
+          // fields for an archive that no longer exists.
+          const distBeforePublish = JSON.parse(JSON.stringify(node.dist ?? {}));
           try {
           const tgzBuffer = await readFile(tgzPath);
           const previousShasum = node.dist.shasum;
@@ -380,6 +383,7 @@ export async function prefetchForUpstream(
               return buildMetadataCacheEntry(target);
             });
           } catch (err) {
+            node.dist = distBeforePublish;
             if (converted) {
               await rm(tgzPath, { force: true }).catch(() => {});
             }

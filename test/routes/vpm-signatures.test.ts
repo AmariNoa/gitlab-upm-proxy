@@ -322,3 +322,89 @@ test(
     assert.equal(dist.signatures[0].keyid, proxyKey.keyid);
   }
 );
+
+// Regression for the eighth review round: when the upstream withdraws a version that is not
+// the latest one, latestVersion still matches the cache, so every metadata request takes the
+// cache-hit branch. That branch served and rewrote the cached copy without ever consulting
+// the index's version list, so the withdrawn version stayed advertised indefinitely.
+test(
+  "最新版以外が上流から削除された場合、応答とキャッシュの両方から消える",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.withdrawn";
+    const withdrawn = "1.0.0";
+    const latest = "2.0.0";
+    const marker = "withdrawn-non-latest";
+
+    const tarballBytes = Buffer.from("withdrawn-test-tarball-bytes");
+    await writeTarballCache(VPM_HOST, packageName, `${packageName}-${latest}.tgz`, tarballBytes);
+    await writeTarballCache(VPM_HOST, packageName, `${packageName}-${withdrawn}.tgz`, tarballBytes);
+
+    const signedDist = (sig: string) => ({
+      tarball: "",
+      original: `${VPM_ORIGIN}/dl/${packageName}.zip`,
+      shasum: createHash("sha1").update(tarballBytes).digest("hex"),
+      integrity: `sha512-${sig}`,
+      signatures: [{ keyid: proxyKey.keyid, sig }]
+    });
+
+    // Both versions are cached and signed; latest is 2.0.0.
+    await writeMetadataCache(VPM_HOST, packageName, {
+      latestVersion: latest,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest },
+        versions: {
+          // author present on purpose: without it the route tries to read one out of the
+          // tarball, and these bytes are not a real archive.
+          [withdrawn]: {
+            name: packageName,
+            version: withdrawn,
+            author: { name: "Test Author" },
+            dist: signedDist("ONE")
+          },
+          [latest]: {
+            name: packageName,
+            version: latest,
+            author: { name: "Test Author" },
+            dist: signedDist("TWO")
+          }
+        }
+      }
+    });
+
+    // The index no longer lists 1.0.0, but 2.0.0 is unchanged, so latestVersion still
+    // matches and the request takes the cache-hit branch.
+    mockVpmIndex(marker, {
+      packages: {
+        [packageName]: {
+          versions: {
+            [latest]: { name: packageName, version: latest, url: `${VPM_ORIGIN}/dl/${packageName}.zip` }
+          }
+        }
+      }
+    });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { versions: Record<string, unknown> };
+    assert.deepEqual(
+      Object.keys(body.versions),
+      [latest],
+      "the withdrawn version must not be advertised any more"
+    );
+
+    const disk = await readDiskMetadata(packageName);
+    assert.equal(
+      disk.metadata.versions[withdrawn],
+      undefined,
+      "the withdrawn version must be gone from the cache as well"
+    );
+    assert.ok(disk.metadata.versions[latest], "the version still in the index must stay");
+  }
+);
