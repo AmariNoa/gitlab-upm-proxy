@@ -20,8 +20,10 @@ process.env.TARBALL_CACHE_DIR = tarballCacheDir;
 process.env.UPSTREAM_CONFIG_PATH = "test/fixtures/upstreams.test.yml";
 process.env.PUBLIC_BASE_URL = "https://proxy.merge-shasum.example.net";
 
-import { mergeShasumFromCache } from "../../src/routes/gitlab-npm-proxy";
+import { mergeShasumFromCache, refreshCachedVpmMetadata } from "../../src/routes/gitlab-npm-proxy";
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
+import { readMetadataCache, writeMetadataCache, type MetadataCache } from "../../src/lib/cache";
+import type { UpstreamEntry } from "../../src/lib/upstreams";
 
 after(() => {
   rmSync(tarballCacheDir, { recursive: true, force: true });
@@ -114,5 +116,65 @@ test(
       "3333333333333333333333333333333333333333",
       "an upstream registry's own shasum must stay authoritative"
     );
+  }
+);
+
+// Regression for the sixth review round: refreshCachedVpmMetadata writes the request's
+// snapshot back to disk, and mergeShasumFromCache only visits versions that snapshot already
+// contains. A version published by a concurrent prefetch was therefore absent from the
+// write and got deleted, taking its shasum with it - after which every response filtered it
+// out until another writer restored it.
+test(
+  "refreshCachedVpmMetadataは、スナップショットに無い版をディスクから削除しない",
+  async () => {
+    const upstream: UpstreamEntry = {
+      baseUrl: "https://vpm.example.com/index.json",
+      host: "vpm-refresh-merge.example.com",
+      type: "vpm"
+    };
+    const packageName = "com.example.refresh.merge";
+
+    // What a concurrent prefetch has already published: 1.0.0 and a signed 2.0.0.
+    const onDisk: MetadataCache = {
+      latestVersion: "2.0.0",
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: "2.0.0" },
+        versions: {
+          "1.0.0": { name: packageName, version: "1.0.0", dist: { tarball: "", shasum: "a".repeat(40) } },
+          "2.0.0": {
+            name: packageName,
+            version: "2.0.0",
+            dist: {
+              tarball: "",
+              shasum: "b".repeat(40),
+              integrity: "sha512-PUBLISHED-BY-THE-PREFETCH",
+              signatures: [{ keyid: proxyKeyid, sig: "PREFETCH-SIGNATURE" }]
+            }
+          }
+        }
+      }
+    };
+    await writeMetadataCache(upstream.host, packageName, onDisk);
+
+    // What this request built from an older index read: 1.0.0 only.
+    const staleSnapshot = {
+      name: packageName,
+      versions: {
+        "1.0.0": { name: packageName, version: "1.0.0", dist: { tarball: "" } }
+      }
+    };
+
+    await refreshCachedVpmMetadata(upstream, packageName, staleSnapshot);
+
+    const result = await readMetadataCache(upstream.host, packageName);
+    assert.ok(result, "expected a metadata cache entry");
+    const versions = result!.metadata.versions;
+    assert.ok(versions["2.0.0"], "the concurrently published version must survive the refresh");
+    assert.equal(versions["2.0.0"].dist.integrity, "sha512-PUBLISHED-BY-THE-PREFETCH");
+    assert.equal(versions["2.0.0"].dist.signatures[0].sig, "PREFETCH-SIGNATURE");
+    assert.equal(result!.latestVersion, "2.0.0", "latestVersion must not roll back to the snapshot's newest");
+    // The version the snapshot did know about still picks up its cached shasum.
+    assert.equal(versions["1.0.0"].dist.shasum, "a".repeat(40));
   }
 );
