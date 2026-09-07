@@ -90,7 +90,11 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
             dist: {
               tarball: "",
               original: sourceUrl,
-              shasum: "0000000000000000000000000000000000000000",
+              // Must match the bytes on disk: the reuse this test pins is only correct
+              // while the cached signature actually describes the cached archive. Seeding a
+              // shasum that disagrees with the file (as this test used to) asserted an
+              // inconsistent state - updated shasum, stale integrity - as the desired one.
+              shasum: computeSha1(tarballBytes),
               integrity: "sha512-PRESET-SHOULD-NOT-CHANGE",
               signatures: [{ keyid: proxyKey.keyid, sig: "PRESIGNED-MARKER" }]
             }
@@ -112,7 +116,7 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
     const after1 = await readMetadataCache(upstream.host, packageName);
     const dist = after1?.metadata.versions[version].dist;
     assert.ok(dist, "expected the version's dist to still be present");
-    assert.equal(dist.shasum, computeSha1(tarballBytes), "shasum must still be (re)computed from the tgz on disk");
+    assert.equal(dist.shasum, computeSha1(tarballBytes), "shasum must still be (re)computed from the tgz on disk and be unchanged");
     assert.equal(dist.integrity, "sha512-PRESET-SHOULD-NOT-CHANGE", "integrity must not be recomputed when already signed");
     assert.equal(dist.signatures.length, 1);
     assert.equal(dist.signatures[0].keyid, proxyKey.keyid);
@@ -262,6 +266,76 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
       ),
       true,
       "the regenerated archive must carry a signature that verifies against its own integrity"
+    );
+  });
+
+  // Regression for the fourth review round: the previous round only re-signed when THIS
+  // pass rebuilt the archive. Two prefetch passes can overlap - one rebuilds the archive to
+  // inject an author and publishes the new signature, while the other still holds a
+  // snapshot signed for the old bytes. That second pass then hashes the new archive, keeps
+  // the old signature because the keyid still matches, and writes the mismatched node back.
+  it("別の書き手がアーカイブを差し替えた場合も、shasumの変化を見て再署名する", async () => {
+    const packageName = "com.example.prefetch.replaced";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const sourceUrl = `${ZIP_ORIGIN}/dl/${packageName}-${version}.zip`;
+
+    // The archive currently on disk: what the other writer left behind.
+    const newBytes = Buffer.from("archive-rebuilt-by-another-prefetch-pass");
+    await writeTarballCache(upstream.host, packageName, cacheKey, newBytes);
+
+    // The snapshot this pass carries: signed under the current key, for the OLD bytes.
+    const oldBytes = Buffer.from("the-archive-this-pass-still-believes-in");
+    const seedCache: MetadataCache = {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            // An author is present, so this pass has no reason to re-download.
+            author: { name: "Test Author" },
+            dist: {
+              tarball: "",
+              original: sourceUrl,
+              shasum: computeSha1(oldBytes),
+              integrity: `sha512-${createHash("sha512").update(oldBytes).digest("base64")}`,
+              signatures: [{ keyid: proxyKey.keyid, sig: "SIGNATURE-OF-THE-REPLACED-ARCHIVE" }]
+            }
+          }
+        }
+      }
+    };
+    await writeMetadataCache(upstream.host, packageName, seedCache);
+
+    await prefetchForPackage(
+      upstream,
+      packageName,
+      { [version]: { name: packageName, version, url: sourceUrl } },
+      undefined,
+      0,
+      noopLog
+    );
+
+    const updated = await readMetadataCache(upstream.host, packageName);
+    const dist = updated?.metadata.versions[version].dist;
+    assert.ok(dist);
+
+    const expectedIntegrity = `sha512-${createHash("sha512").update(newBytes).digest("base64")}`;
+    assert.equal(dist.shasum, computeSha1(newBytes));
+    assert.equal(dist.integrity, expectedIntegrity, "integrity must follow the archive on disk");
+    assert.notEqual(dist.signatures[0].sig, "SIGNATURE-OF-THE-REPLACED-ARCHIVE");
+    assert.equal(
+      cryptoVerify(
+        "sha256",
+        Buffer.from(`${packageName}@${version}:${expectedIntegrity}`),
+        proxyPublicKey,
+        Buffer.from(dist.signatures[0].sig, "base64")
+      ),
+      true,
+      "the signature must verify against the integrity published beside it"
     );
   });
 

@@ -309,10 +309,11 @@ export async function prefetchForUpstream(
         }
       }
       const tgzBuffer = await readFile(tgzPath);
+      const previousShasum = node.dist.shasum;
       node.dist.shasum = computeSha1(tgzBuffer);
-      // See prefetchForPackage: a regenerated archive invalidates the cached integrity,
-      // so only an untouched archive may reuse its existing signature.
-      if (needsDownload || !hasProxySignature(node.dist)) {
+      // See prefetchForPackage: the cached signature may only be reused when the archive
+      // was neither rebuilt by this pass nor changed underneath it.
+      if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
         applyPackageSignature(name, version, tgzBuffer, node.dist);
       }
       applyAuthorIfMissing(node, vpmAuthor);
@@ -400,13 +401,15 @@ export async function prefetchForPackage(
       }
     }
     const tgzBuffer = await readFile(tgzPath);
+    const previousShasum = node.dist.shasum;
     node.dist.shasum = computeSha1(tgzBuffer);
-    // Re-sign whenever the archive was just (re)built: needsDownload is also set when a
-    // tgz already existed but had to be regenerated to inject the author, and those new
-    // bytes make the cached integrity - which is a hash of the OLD archive - wrong. Only
-    // an untouched archive may keep the signature it already carries under the current
-    // key; leaving a stale integrity in place makes every client reject the download.
-    if (needsDownload || !hasProxySignature(node.dist)) {
+    // The signature must always describe the bytes just hashed. Reusing the cached one is
+    // only correct when nothing about the archive moved: this pass did not rebuild it
+    // (needsDownload), the hash still matches what the snapshot carried, and it is signed
+    // under the current key. A differing hash means someone else rebuilt the archive while
+    // this pass was running - keeping the old integrity there would publish a hash of an
+    // archive nobody serves any more, and every client would reject the download.
+    if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
       applyPackageSignature(packageName, version, tgzBuffer, node.dist);
     }
     applyAuthorIfMissing(node, vpmAuthor);
