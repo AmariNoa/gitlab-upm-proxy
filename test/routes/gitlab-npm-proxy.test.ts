@@ -11,13 +11,17 @@
 // case. Instead a single temp directory is created for the whole file before
 // the app is built for the first time, and removed again after all tests
 // finish.
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
+import * as tar from "tar";
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher, type Dispatcher } from "undici";
 import { build, TestContext } from "../helper";
+
+// Temp directories built by the enrichment test; removed with the cache dir below.
+const enrichTempDirs: string[] = [];
 
 const tarballCacheDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-test-"));
 process.env.TARBALL_CACHE_DIR = tarballCacheDir;
@@ -50,6 +54,9 @@ after(async () => {
   setGlobalDispatcher(originalDispatcher);
   await mockAgent.close();
   rmSync(tarballCacheDir, { recursive: true, force: true });
+  for (const dir of enrichTempDirs) {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 /** Mocks GET {default}/api/v4/user returning 200 (valid PAT), returns a getter for the headers GitLab received. */
@@ -199,12 +206,101 @@ test("スコープに一致する非defaultアップストリーム(npm型)へ�
   const res = await app.inject({
     method: "GET",
     url: "/api/v4/groups/my-group/com.example.other.thing",
-    headers: { "private-token": "valid-token" }
+    headers: {
+      "private-token": "valid-token",
+      authorization: "Bearer valid-token",
+      cookie: "_gitlab_session=super-secret-session"
+    }
   });
 
   assert.equal(res.statusCode, 200);
   assert.equal(scopedCallHeaders["private-token"], undefined);
   assert.equal(scopedCallHeaders["authorization"], undefined);
+  // A session cookie identifies the caller just as much as the PAT does.
+  assert.equal(scopedCallHeaders["cookie"], undefined);
+});
+
+// Regression for the third review round: the metadata enrichment step downloads the latest
+// version's tarball when author/displayName are missing, and it used to do so with the
+// headers built for the DEFAULT upstream. dist.tarball here points at the non-default
+// registry's OWN origin, which is what makes this discriminating: the cross-origin strip in
+// headersForDownload does not apply, so only building the headers for the owning upstream
+// keeps the caller's credentials out of the request.
+test("非defaultアップストリームのメタデータ補完で、tarball取得先へ認証情報が送られない", async (t: TestContext) => {
+  mockValidUser();
+  const packageName = "com.example.other.enrich";
+  const version = "1.0.0";
+  const downloadOrigin = SCOPED_ORIGIN;
+  const downloadPath = `/assets/${packageName}-${version}.tgz`;
+
+  // A real tgz, so the enrichment step can actually read package.json out of it.
+  const sourceDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-enrich-src-"));
+  mkdirSync(join(sourceDir, "package"), { recursive: true });
+  writeFileSync(
+    join(sourceDir, "package", "package.json"),
+    JSON.stringify({ name: packageName, version, author: { name: "Tarball Author" }, displayName: "Tarball Display" }),
+    "utf-8"
+  );
+  const tgzPath = join(sourceDir, "package.tgz");
+  await tar.c({ gzip: true, file: tgzPath, cwd: sourceDir }, ["package"]);
+  const tgzBytes = readFileSync(tgzPath);
+  enrichTempDirs.push(sourceDir);
+
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({ path: `/${packageName}`, method: "GET" })
+    .reply(
+      200,
+      {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            dist: { tarball: `${downloadOrigin}${downloadPath}` }
+          }
+        }
+      },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  let downloadHeaders: Record<string, string> = {};
+  mockAgent
+    .get(downloadOrigin)
+    .intercept({
+      path: downloadPath,
+      method: "GET",
+      headers(headers) {
+        downloadHeaders = normalizeHeaders(headers);
+        return true;
+      }
+    })
+    .reply(200, tgzBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/my-group/${packageName}`,
+    headers: {
+      "private-token": "super-secret-token",
+      authorization: "Bearer super-secret-token",
+      cookie: "_gitlab_session=super-secret-session"
+    }
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = res.json() as { author?: string };
+  assert.equal(body.author, "Tarball Author", "precondition: the enrichment download must have happened");
+
+  assert.notDeepEqual(downloadHeaders, {}, "the tarball download must have been attempted");
+  assert.equal(downloadHeaders["private-token"], undefined);
+  assert.equal(downloadHeaders["authorization"], undefined);
+  assert.equal(downloadHeaders["cookie"], undefined);
+  assert.ok(
+    !JSON.stringify(downloadHeaders).includes("super-secret"),
+    "no header value may carry the caller's credentials to the download host"
+  );
 });
 
 test("プロジェクトスコープのtarball中継はレスポンスをそのまま返しキャッシュへ書き込む", async (t: TestContext) => {

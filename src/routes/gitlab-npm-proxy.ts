@@ -86,8 +86,9 @@ function buildUpstreamHeadersFor(
 ): Record<string, string> {
   const headers = buildUpstreamHeaders(reqHeaders);
   if (upstream.baseUrl !== defaultUpstream.baseUrl) {
-    delete headers["Authorization"];
-    delete headers["PRIVATE-TOKEN"];
+    // Nothing that identifies the caller goes to a registry other than the one they
+    // authenticated against - the session cookie included.
+    return withoutCredentials(headers);
   }
   return headers;
 }
@@ -100,6 +101,12 @@ function withoutCredentials(headers: Record<string, string>): Record<string, str
   const stripped = { ...headers };
   delete stripped["Authorization"];
   delete stripped["PRIVATE-TOKEN"];
+  // buildUpstreamHeaders copies the request's headers verbatim, so a session cookie rides
+  // along unless it is removed here too. It identifies the caller just as much as the PAT
+  // does, and has no business reaching a host outside the upstream we authenticated to.
+  for (const name of Object.keys(stripped)) {
+    if (name.toLowerCase() === "cookie") delete stripped[name];
+  }
   return stripped;
 }
 
@@ -865,7 +872,12 @@ async function mergeMetadataIfNeeded(
         let tarballPath = getTarballCachePath(upstream.host, packageName, filename);
         const cachedTarball = await hasTarballCache(upstream.host, packageName, filename);
         if (!cachedTarball) {
-          tarballPath = await downloadTarballToCache(tarballUrl, upstream, packageName, headers);
+          tarballPath = await downloadTarballToCache(
+            tarballUrl,
+            upstream,
+            packageName,
+            headersForDownload(tarballUrl, upstream, headers)
+          );
         }
         const info = await readPackageInfoFromTarballPath(tarballPath);
         author = author ?? info.author;
@@ -1074,7 +1086,9 @@ async function proxyGroupNpm(
   restPath: string
 ): Promise<void> {
   const normalizedRest = restPath.replace(/^\/+/, "");
-  const headers = buildUpstreamHeadersFor(defaultUpstream, req.headers as any);
+  // No function-wide header set on purpose: each branch below builds headers for the
+  // upstream it actually talks to. A single set built for the default upstream is how the
+  // caller's credentials used to reach other registries and third-party download hosts.
 
   if (normalizedRest.startsWith("npm/")) {
     const parts = normalizedRest.split("/").filter(Boolean);
@@ -1288,7 +1302,15 @@ async function proxyGroupNpm(
           return;
         }
 
-        await mergeMetadataIfNeeded(json, packageName, upstream, headers);
+        // Headers for the upstream that owns this package, not the default one: the
+        // enrichment step may download the tarball, and `headers` above targets the
+        // default upstream and carries the caller's credentials.
+        await mergeMetadataIfNeeded(
+          json,
+          packageName,
+          upstream,
+          buildUpstreamHeadersFor(upstream, req.headers as any)
+        );
 
         const cacheMetadata = JSON.parse(JSON.stringify(json));
         rewriteTarballUrlsInMetadata(json, upstream, groupEnc);
