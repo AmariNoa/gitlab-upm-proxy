@@ -854,22 +854,37 @@ function splitTarballCandidates(base: string): Array<{ name: string; version: st
  * first candidate, which is the previous behaviour.
  */
 async function resolveTarballBasename(
-  base: string
+  base: string,
+  log?: { info: (obj: any, msg?: string) => void }
 ): Promise<{ name: string; version: string } | null> {
   const candidates = splitTarballCandidates(base);
   if (candidates.length === 0) return null;
 
+  const corroborated: Array<{ name: string; version: string }> = [];
   for (const candidate of candidates) {
     if (!isSafePackageName(candidate.name)) continue;
     const upstream = selectUpstream(candidate.name);
     if (upstream.type !== "vpm") continue;
     const cached = await readMetadataCache(upstream.host, candidate.name);
     if (cached?.metadata?.versions?.[candidate.version]) {
-      return candidate;
+      corroborated.push(candidate);
     }
   }
 
-  return candidates[0];
+  if (corroborated.length > 1) {
+    // Two real packages can generate the same filename - "amb" at "1.0.0-2.3.4" and
+    // "amb-1.0.0" at "2.3.4" both produce "amb-1.0.0-2.3.4.tgz" - and this URL format
+    // carries nothing that tells them apart. The first candidate is served, which means the
+    // other package's clients get an archive whose integrity will not match. Nothing can be
+    // decided here; the collision is logged so it is at least visible, and PROJECT_MAP
+    // records the limitation.
+    log?.info(
+      { basename: base, candidates: corroborated.map((c) => `${c.name}@${c.version}`) },
+      "tarball_name_collision"
+    );
+  }
+
+  return corroborated[0] ?? candidates[0];
 }
 
 function extractTarballFilenameFromUrl(url: string): string | null {
@@ -1505,7 +1520,7 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
   }
 
   const base = decodedFile.slice(0, -4);
-  const split = await resolveTarballBasename(base);
+  const split = await resolveTarballBasename(base, req.log);
   if (!split) {
     reply.code(404).send();
     return;

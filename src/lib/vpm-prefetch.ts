@@ -268,7 +268,17 @@ export async function prefetchForUpstream(
     const versions = pkg?.versions;
     if (!versions) continue;
     const cached = await readMetadataCache(upstream.host, name);
-    const metadata = cached?.metadata ?? buildNpmMetadataFromVpm(name, versions);
+    const fresh = buildNpmMetadataFromVpm(name, versions);
+    const metadata = cached?.metadata ?? fresh;
+    if (cached?.metadata) {
+      // Same merge prefetchForPackage does. Taking the cached snapshot alone means the
+      // work list below only ever contains versions that were already cached, so a version
+      // published since the last run is never fetched here. It then has no shasum, gets
+      // filtered out of every metadata response, and stays invisible until a search request
+      // happens to trigger the per-package prefetch. Merging is insert-only for existing
+      // nodes, so the signing fields already on disk are preserved.
+      mergeMissingVersions(metadata, fresh);
+    }
     if (vpmAuthor) {
       metadata._vpmAuthor = vpmAuthor;
     }
