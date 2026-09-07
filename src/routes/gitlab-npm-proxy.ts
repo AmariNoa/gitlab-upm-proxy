@@ -31,7 +31,7 @@ import {
   mergeSigningKeys
 } from "../lib/npm-signatures";
 import { startVpmPrefetchForPackage } from "../lib/vpm-prefetch";
-import { computeSha1, convertZipBufferToTgz, runTempLocked } from "../lib/tgz";
+import { computeSha1, convertZipBufferToTgzUnlocked, runTempLocked } from "../lib/tgz";
 import { mustEnv } from "../lib/env";
 
 const PUBLIC_BASE_URL = mustEnv("PUBLIC_BASE_URL").replace(/\/+$/, "");
@@ -557,7 +557,16 @@ async function serveVpmTarball(
 
   req.log.info({ path, method: req.method }, "vpm_tarball_request");
 
-  const cachedBuffer = await readTarballCache(vpmUpstream.host, decodedName, cacheKey);
+  // Read under the same per-directory lock a conversion holds, so this never serves an
+  // archive from the middle of someone else's transaction: the conversion publishes the new
+  // tgz by rename and only then writes the metadata that describes it, and a lock-free read
+  // landing between the two hands the client new bytes with the previous signature. Waiting
+  // here serializes concurrent downloads of the same package (local file reads, so the cost
+  // is small) and blocks while that package is being converted, which is the point.
+  const cachedBuffer = await runTempLocked(
+    dirname(getTarballCachePath(vpmUpstream.host, decodedName, cacheKey)),
+    () => readTarballCache(vpmUpstream.host, decodedName, cacheKey)
+  );
   if (cachedBuffer) {
     reply.code(200);
     applyTarballHeaders(reply, cachedBuffer.length);
@@ -587,13 +596,13 @@ async function serveVpmTarball(
       withoutResponseNarrowing(headersForDownload(tarballUrl, vpmUpstream, headers))
     );
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
-    await convertZipBufferToTgz(buffer, tgzPath, runTempLocked, vpmAuthor);
-    // Reading the archive, hashing it and publishing what that hash describes is one step,
-    // held under the same per-directory lock the conversion uses: otherwise a prefetch pass
-    // can replace the archive in between, and whichever writer publishes last wins with a
-    // hash that no longer matches the bytes on disk. The conversion above stays outside -
-    // the lock is not reentrant.
+    // Converting the archive, hashing it and publishing what that hash describes is one
+    // change from a client's point of view, so it is one critical section: releasing the
+    // lock between the conversion's rename and the metadata write would let a reader see
+    // the new archive beside the old signature. The unlocked conversion helper is used
+    // because the lock is not reentrant.
     const tgzBuffer = await runTempLocked(dirname(tgzPath), async () => {
+      await convertZipBufferToTgzUnlocked(buffer, tgzPath, vpmAuthor);
       const bytes = await readFile(tgzPath);
       const shasum = computeSha1(bytes);
       const distUpdate: Record<string, unknown> = { shasum };

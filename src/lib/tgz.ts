@@ -84,13 +84,32 @@ export const runTempLocked: TempLockRunner = createTempLockRunner();
 
 // Converts a downloaded zip buffer into an npm-style tgz at targetTgzPath, optionally
 // filling in a missing package.json author from the VPM index. Returns the tgz contents.
+//
+// Callers that go on to hash the result and publish its signature should take the lock
+// themselves and call convertZipBufferToTgzUnlocked inside it: publishing the archive and
+// publishing the metadata that describes it are one change as far as a client is concerned,
+// and releasing the lock in between lets a reader observe the new archive beside the old
+// signature.
 export async function convertZipBufferToTgz(
   zipBuffer: Buffer,
   targetTgzPath: string,
   runLocked: TempLockRunner,
   vpmAuthor?: unknown
 ): Promise<Buffer> {
-  return await runLocked(dirname(targetTgzPath), async () => {
+  return await runLocked(dirname(targetTgzPath), () =>
+    convertZipBufferToTgzUnlocked(zipBuffer, targetTgzPath, vpmAuthor)
+  );
+}
+
+// The body of the conversion, without taking the lock. Only call this while already holding
+// the per-directory lock for dirname(targetTgzPath) - the lock is not reentrant, so calling
+// convertZipBufferToTgz from inside a locked section would deadlock.
+export async function convertZipBufferToTgzUnlocked(
+  zipBuffer: Buffer,
+  targetTgzPath: string,
+  vpmAuthor?: unknown
+): Promise<Buffer> {
+  {
     await mkdir(dirname(targetTgzPath), { recursive: true });
     const tempDir = join(dirname(targetTgzPath), "temp");
     await rm(tempDir, { recursive: true, force: true });
@@ -152,5 +171,5 @@ export async function convertZipBufferToTgz(
         // ignore cleanup errors on Windows
       }
     }
-  });
+  }
 }

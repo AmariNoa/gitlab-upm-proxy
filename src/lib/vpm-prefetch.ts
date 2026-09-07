@@ -7,7 +7,7 @@ import { getTarballCachePath, readMetadataCache, updateMetadataCache, type Metad
 import { applyPackageSignature, hasProxySignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 import { mustEnv } from "./env";
-import { computeSha1, convertZipBufferToTgz, runTempLocked } from "./tgz";
+import { computeSha1, convertZipBufferToTgzUnlocked, runTempLocked } from "./tgz";
 
 type VpmIndex = {
   author?: unknown;
@@ -307,46 +307,55 @@ export async function prefetchForUpstream(
           needsDownload = true;
         }
       }
+      // The zip download stays outside the lock - it is the slow part and needs nothing
+      // from the cache directory.
+      let zipBuffer: Buffer | null = null;
       if (needsDownload) {
         try {
           await delay();
-          const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
-          await convertZipBufferToTgz(zipBuffer, tgzPath, runTempLocked, vpmAuthor);
-          log.info({ packageName: name, version }, "vpm_prefetch_done");
+          zipBuffer = await fetchBufferWithRedirects(sourceUrl);
         } catch (err) {
           log.info({ err, packageName: name, version }, "vpm_prefetch_skip");
           continue;
         }
       }
-      // Hashing the archive and publishing what that hash describes has to be one step.
-      // Comparing against the previous shasum catches an archive that changed BEFORE the
-      // read; it cannot catch one that changes after it. Holding the same per-directory
-      // lock the conversion uses keeps any other in-process writer from replacing the
-      // archive (and publishing its signature) between the read here and the write below,
-      // which would leave this pass overwriting newer metadata with the older archive's
-      // hash. This block must not contain the conversion above: the lock is not reentrant.
-      await runTempLocked(dirname(tgzPath), async () => {
-        const tgzBuffer = await readFile(tgzPath);
-        const previousShasum = node.dist.shasum;
-        node.dist.shasum = computeSha1(tgzBuffer);
-        // See prefetchForPackage: the cached signature may only be reused when the archive
-        // was neither rebuilt by this pass nor changed underneath it.
-        if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
-          applyPackageSignature(name, version, tgzBuffer, node.dist);
-        }
-        applyAuthorIfMissing(node, vpmAuthor);
-        // Re-read the cache under the metadata lock instead of blindly writing our
-        // locally-built `metadata` snapshot: another writer may have updated a DIFFERENT
-        // version's dist fields on disk since we last read. Merge in only the version we
-        // just processed.
-        await updateMetadataCache(upstream.host, name, (current) => {
-          const target = current?.metadata ?? metadata;
-          if (target !== metadata) {
-            mergeVersionsInto(target, { [version]: node });
+      // Converting the archive, hashing it and publishing what that hash describes is one
+      // change from a client's point of view, so it is one critical section. Releasing the
+      // lock between the conversion's rename and the metadata write would let a reader
+      // observe the new archive beside the old signature. Comparing against the previous
+      // shasum, on its own, only catches an archive that changed BEFORE the read.
+      // convertZipBufferToTgzUnlocked is used because the lock is not reentrant.
+      try {
+        await runTempLocked(dirname(tgzPath), async () => {
+          if (zipBuffer) {
+            await convertZipBufferToTgzUnlocked(zipBuffer, tgzPath, vpmAuthor);
+            log.info({ packageName: name, version }, "vpm_prefetch_done");
           }
-          return buildMetadataCacheEntry(target);
+          const tgzBuffer = await readFile(tgzPath);
+          const previousShasum = node.dist.shasum;
+          node.dist.shasum = computeSha1(tgzBuffer);
+          // See prefetchForPackage: the cached signature may only be reused when the
+          // archive was neither rebuilt by this pass nor changed underneath it.
+          if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
+            applyPackageSignature(name, version, tgzBuffer, node.dist);
+          }
+          applyAuthorIfMissing(node, vpmAuthor);
+          // Re-read the cache under the metadata lock instead of blindly writing our
+          // locally-built `metadata` snapshot: another writer may have updated a DIFFERENT
+          // version's dist fields on disk since we last read. Merge in only the version we
+          // just processed.
+          await updateMetadataCache(upstream.host, name, (current) => {
+            const target = current?.metadata ?? metadata;
+            if (target !== metadata) {
+              mergeVersionsInto(target, { [version]: node });
+            }
+            return buildMetadataCacheEntry(target);
+          });
         });
-      });
+      } catch (err) {
+        log.info({ err, packageName: name, version }, "vpm_prefetch_skip");
+        continue;
+      }
     }
   }
 
@@ -408,45 +417,56 @@ export async function prefetchForPackage(
         needsDownload = true;
       }
     }
+    // The download stays outside the lock: it is the slow part and needs nothing from the
+    // cache directory.
+    let zipBuffer: Buffer | null = null;
     if (needsDownload) {
       if (intervalMs > 0) await sleep(intervalMs);
       try {
-        const zipBuffer = await fetchBufferWithRedirects(sourceUrl);
-        await convertZipBufferToTgz(zipBuffer, tgzPath, runTempLocked, vpmAuthor);
-        log.info({ packageName, version }, "vpm_prefetch_done");
+        zipBuffer = await fetchBufferWithRedirects(sourceUrl);
       } catch (err) {
         log.info({ err, packageName, version }, "vpm_prefetch_skip");
         continue;
       }
     }
-    // Hash and publish as one step, under the same per-directory lock the conversion uses,
-    // so no other in-process writer can replace the archive between the read and the write.
-    // The conversion above must stay outside this block: the lock is not reentrant.
-    await runTempLocked(dirname(tgzPath), async () => {
-      const tgzBuffer = await readFile(tgzPath);
-      const previousShasum = node.dist.shasum;
-      node.dist.shasum = computeSha1(tgzBuffer);
-      // The signature must always describe the bytes just hashed. Reusing the cached one is
-      // only correct when nothing about the archive moved: this pass did not rebuild it
-      // (needsDownload), the hash still matches what the snapshot carried, and it is signed
-      // under the current key. A differing hash means someone else rebuilt the archive
-      // before this read - keeping the old integrity there would publish a hash of an
-      // archive nobody serves any more, and every client would reject the download.
-      if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
-        applyPackageSignature(packageName, version, tgzBuffer, node.dist);
-      }
-      applyAuthorIfMissing(node, vpmAuthor);
-      // Same re-read-and-merge as prefetchForUpstream above: only graft this version's
-      // node onto whatever is currently on disk, so a concurrent writer's update to a
-      // different version of this same package is not lost.
-      await updateMetadataCache(upstream.host, packageName, (current) => {
-        const target = current?.metadata ?? metadata;
-        if (target !== metadata) {
-          mergeVersionsInto(target, { [version]: node });
+    // Convert, hash and publish as one critical section, under the same per-directory lock
+    // the conversion takes on its own: releasing it between the conversion's rename and the
+    // metadata write would let a reader see the new archive beside the old signature. The
+    // unlocked conversion helper is used because the lock is not reentrant.
+    try {
+      await runTempLocked(dirname(tgzPath), async () => {
+        if (zipBuffer) {
+          await convertZipBufferToTgzUnlocked(zipBuffer, tgzPath, vpmAuthor);
+          log.info({ packageName, version }, "vpm_prefetch_done");
         }
-        return buildMetadataCacheEntry(target);
+        const tgzBuffer = await readFile(tgzPath);
+        const previousShasum = node.dist.shasum;
+        node.dist.shasum = computeSha1(tgzBuffer);
+        // The signature must always describe the bytes just hashed. Reusing the cached one
+        // is only correct when nothing about the archive moved: this pass did not rebuild
+        // it (needsDownload), the hash still matches what the snapshot carried, and it is
+        // signed under the current key. A differing hash means someone else rebuilt the
+        // archive before this read - keeping the old integrity there would publish a hash
+        // of an archive nobody serves any more, and every client would reject the download.
+        if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
+          applyPackageSignature(packageName, version, tgzBuffer, node.dist);
+        }
+        applyAuthorIfMissing(node, vpmAuthor);
+        // Same re-read-and-merge as prefetchForUpstream above: only graft this version's
+        // node onto whatever is currently on disk, so a concurrent writer's update to a
+        // different version of this same package is not lost.
+        await updateMetadataCache(upstream.host, packageName, (current) => {
+          const target = current?.metadata ?? metadata;
+          if (target !== metadata) {
+            mergeVersionsInto(target, { [version]: node });
+          }
+          return buildMetadataCacheEntry(target);
+        });
       });
-    });
+    } catch (err) {
+      log.info({ err, packageName, version }, "vpm_prefetch_skip");
+      continue;
+    }
   }
 }
 
