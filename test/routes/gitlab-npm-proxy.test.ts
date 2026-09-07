@@ -110,6 +110,27 @@ test("GitLabの/api/v4/userが401を返す場合は401 invalid_tokenを返す", 
   assert.deepEqual(res.json(), { error: "invalid_token" });
 });
 
+// Regression for the fourth review round: the check used to accept anything below 400.
+// undici does not follow redirects, so a GitLab URL answering with a 302 - an http to https
+// hop, or a redirect to a login page - let every token through, valid or not.
+test("GitLabの/api/v4/userがリダイレクトを返す場合も401 invalid_tokenを返す", async (t: TestContext) => {
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: "/api/v4/user", method: "GET" })
+    .reply(302, "", { headers: { location: "https://gitlab.example.com/users/sign_in" } });
+
+  const app = await build(t);
+
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/v1/search?text=widget",
+    headers: { "private-token": "any-token" }
+  });
+
+  assert.equal(res.statusCode, 401);
+  assert.deepEqual(res.json(), { error: "invalid_token" });
+});
+
 test("有効なPATでsearchがレスポンスを返し、GitLabへPATヘッダが転送される", async (t: TestContext) => {
   const user = mockValidUser();
   let packagesCallHeaders: Record<string, string> = {};
