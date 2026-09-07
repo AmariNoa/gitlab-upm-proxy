@@ -158,6 +158,11 @@ async function validateGitlabPat(req: any, reply: any): Promise<boolean> {
       method: "GET",
       headers
     });
+    // This runs on every single request and only the status code is of interest, so the
+    // body must be discarded explicitly: an undici response whose body is never read holds
+    // its connection until the socket is reclaimed, and at request rate that is enough to
+    // exhaust the pool to the default upstream.
+    await res.body.dump();
     if (res.statusCode >= 400) {
       reply.code(401).send({ error: "invalid_token" });
       return false;
@@ -235,6 +240,7 @@ async function fetchVpmIndex(
 ): Promise<VpmIndex> {
   const res = await request(getVpmIndexUrl(upstream), { method: "GET", headers });
   if (res.statusCode >= 400) {
+    await res.body.dump();
     throw new Error(`vpm_index_failed:${res.statusCode}`);
   }
   return (await res.body.json()) as VpmIndex;
@@ -644,10 +650,14 @@ async function fetchBufferWithRedirects(
       if (!isSameOrigin(next, url)) {
         currentHeaders = withoutCredentials(currentHeaders);
       }
+      // The redirect's own body is of no interest, but it still has to be released before
+      // the next hop, or each redirect leaves a connection tied up.
+      await res.body.dump();
       current = next;
       continue;
     }
     if (status >= 400) {
+      await res.body.dump();
       throw new Error(`zip_download_failed:${status}`);
     }
     return Buffer.from(await res.body.arrayBuffer());
@@ -836,6 +846,7 @@ async function downloadTarballToCache(
   }
   const res = await request(tarballUrl, { method: "GET", headers });
   if (res.statusCode >= 400) {
+    await res.body.dump();
     throw new Error(`Tarball download failed: ${res.statusCode}`);
   }
   const buffer = Buffer.from(await res.body.arrayBuffer());
@@ -1056,6 +1067,8 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       });
       const contentType = String(res.headers["content-type"] ?? "");
       if (res.statusCode >= 400 || !contentType.includes("application/json")) {
+        // Skipping this upstream still means releasing its body.
+        await res.body.dump();
         continue;
       }
       const payload = await res.body.json();
