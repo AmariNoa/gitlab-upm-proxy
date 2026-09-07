@@ -375,19 +375,29 @@ function applyAuthorIfMissing(node: any, authorValue: unknown): void {
   }
 }
 
-// mergeShasumFromCache only visits versions the snapshot already knows about, so a version
-// that appeared on disk after the snapshot was taken - published by a prefetch pass running
-// alongside this request - is simply absent from it. Writing that snapshot back therefore
-// deletes the version, and the next request rebuilds it from the index without the shasum
-// that was just discarded, so it is filtered out of every response until some other writer
-// restores it. Copying those versions in first keeps the write additive.
-function insertVersionsMissingFromSnapshot(target: any, cached: any): void {
+// A version that is on disk but missing from what this request is about to write is one of
+// two very different things, and the disk alone cannot tell them apart:
+//
+//   - it was published by a prefetch pass running alongside this request, after the request
+//     read the cache. Writing without it deletes it, and the next request rebuilds it from
+//     the index without the shasum that was just discarded, so it disappears from every
+//     response until some other writer restores it.
+//   - it was in the cache when this request started and the upstream index no longer lists
+//     it. The upstream withdrew it, and restoring it would resurrect it permanently -
+//     including as `latest`, since latestVersion is chosen from what gets written.
+//
+// The baseline - the cache as this request first read it - separates the two: anything on
+// disk that the baseline did not have arrived concurrently and is kept; anything the
+// baseline did have is this request's to drop.
+function insertVersionsAddedSinceBaseline(target: any, cached: any, baseline: any): void {
   if (!cached?.versions || typeof cached.versions !== "object") return;
+  const baselineVersions =
+    baseline?.versions && typeof baseline.versions === "object" ? baseline.versions : {};
   target.versions = target.versions && typeof target.versions === "object" ? target.versions : {};
   for (const [version, node] of Object.entries<any>(cached.versions)) {
-    if (target.versions[version] === undefined) {
-      target.versions[version] = node;
-    }
+    if (target.versions[version] !== undefined) continue;
+    if (baselineVersions[version] !== undefined) continue;
+    target.versions[version] = node;
   }
 }
 
@@ -465,7 +475,12 @@ async function fillAuthorFromTgzIfNeeded(
 export async function refreshCachedVpmMetadata(
   upstream: UpstreamEntry,
   packageName: string,
-  metadata: any
+  metadata: any,
+  // The cache as this request first read it, used to tell a concurrently published version
+  // from one the upstream withdrew. Omitted (or null) means every version on disk that is
+  // missing from `metadata` was withdrawn - correct for callers whose `metadata` IS the
+  // cache they just read.
+  baseline?: any
 ): Promise<void> {
   // Re-read the cache under the lock and merge in whatever shasum/integrity/signatures
   // are present there but missing on `metadata` (which was rebuilt from the VPM index,
@@ -475,7 +490,7 @@ export async function refreshCachedVpmMetadata(
   await updateMetadataCache(upstream.host, packageName, (current) => {
     if (current?.metadata) {
       mergeShasumFromCache(metadata, current.metadata);
-      insertVersionsMissingFromSnapshot(metadata, current.metadata);
+      insertVersionsAddedSinceBaseline(metadata, current.metadata, baseline);
     }
     // Chosen after the merge, so a version added by a concurrent writer can still be the
     // latest one rather than being rolled back to whatever this snapshot knew.
@@ -1154,7 +1169,9 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
           await updateMetadataCache(upstream.host, name, (current) => {
             if (current?.metadata) {
               mergeShasumFromCache(metadata, current.metadata);
-              insertVersionsMissingFromSnapshot(metadata, current.metadata);
+              // `cached` is this iteration's baseline: it was read before the index fetch
+              // above, so anything on disk that it did not contain arrived concurrently.
+              insertVersionsAddedSinceBaseline(metadata, current.metadata, cached?.metadata);
             }
             return {
               latestVersion: pickLatestVpmVersion(metadata?.versions) ?? latestVersion,
@@ -1403,7 +1420,10 @@ async function proxyGroupNpm(
       // fill in a missing author.
       await applyVpmSignaturesFromCache(upstream, packageName, metadata);
       if (latestVersion) {
-        await refreshCachedVpmMetadata(upstream, packageName, metadata);
+        // cachedForMerge is the baseline: read before this rebuild, so a version on disk
+        // that it lacks was published concurrently and is kept, while one it had and the
+        // index no longer lists was withdrawn upstream and is allowed to go.
+        await refreshCachedVpmMetadata(upstream, packageName, metadata, cachedForMerge?.metadata);
       }
 
       reply.code(200);
