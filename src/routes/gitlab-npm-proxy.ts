@@ -775,13 +775,16 @@ async function deletePackageCache(upstream: UpstreamEntry, packageName: string):
  * two parts. Splitting at the LAST dash is wrong for prerelease versions: it turns
  * "com.example.pkg-1.0.0-beta.1" into the package "com.example.pkg-1.0.0" at version
  * "beta.1", so a URL this proxy generated itself could not be resolved back and answered
- * 404. Candidates are tried from the earliest dash so the longest valid version wins,
- * and a candidate only counts when its version half is a complete semver. The last-dash
- * split is kept as a fallback so filenames whose version is not valid semver resolve
- * exactly as they did before.
+ * 404. Candidates are tried from the LAST dash backwards, taking the first whose version
+ * half is a complete semver, and the plain last-dash split remains the fallback when none
+ * is. That ordering resolves both shapes correctly: "pkg-1.0.0-beta.1" finds nothing at
+ * "beta.1" and settles on "1.0.0-beta.1", while a package whose own name ends in something
+ * version-like ("pkg-1.2.3" at version "4.5.6") still splits at the last dash, exactly as
+ * it did before. Searching from the earliest dash instead would read that filename as the
+ * package "pkg" at version "1.2.3-4.5.6", since that is valid semver too.
  */
 function splitTarballBasename(base: string): { name: string; version: string } | null {
-  for (let i = base.indexOf("-"); i > 0; i = base.indexOf("-", i + 1)) {
+  for (let i = base.lastIndexOf("-"); i > 0; i = base.lastIndexOf("-", i - 1)) {
     const version = base.slice(i + 1);
     if (semver.valid(version)) {
       return { name: base.slice(0, i), version };

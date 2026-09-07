@@ -301,6 +301,49 @@ test(
 );
 
 // ---------------------------------------------------------------------------------
+// (f) 名前自体がバージョンらしい接尾辞で終わるパッケージ
+// ---------------------------------------------------------------------------------
+// Regression for the third review round: the previous round replaced the last-dash split
+// with a search from the EARLIEST dash, which reads
+// "com.example.vpm.pkg-1.2.3-4.5.6.tgz" as the package "com.example.vpm.pkg" at version
+// "1.2.3-4.5.6" - also valid semver. Searching from the last dash resolves both this and
+// the prerelease case below.
+test(
+  "名前がバージョン風の接尾辞で終わるパッケージでも、末尾側の分割が優先される",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.pkg-1.2.3";
+    const version = "4.5.6";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2), "utf-8")
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "the package name's version-like suffix must not be split off");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+
+    const diskMetadata = await readMetadataCache(VPM_HOST, packageName);
+    assert.ok(diskMetadata?.metadata.versions[version].dist, "the update must land on the real version node");
+  }
+);
+
+// ---------------------------------------------------------------------------------
 // (e) 旧形式エイリアス（/vpm/<package>/<version>）
 // ---------------------------------------------------------------------------------
 // Regression for the third review round: the bare-version spelling of this legacy URL keyed
