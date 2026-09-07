@@ -453,6 +453,109 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
     assert.equal(oldIntegrity === newIntegrity, false, "precondition: the two archives must differ");
   });
 
+  // Regression for the fifth review round: the startup pass took the cached snapshot
+  // wholesale, so its work list only ever held versions that were already cached. A version
+  // published since the last run was never fetched, never got a shasum, and was therefore
+  // filtered out of every metadata response until a search request happened to trigger the
+  // per-package prefetch instead.
+  it("起動時パスは、インデックスに現れた新しいバージョンも取り込む", async () => {
+    const packageName = "com.example.prefetch.newversion";
+    const cachedVersion = "1.0.0";
+    const newVersion = "2.0.0";
+    const indexPath = "/new-version-index.json";
+    const newZipPath = `/dl/${packageName}-${newVersion}.zip`;
+    const flushUpstream: UpstreamEntry = {
+      baseUrl: `${ZIP_ORIGIN}${indexPath}`,
+      host: "vpm-prefetch-newversion.example.com",
+      type: "vpm"
+    };
+
+    // Already cached and signed: 1.0.0 only.
+    const cachedBytes = Buffer.from("the-already-cached-archive");
+    await writeTarballCache(
+      flushUpstream.host,
+      packageName,
+      `${packageName}-${cachedVersion}.tgz`,
+      cachedBytes
+    );
+    await writeMetadataCache(flushUpstream.host, packageName, {
+      latestVersion: cachedVersion,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: cachedVersion },
+        versions: {
+          [cachedVersion]: {
+            name: packageName,
+            version: cachedVersion,
+            author: { name: "Test Author" },
+            dist: {
+              tarball: "",
+              original: `${ZIP_ORIGIN}/dl/${packageName}-${cachedVersion}.zip`,
+              shasum: computeSha1(cachedBytes),
+              integrity: `sha512-${createHash("sha512").update(cachedBytes).digest("base64")}`,
+              signatures: [{ keyid: proxyKey.keyid, sig: "SIGNATURE-OF-THE-CACHED-ARCHIVE" }]
+            }
+          }
+        }
+      }
+    });
+
+    // The index has both, including the newly published 2.0.0.
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: indexPath, method: "GET" })
+      .reply(
+        200,
+        {
+          packages: {
+            [packageName]: {
+              versions: {
+                [cachedVersion]: {
+                  name: packageName,
+                  version: cachedVersion,
+                  url: `${ZIP_ORIGIN}/dl/${packageName}-${cachedVersion}.zip`
+                },
+                [newVersion]: {
+                  name: packageName,
+                  version: newVersion,
+                  url: `${ZIP_ORIGIN}${newZipPath}`
+                }
+              }
+            }
+          }
+        },
+        { headers: { "content-type": "application/json" } }
+      );
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version: newVersion, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: newZipPath, method: "GET" })
+      .reply(200, zipBuffer, { headers: { "content-type": "application/zip" } });
+
+    await prefetchForUpstream(flushUpstream, 0, noopLog);
+
+    const finalCache = await readMetadataCache(flushUpstream.host, packageName);
+    const newDist = finalCache?.metadata.versions[newVersion]?.dist;
+    assert.ok(newDist, "the newly published version must be present in the cache");
+    assert.equal(typeof newDist.shasum, "string");
+    assert.equal(newDist.shasum.length, 40, "the new version must have been fetched and hashed");
+    assert.equal(newDist.signatures[0].keyid, proxyKey.keyid);
+
+    // The already-cached version keeps its own signature.
+    const cachedDist = finalCache?.metadata.versions[cachedVersion]?.dist;
+    assert.ok(cachedDist);
+    assert.equal(cachedDist.signatures[0].sig, "SIGNATURE-OF-THE-CACHED-ARCHIVE");
+  });
+
   // Regression for the second review round: the pass ends by flushing the snapshot it
   // read at the start back to disk. Doing that as a wholesale replacement undid whatever
   // another writer stored while the pass was running - here, the shasum and signature a
