@@ -163,7 +163,11 @@ async function validateGitlabPat(req: any, reply: any): Promise<boolean> {
     // its connection until the socket is reclaimed, and at request rate that is enough to
     // exhaust the pool to the default upstream.
     await res.body.dump();
-    if (res.statusCode >= 400) {
+    // Only a 200 counts as "this token is valid". undici does not follow redirects, so a
+    // GitLab URL that answers with a 301/302 - an http to https hop, or a redirect to a
+    // login page - used to make every token, valid or not, pass this hook. Anything other
+    // than the documented 200 means the check did not actually happen.
+    if (res.statusCode !== 200) {
       reply.code(401).send({ error: "invalid_token" });
       return false;
     }
