@@ -303,6 +303,57 @@ test("非defaultアップストリームのメタデータ補完で、tarball取
   );
 });
 
+// Regression for the third review round: the caller's Range header is forwarded upstream
+// (and the proxy advertises accept-ranges), while the cache-write condition accepted any
+// status below 400. A cold-cache ranged request therefore stored a few bytes as the whole
+// archive, and every later request was served that truncated file as a complete 200.
+test("Range付きの部分応答(206)はキャッシュされず、後続の通常GETが完全な内容を返す", async (t: TestContext) => {
+  mockValidUser();
+  const fullBytes = Buffer.from("0123456789-full-tarball-content");
+  const partialBytes = fullBytes.subarray(0, 10);
+  const path = "/api/v4/projects/123/packages/npm/ranged/-/ranged-1.0.0.tgz";
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path, method: "GET", headers: { range: "bytes=0-9" } })
+    .reply(206, partialBytes, {
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-range": `bytes 0-9/${fullBytes.length}`
+      }
+    });
+
+  const app = await build(t);
+  const partial = await app.inject({
+    method: "GET",
+    url: path,
+    headers: { "private-token": "valid-token", range: "bytes=0-9" }
+  });
+
+  assert.equal(partial.statusCode, 206);
+  assert.deepEqual(partial.rawPayload, partialBytes, "the partial response is still passed through");
+
+  // Nothing may have been cached, so the next ordinary request goes upstream again.
+  // mockValidUser registers a single-use intercept, so the second request needs its own.
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path, method: "GET" })
+    .reply(200, fullBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const full = await app.inject({
+    method: "GET",
+    url: path,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(full.statusCode, 200);
+  assert.deepEqual(full.rawPayload, fullBytes, "a later request must not be served the truncated bytes");
+
+  const cachedPath = join(tarballCacheDir, DEFAULT_HOST, "ranged", "ranged-1.0.0.tgz");
+  assert.deepEqual(readFileSync(cachedPath), fullBytes, "only the complete archive may be cached");
+});
+
 test("プロジェクトスコープのtarball中継はレスポンスをそのまま返しキャッシュへ書き込む", async (t: TestContext) => {
   mockValidUser();
   const tarballBytes = Buffer.from("fake-tarball-content");

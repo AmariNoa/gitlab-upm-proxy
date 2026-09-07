@@ -803,6 +803,18 @@ function extractTarballFilenameFromUrl(url: string): string | null {
   }
 }
 
+/**
+ * True only for a response that carries the whole tarball. The caller's Range header is
+ * forwarded upstream (and the proxy advertises accept-ranges), so a cold-cache ranged
+ * request can come back as a 206 holding a few bytes. Caching that would publish it as a
+ * complete archive to every later request - and now that publication is atomic, it would do
+ * so reliably.
+ */
+function isCompleteTarballResponse(statusCode: number, headers: Record<string, unknown>): boolean {
+  if (statusCode !== 200) return false;
+  return headers["content-range"] === undefined;
+}
+
 function extractTarballFilenameFromPath(restPath: string): string | null {
   const parts = restPath.split("/").filter(Boolean);
   if (parts.length === 0) return null;
@@ -1362,7 +1374,13 @@ async function proxyGroupNpm(
   reply.code(res.statusCode);
   applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
   const buffer = Buffer.from(await res.body.arrayBuffer());
-  if (isTarball && method === "GET" && packageName && tarballFilename && res.statusCode < 400) {
+  if (
+    isTarball &&
+    method === "GET" &&
+    packageName &&
+    tarballFilename &&
+    isCompleteTarballResponse(res.statusCode, res.headers as Record<string, unknown>)
+  ) {
     await writeTarballCache(upstream.host, packageName, tarballFilename, buffer);
   }
   reply.send(buffer);
@@ -1549,7 +1567,13 @@ const routes: FastifyPluginAsync = async (app) => {
         reply.code(res.statusCode);
         applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
         const buffer = Buffer.from(await res.body.arrayBuffer());
-        if (isTarball && method === "GET" && packageName && tarballFilename && res.statusCode < 400) {
+        if (
+          isTarball &&
+          method === "GET" &&
+          packageName &&
+          tarballFilename &&
+          isCompleteTarballResponse(res.statusCode, res.headers as Record<string, unknown>)
+        ) {
           await writeTarballCache(defaultUpstream.host, packageName, tarballFilename, buffer);
         }
         reply.send(buffer);
