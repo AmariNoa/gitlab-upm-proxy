@@ -1418,15 +1418,27 @@ async function proxyGroupNpm(
           return;
         }
 
+        // Enrichment only fills in author and displayName from inside the tarball, so a
+        // failure here must not take the metadata response with it. It downloads the
+        // archive to do that, and everything about that download can fail for reasons that
+        // say nothing about the metadata: the upstream answers with a redirect (which this
+        // proxy will not follow and will not cache), the host is unreachable, the archive
+        // is not readable as a tar. Before this was caught, any of those turned a perfectly
+        // good metadata response into a 500.
+        //
         // Headers for the upstream that owns this package, not the default one: the
-        // enrichment step may download the tarball, and `headers` above targets the
-        // default upstream and carries the caller's credentials.
-        await mergeMetadataIfNeeded(
-          json,
-          packageName,
-          upstream,
-          buildUpstreamHeadersFor(upstream, req.headers as any)
-        );
+        // enrichment step may download the tarball, and a header set built for the default
+        // upstream would carry the caller's credentials to another registry.
+        try {
+          await mergeMetadataIfNeeded(
+            json,
+            packageName,
+            upstream,
+            buildUpstreamHeadersFor(upstream, req.headers as any)
+          );
+        } catch (err) {
+          req.log.info({ err, packageName }, "metadata_enrichment_failed");
+        }
 
         const cacheMetadata = JSON.parse(JSON.stringify(json));
         rewriteTarballUrlsInMetadata(json, upstream, groupEnc);

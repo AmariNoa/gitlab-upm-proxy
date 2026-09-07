@@ -328,7 +328,7 @@ test("非defaultアップストリームのメタデータ補完で、tarball取
 // request, but it was built from the caller's headers and cached anything below 400. A
 // caller's Range turned it into a 206 fragment, and a redirect's body was stored under the
 // tarball's name - either way a later request would be served that as the archive.
-test("メタデータ補完のダウンロードはRangeを転送せず、リダイレクトをキャッシュしない", async (t: TestContext) => {
+test("メタデータ補完のダウンロードはRangeや条件付きヘッダを転送しない", async (t: TestContext) => {
   mockValidUser();
   const packageName = "com.example.other.narrow";
   const version = "1.0.0";
@@ -389,6 +389,55 @@ test("メタデータ補完のダウンロードはRangeを転送せず、リダ
 
   const cachedPath = join(tarballCacheDir, "npm.example.org", packageName, `${packageName}-${version}.tgz`);
   assert.deepEqual(readFileSync(cachedPath), tgzBytes, "the complete archive must be what lands in the cache");
+});
+
+// Regression for the fifth review round: enrichment only fills in author and displayName,
+// but its download throwing - which a redirect now does, since the proxy neither follows nor
+// caches one - propagated out of the route handler and turned the whole metadata response
+// into a 500.
+test("メタデータ補完のダウンロードがリダイレクトで失敗しても、メタデータ応答は成功する", async (t: TestContext) => {
+  mockValidUser();
+  const packageName = "com.example.other.redirect";
+  const version = "1.0.0";
+  const downloadPath = `/assets/${packageName}-${version}.tgz`;
+
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({ path: `/${packageName}`, method: "GET" })
+    .reply(
+      200,
+      {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: { name: packageName, version, dist: { tarball: `${SCOPED_ORIGIN}${downloadPath}` } }
+        }
+      },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  // An ordinary redirect to a CDN: not followed, not cached, and it must not be fatal.
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({ path: downloadPath, method: "GET" })
+    .reply(302, "", { headers: { location: "https://cdn.example.org/assets/pkg.tgz" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/my-group/${packageName}`,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200, "a failed enrichment download must not fail the metadata request");
+  const body = res.json() as { name: string; author?: string; versions: Record<string, unknown> };
+  assert.equal(body.name, packageName);
+  assert.ok(body.versions[version], "the upstream metadata must still be returned");
+  assert.equal(body.author, undefined, "author simply stays unfilled when enrichment cannot run");
+
+  // Nothing may have been cached from the redirect.
+  const cachedPath = join(tarballCacheDir, "npm.example.org", packageName, `${packageName}-${version}.tgz`);
+  assert.equal(existsSync(cachedPath), false, "a redirect response must not be cached as the archive");
 });
 
 // Regression for the third review round: the caller's Range header is forwarded upstream
