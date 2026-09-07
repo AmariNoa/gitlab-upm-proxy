@@ -20,9 +20,9 @@
 // dedicated mock interceptor keyed on "marker absent" always answers it with an empty
 // package list, regardless of call ordering, and it never touches the packages under
 // test here.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
@@ -36,7 +36,13 @@ process.env.VPM_PREFETCH_INTERVAL_SEC = "0";
 
 import { build, TestContext } from "../helper";
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
-import { writeMetadataCache, writeTarballCache, readMetadataCache, type MetadataCache } from "../../src/lib/cache";
+import {
+  getMetadataCachePath,
+  readMetadataCache,
+  writeMetadataCache,
+  writeTarballCache,
+  type MetadataCache
+} from "../../src/lib/cache";
 
 const DEFAULT_ORIGIN = "https://gitlab.example.com";
 const VPM_ORIGIN = "https://vpm.example.com";
@@ -406,5 +412,120 @@ test(
       "the withdrawn version must be gone from the cache as well"
     );
     assert.ok(disk.metadata.versions[latest], "the version still in the index must stay");
+  }
+);
+
+// Regression for the ninth review round: a package the index does not list was deleted
+// outright - metadata and archives - without asking whether this request could possibly know
+// that. A malformed index is not evidence of a withdrawal, and neither is an index older
+// than a package another writer has just published.
+test(
+  "packagesを持たない不正なインデックスでは、キャッシュを削除しない",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.malformed";
+    const version = "1.0.0";
+    const marker = "malformed-index";
+
+    await writeMetadataCache(VPM_HOST, packageName, {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: { tarball: "", shasum: "d".repeat(40), integrity: "sha512-KEEP", signatures: [] }
+          }
+        }
+      }
+    });
+
+    // A 200 carrying a structurally useless document.
+    mockVpmIndex(marker, {});
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 404, "an unusable index answers 404");
+    const disk = await readMetadataCache(VPM_HOST, packageName);
+    assert.ok(disk, "but the cache must survive it");
+    assert.equal(disk!.metadata.versions[version].dist.integrity, "sha512-KEEP");
+  }
+);
+
+test(
+  "インデックスに無いパッケージでも、基準に無ければ削除しない",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.concurrentpkg";
+    const version = "1.0.0";
+    const marker = "concurrent-package";
+
+    const publishedCache = {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: { tarball: "", shasum: "e".repeat(40), integrity: "sha512-CONCURRENT", signatures: [] }
+          }
+        }
+      }
+    };
+
+    // The index this request reads lists another package, not this one - and the package it
+    // omits is published by "another writer" from inside this reply, i.e. after the request
+    // has taken its baseline and before it sees the index. Written synchronously because a
+    // mock reply callback cannot be async.
+    mockAgent
+      .get(VPM_ORIGIN)
+      .intercept({
+        path: "/index.json",
+        method: "GET",
+        headers(headers) {
+          return normalizeHeaders(headers)["x-vpm-test-route"] === marker;
+        }
+      })
+      .reply(() => {
+        const metadataPath = getMetadataCachePath(VPM_HOST, packageName);
+        mkdirSync(dirname(metadataPath), { recursive: true });
+        writeFileSync(metadataPath, JSON.stringify(publishedCache, null, 2), "utf-8");
+        return {
+          statusCode: 200,
+          data: {
+            packages: {
+              "com.example.vpm.other": {
+                versions: {
+                  "1.0.0": { name: "com.example.vpm.other", version: "1.0.0", url: `${VPM_ORIGIN}/dl/o.zip` }
+                }
+              }
+            }
+          },
+          responseOptions: { headers: { "content-type": "application/json" } }
+        };
+      })
+      .persist();
+
+    const app = await build(t);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 404, "this request cannot serve a package its index does not list");
+    const disk = await readMetadataCache(VPM_HOST, packageName);
+    assert.ok(disk, "but it must not delete what another writer published");
+    assert.equal(disk!.metadata.versions[version].dist.integrity, "sha512-CONCURRENT");
   }
 );

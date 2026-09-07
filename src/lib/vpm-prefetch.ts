@@ -75,6 +75,40 @@ async function readAuthorFromTgz(tgzPath: string): Promise<unknown> {
   }
 }
 
+// Called when an archive was published and the metadata describing it could not be written,
+// so the archive has just been deleted again. Restoring the version's previous dist would be
+// wrong: on a rebuild, the rename already replaced the archive those fields described, and
+// nothing on disk matches them any more. Everything that makes the version look available is
+// stripped instead, in the local snapshot and - best effort - in the persisted metadata, so
+// the version is filtered out of responses until it is fetched again. Neither the response
+// filter nor the signature reuse check would notice otherwise: one only looks for a shasum,
+// the other only at the keyid.
+async function clearVersionAvailability(
+  upstream: UpstreamEntry,
+  packageName: string,
+  version: string,
+  node: any
+): Promise<void> {
+  if (node?.dist) {
+    delete node.dist.shasum;
+    delete node.dist.integrity;
+    delete node.dist.signatures;
+  }
+  try {
+    await updateMetadataCache(upstream.host, packageName, (current) => {
+      const dist = current?.metadata?.versions?.[version]?.dist;
+      if (!dist) return null;
+      delete dist.shasum;
+      delete dist.integrity;
+      delete dist.signatures;
+      return current!;
+    });
+  } catch {
+    // The write that failed a moment ago may well fail again; the local snapshot is
+    // already clean, which is what keeps this pass from publishing the version.
+  }
+}
+
 // Re-runs, under the lock, the same question that was answered before it: does this archive
 // still have to be built? Another writer may have published it, or injected the author into
 // it, while this pass was downloading. Rebuilding on top of that would replace a published
@@ -357,10 +391,9 @@ export async function prefetchForUpstream(
           // See prefetchForPackage: once the new archive is published, a failure to write
           // the metadata that describes it would leave the cache serving those bytes under
           // the previous signature, with nothing to repair it later. Drop the archive on
-          // that path instead - and put this version's node back the way it was, because
-          // the final flush at the end of the pass would otherwise publish these signing
-          // fields for an archive that no longer exists.
-          const distBeforePublish = JSON.parse(JSON.stringify(node.dist ?? {}));
+          // that path instead - and strip what makes this version look available, because
+          // the final flush at the end of the pass would otherwise publish signing fields
+          // for an archive that no longer exists.
           try {
           const tgzBuffer = await readFile(tgzPath);
           const previousShasum = node.dist.shasum;
@@ -383,9 +416,9 @@ export async function prefetchForUpstream(
               return buildMetadataCacheEntry(target);
             });
           } catch (err) {
-            node.dist = distBeforePublish;
             if (converted) {
               await rm(tgzPath, { force: true }).catch(() => {});
+              await clearVersionAvailability(upstream, name, version, node);
             }
             throw err;
           }
@@ -513,6 +546,11 @@ export async function prefetchForPackage(
         } catch (err) {
           if (converted) {
             await rm(tgzPath, { force: true }).catch(() => {});
+            // Same as prefetchForUpstream: this pass keeps going to the next version, and
+            // the fallback write there takes the whole local snapshot when the cache is
+            // still absent - which would publish this version's signing fields for an
+            // archive that has just been deleted.
+            await clearVersionAvailability(upstream, packageName, version, node);
           }
           throw err;
         }

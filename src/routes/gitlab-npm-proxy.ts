@@ -1410,9 +1410,23 @@ async function proxyGroupNpm(
       const baselineCache = await readMetadataCache(upstream.host, packageName);
       const index = await fetchVpmIndex(upstream, buildUpstreamHeadersFor(upstream, req.headers as any));
       const vpmAuthor = index.author;
-      const versions = index.packages?.[packageName]?.versions;
+      // An index without a usable `packages` map says nothing about what the upstream
+      // still publishes - it is a malformed or truncated document, and fetchVpmIndex only
+      // checks the status code and content type. Treating it as "everything is withdrawn"
+      // would delete the whole package, archives included, on a 200 carrying `{}`.
+      if (!index.packages || typeof index.packages !== "object") {
+        reply.code(404).send();
+        return;
+      }
+      const versions = index.packages[packageName]?.versions;
       if (!versions) {
-        await deletePackageCache(upstream, packageName);
+        // Same rule as for individual versions: only what the baseline knew about may be
+        // treated as withdrawn. A package that appeared on disk after this request read
+        // the cache was published by another writer, whose index is at least as fresh as
+        // the one read here - deleting it would destroy that writer's work.
+        if (baselineCache) {
+          await deletePackageCache(upstream, packageName);
+        }
         reply.code(404).send();
         return;
       }
