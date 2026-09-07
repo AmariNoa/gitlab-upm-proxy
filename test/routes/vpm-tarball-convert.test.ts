@@ -20,7 +20,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -35,7 +35,14 @@ process.env.VPM_PREFETCH_INTERVAL_SEC = "0";
 
 import { build, TestContext } from "../helper";
 import { buildStoredZip } from "../lib/zip-fixture";
-import { getTarballCachePath, readMetadataCache, writeMetadataCache, type MetadataCache } from "../../src/lib/cache";
+import {
+  getTarballCachePath,
+  readMetadataCache,
+  writeMetadataCache,
+  writeTarballCache,
+  type MetadataCache
+} from "../../src/lib/cache";
+import { runTempLocked } from "../../src/lib/tgz";
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
 
 const DEFAULT_ORIGIN = "https://gitlab.example.com";
@@ -297,6 +304,59 @@ test(
     // The rest of the original package.json content must be preserved.
     assert.equal(extractedPackageJson.name, packageName);
     assert.equal(extractedPackageJson.version, version);
+  }
+);
+
+// ---------------------------------------------------------------------------------
+// (h) キャッシュヒット時の読み取りもロックの下で行う
+// ---------------------------------------------------------------------------------
+// Regression for the sixth review round: a conversion publishes the rebuilt archive by
+// rename and writes the metadata describing it a moment later, both inside the package's
+// lock. Serving the cached archive without taking that lock let a request land in between
+// and receive the new bytes with the previous signature. What is pinned here is the
+// mechanism: while the lock is held, the tarball route cannot answer from cache.
+test(
+  "キャッシュ済みtarballの配信は、パッケージのロックを取ってから行われる",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.lockedread";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipUrl = `${VPM_ORIGIN}/dl/${packageName}-${version}.zip`;
+
+    // Already cached, so the request takes the cache-hit path and never converts anything.
+    const cachedBytes = Buffer.from("already-cached-archive-bytes");
+    await writeTarballCache(VPM_HOST, packageName, cacheKey, cachedBytes);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const packageDir = dirname(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    let releaseLock = () => {};
+    const lockHeld = new Promise<void>((resolve) => {
+      releaseLock = () => resolve();
+    });
+    const holder = runTempLocked(packageDir, () => lockHeld);
+
+    const app = await build(t);
+    const pending = app.inject({
+      method: "GET",
+      url: `/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    // Reading a local file is fast, so if the route were not waiting for the lock it would
+    // have answered well inside this window.
+    const stillBlocked = Symbol("still blocked");
+    const raced = await Promise.race([
+      pending.then(() => "answered" as const),
+      new Promise<typeof stillBlocked>((resolve) => setTimeout(() => resolve(stillBlocked), 300))
+    ]);
+    assert.equal(raced, stillBlocked, "the cache-hit path must wait for the package's lock");
+
+    releaseLock();
+    await holder;
+    const res = await pending;
+
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.rawPayload, cachedBytes);
   }
 );
 
