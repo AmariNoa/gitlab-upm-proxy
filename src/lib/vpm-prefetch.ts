@@ -81,10 +81,10 @@ async function fetchBufferWithRedirects(url: string, maxRedirects = 5): Promise<
     const res = await request(current, { method: "GET" });
     const status = res.statusCode;
     if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
-      const next = new URL(res.headers.location, current).toString();
-      // Release the redirect's body before the next hop; an unread undici body keeps its
-      // connection occupied.
+      // Released before the Location is parsed: a malformed one makes the URL constructor
+      // throw, and an unread undici body keeps its connection occupied.
       await res.body.dump();
+      const next = new URL(res.headers.location, current).toString();
       current = next;
       continue;
     }

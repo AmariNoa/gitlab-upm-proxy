@@ -669,15 +669,16 @@ async function fetchBufferWithRedirects(
     const res = await request(current, { method: "GET", headers: currentHeaders });
     const status = res.statusCode;
     if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
+      // Released before the Location is parsed: a malformed one makes the URL constructor
+      // throw, and doing this afterwards would leave the body unread on exactly the path
+      // where the request is abandoned.
+      await res.body.dump();
       const next = new URL(res.headers.location, current).toString();
       // Follow-the-credentials is how tokens end up in someone else's logs: once the
       // redirect chain leaves the origin we were authorized for, drop them for good.
       if (!isSameOrigin(next, url)) {
         currentHeaders = withoutCredentials(currentHeaders);
       }
-      // The redirect's own body is of no interest, but it still has to be released before
-      // the next hop, or each redirect leaves a connection tied up.
-      await res.body.dump();
       current = next;
       continue;
     }
@@ -810,24 +811,56 @@ async function deletePackageCache(upstream: UpstreamEntry, packageName: string):
  * two parts. Splitting at the LAST dash is wrong for prerelease versions: it turns
  * "com.example.pkg-1.0.0-beta.1" into the package "com.example.pkg-1.0.0" at version
  * "beta.1", so a URL this proxy generated itself could not be resolved back and answered
- * 404. Candidates are tried from the LAST dash backwards, taking the first whose version
- * half is a complete semver, and the plain last-dash split remains the fallback when none
- * is. That ordering resolves both shapes correctly: "pkg-1.0.0-beta.1" finds nothing at
- * "beta.1" and settles on "1.0.0-beta.1", while a package whose own name ends in something
- * version-like ("pkg-1.2.3" at version "4.5.6") still splits at the last dash, exactly as
- * it did before. Searching from the earliest dash instead would read that filename as the
- * package "pkg" at version "1.2.3-4.5.6", since that is valid semver too.
+ * 404. No scan direction gets this right on its own, because the filename is genuinely
+ * ambiguous: "pkg-1.0.0-beta.1" is the package "pkg" at a prerelease version, while
+ * "pkg-1.2.3-4.5.6" is most likely the package "pkg-1.2.3" at version "4.5.6" - and
+ * "pkg-1.0.0-2.3.4" could be either, since both halves are valid semver. Candidates are
+ * therefore listed from the last dash backwards and resolved against what the proxy
+ * actually knows, in splitTarballCandidates' caller.
  */
-function splitTarballBasename(base: string): { name: string; version: string } | null {
+function splitTarballCandidates(base: string): Array<{ name: string; version: string }> {
+  const candidates: Array<{ name: string; version: string }> = [];
   for (let i = base.lastIndexOf("-"); i > 0; i = base.lastIndexOf("-", i - 1)) {
     const version = base.slice(i + 1);
     if (semver.valid(version)) {
-      return { name: base.slice(0, i), version };
+      candidates.push({ name: base.slice(0, i), version });
     }
   }
   const lastDash = base.lastIndexOf("-");
-  if (lastDash <= 0) return null;
-  return { name: base.slice(0, lastDash), version: base.slice(lastDash + 1) };
+  if (lastDash > 0) {
+    const fallback = { name: base.slice(0, lastDash), version: base.slice(lastDash + 1) };
+    // The historical behaviour, kept last so filenames whose version is not valid semver
+    // still resolve exactly as they always did.
+    if (!candidates.some((c) => c.name === fallback.name && c.version === fallback.version)) {
+      candidates.push(fallback);
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Picks the candidate split that the proxy can actually corroborate: the name must belong
+ * to a VPM upstream, and that upstream's metadata cache must already list the version. Only
+ * when nothing can be corroborated - a cold cache, typically - does it fall back to the
+ * first candidate, which is the previous behaviour.
+ */
+async function resolveTarballBasename(
+  base: string
+): Promise<{ name: string; version: string } | null> {
+  const candidates = splitTarballCandidates(base);
+  if (candidates.length === 0) return null;
+
+  for (const candidate of candidates) {
+    if (!isSafePackageName(candidate.name)) continue;
+    const upstream = selectUpstream(candidate.name);
+    if (upstream.type !== "vpm") continue;
+    const cached = await readMetadataCache(upstream.host, candidate.name);
+    if (cached?.metadata?.versions?.[candidate.version]) {
+      return candidate;
+    }
+  }
+
+  return candidates[0];
 }
 
 function extractTarballFilenameFromUrl(url: string): string | null {
@@ -1451,7 +1484,7 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
   }
 
   const base = decodedFile.slice(0, -4);
-  const split = splitTarballBasename(base);
+  const split = await resolveTarballBasename(base);
   if (!split) {
     reply.code(404).send();
     return;

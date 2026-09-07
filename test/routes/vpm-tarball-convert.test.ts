@@ -301,6 +301,52 @@ test(
 );
 
 // ---------------------------------------------------------------------------------
+// (g) 名前と版のどちらにもダッシュが現れ、分割が曖昧なケース
+// ---------------------------------------------------------------------------------
+// Regression for the fourth review round: "com.example.vpm.amb-1.0.0-2.3.4.tgz" splits two
+// ways that are both valid semver - the package "com.example.vpm.amb" at the prerelease
+// version "1.0.0-2.3.4", or the package "com.example.vpm.amb-1.0.0" at version "2.3.4". No
+// scan direction settles it; only the metadata the proxy already holds does.
+test(
+  "分割が曖昧なファイル名は、メタデータキャッシュに実在する組み合わせで解決される",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.amb";
+    const version = "1.0.0-2.3.4";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2), "utf-8")
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    // Only this combination exists, so the other reading of the filename must lose.
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "the split corroborated by the metadata cache must win");
+
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+
+    const diskMetadata = await readMetadataCache(VPM_HOST, packageName);
+    const dist = diskMetadata?.metadata.versions[version].dist;
+    assert.ok(dist, "the update must land on the prerelease version node");
+    assert.equal(dist.signatures[0].keyid, proxyKeyid);
+  }
+);
+
+// ---------------------------------------------------------------------------------
 // (f) 名前自体がバージョンらしい接尾辞で終わるパッケージ
 // ---------------------------------------------------------------------------------
 // Regression for the third review round: the previous round replaced the last-dash split
