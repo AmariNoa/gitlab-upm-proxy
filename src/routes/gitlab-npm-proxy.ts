@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { FastifyPluginAsync } from "fastify";
 import * as semver from "semver";
 import * as tar from "tar";
@@ -566,40 +566,49 @@ async function serveVpmTarball(
     );
     const tgzPath = getTarballCachePath(vpmUpstream.host, decodedName, cacheKey);
     await convertZipBufferToTgz(buffer, tgzPath, runTempLocked, vpmAuthor);
-    const tgzBuffer = await readFile(tgzPath);
-    const shasum = computeSha1(tgzBuffer);
-    const distUpdate: Record<string, unknown> = { shasum };
-    applyPackageSignature(decodedName, decodedVersion, tgzBuffer, distUpdate);
+    // Reading the archive, hashing it and publishing what that hash describes is one step,
+    // held under the same per-directory lock the conversion uses: otherwise a prefetch pass
+    // can replace the archive in between, and whichever writer publishes last wins with a
+    // hash that no longer matches the bytes on disk. The conversion above stays outside -
+    // the lock is not reentrant.
+    const tgzBuffer = await runTempLocked(dirname(tgzPath), async () => {
+      const bytes = await readFile(tgzPath);
+      const shasum = computeSha1(bytes);
+      const distUpdate: Record<string, unknown> = { shasum };
+      applyPackageSignature(decodedName, decodedVersion, bytes, distUpdate);
 
-    const fallbackMetadata = cachedMetadata?.metadata;
-    if (fallbackMetadata?.versions && typeof fallbackMetadata.versions === "object") {
-      // Re-read the cache under the lock: `cachedMetadata` was read before the (slow)
-      // network fetch and tgz conversion above, so it may be stale by now. Only the
-      // freshly read version node's dist fields and author are set, so a concurrent
-      // update to a different version is not overwritten.
-      await updateMetadataCache(vpmUpstream.host, decodedName, (current) => {
-        const target = current?.metadata ?? fallbackMetadata;
-        const freshVersionNode =
-          target?.versions && typeof target.versions === "object"
-            ? target.versions[decodedVersion]
-            : undefined;
-        if (!freshVersionNode?.dist) return null;
-        freshVersionNode.dist.shasum = distUpdate.shasum;
-        if (typeof distUpdate.integrity === "string") {
-          freshVersionNode.dist.integrity = distUpdate.integrity;
-        }
-        if (Array.isArray(distUpdate.signatures)) {
-          freshVersionNode.dist.signatures = distUpdate.signatures;
-        }
-        applyAuthorIfMissing(freshVersionNode, vpmAuthor);
-        return {
-          latestVersion: current?.latestVersion ?? cachedMetadata?.latestVersion ?? "",
-          author: current?.author ?? cachedMetadata?.author,
-          displayName: current?.displayName ?? cachedMetadata?.displayName,
-          metadata: target
-        };
-      });
-    }
+      const fallbackMetadata = cachedMetadata?.metadata;
+      if (fallbackMetadata?.versions && typeof fallbackMetadata.versions === "object") {
+        // Re-read the cache under the metadata lock: `cachedMetadata` was read before the
+        // (slow) network fetch and tgz conversion above, so it may be stale by now. Only
+        // the freshly read version node's dist fields and author are set, so a concurrent
+        // update to a different version is not overwritten.
+        await updateMetadataCache(vpmUpstream.host, decodedName, (current) => {
+          const target = current?.metadata ?? fallbackMetadata;
+          const freshVersionNode =
+            target?.versions && typeof target.versions === "object"
+              ? target.versions[decodedVersion]
+              : undefined;
+          if (!freshVersionNode?.dist) return null;
+          freshVersionNode.dist.shasum = distUpdate.shasum;
+          if (typeof distUpdate.integrity === "string") {
+            freshVersionNode.dist.integrity = distUpdate.integrity;
+          }
+          if (Array.isArray(distUpdate.signatures)) {
+            freshVersionNode.dist.signatures = distUpdate.signatures;
+          }
+          applyAuthorIfMissing(freshVersionNode, vpmAuthor);
+          return {
+            latestVersion: current?.latestVersion ?? cachedMetadata?.latestVersion ?? "",
+            author: current?.author ?? cachedMetadata?.author,
+            displayName: current?.displayName ?? cachedMetadata?.displayName,
+            metadata: target
+          };
+        });
+      }
+
+      return bytes;
+    });
 
     reply.code(200);
     applyTarballHeaders(reply, tgzBuffer.length);

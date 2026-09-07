@@ -12,7 +12,7 @@
 import * as assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { after, before, describe, it } from "node:test";
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher, type Dispatcher } from "undici";
@@ -24,13 +24,15 @@ import { getProxySigningKey } from "../../src/lib/npm-signatures";
 import { prefetchForPackage, prefetchForUpstream } from "../../src/lib/vpm-prefetch";
 import {
   getMetadataCachePath,
+  getTarballCachePath,
   readMetadataCache,
   readTarballCache,
+  updateMetadataCache,
   writeMetadataCache,
   writeTarballCache,
   type MetadataCache
 } from "../../src/lib/cache";
-import { computeSha1 } from "../../src/lib/tgz";
+import { computeSha1, runTempLocked } from "../../src/lib/tgz";
 import { buildStoredZip } from "./zip-fixture";
 import type { UpstreamEntry } from "../../src/lib/upstreams";
 
@@ -337,6 +339,118 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
       true,
       "the signature must verify against the integrity published beside it"
     );
+  });
+
+  // Regression for the fifth review round: comparing shasums catches an archive that
+  // changed BEFORE the read, not one that changes after it. This test drives that exact
+  // order - the prefetch reads the archive, and only then does another writer replace it
+  // and publish the replacement's signature - by hooking the lock the prefetch has to take
+  // before it may publish. Without holding that lock across read-and-publish, the prefetch
+  // writes the old archive's hash over the newer metadata.
+  it("読み取り後にアーカイブが差し替えられても、古い署名で新しいメタデータを上書きしない", async () => {
+    const packageName = "com.example.prefetch.interleaved";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const sourceUrl = `${ZIP_ORIGIN}/dl/${packageName}-${version}.zip`;
+
+    const oldBytes = Buffer.from("the-archive-present-when-the-pass-starts");
+    const newBytes = Buffer.from("the-archive-another-writer-publishes-later");
+    await writeTarballCache(upstream.host, packageName, cacheKey, oldBytes);
+
+    const oldIntegrity = `sha512-${createHash("sha512").update(oldBytes).digest("base64")}`;
+    const newIntegrity = `sha512-${createHash("sha512").update(newBytes).digest("base64")}`;
+
+    const seedCache: MetadataCache = {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: {
+              tarball: "",
+              original: sourceUrl,
+              shasum: computeSha1(oldBytes),
+              integrity: oldIntegrity,
+              signatures: [{ keyid: proxyKey.keyid, sig: "SIGNATURE-OF-THE-OLD-ARCHIVE" }]
+            }
+          }
+        }
+      }
+    };
+    await writeMetadataCache(upstream.host, packageName, seedCache);
+
+    // Racing the two writers and inspecting the outcome cannot pin this down: whether the
+    // bad interleaving happens is up to the event loop. What CAN be pinned is the property
+    // that prevents it - the prefetch must not publish while another writer holds the
+    // package's lock. So the lock is taken here first and held; with the fix the prefetch
+    // blocks on it and cannot finish, and without it the prefetch sails past and publishes
+    // the old archive's hash over what this block just wrote.
+    const packageDir = dirname(getTarballCachePath(upstream.host, packageName, cacheKey));
+    let releaseLock = () => {};
+    const lockHeld = new Promise<void>((resolve) => {
+      releaseLock = () => resolve();
+    });
+    const holder = runTempLocked(packageDir, async () => {
+      // Stand in for another writer that has replaced the archive and published its
+      // signature, and is still inside its own critical section.
+      await writeTarballCache(upstream.host, packageName, cacheKey, newBytes);
+      await updateMetadataCache(upstream.host, packageName, (current) => {
+        const target = current?.metadata;
+        if (!target?.versions?.[version]?.dist) return null;
+        target.versions[version].dist.shasum = computeSha1(newBytes);
+        target.versions[version].dist.integrity = newIntegrity;
+        target.versions[version].dist.signatures = [
+          { keyid: proxyKey.keyid, sig: "SIGNATURE-OF-THE-NEW-ARCHIVE" }
+        ];
+        return {
+          latestVersion: current?.latestVersion ?? version,
+          author: current?.author,
+          displayName: current?.displayName,
+          metadata: target
+        };
+      });
+      await lockHeld;
+    });
+
+    const prefetch = prefetchForPackage(
+      upstream,
+      packageName,
+      { [version]: { name: packageName, version, url: sourceUrl } },
+      undefined,
+      0,
+      noopLog
+    );
+
+    // Everything the prefetch does here is local filesystem work, so if it is going to
+    // finish without the lock it finishes well inside this window.
+    const stillBlocked = Symbol("still blocked");
+    const raced = await Promise.race([
+      prefetch.then(() => "finished" as const),
+      new Promise<typeof stillBlocked>((resolve) => setTimeout(() => resolve(stillBlocked), 300))
+    ]);
+    assert.equal(raced, stillBlocked, "the prefetch must not publish while another writer holds the lock");
+
+    releaseLock();
+    await holder;
+    await prefetch;
+
+    // And once it does run, what it publishes must describe the archive on disk.
+    const finalCache = await readMetadataCache(upstream.host, packageName);
+    const dist = finalCache?.metadata.versions[version].dist;
+    assert.ok(dist);
+    const served = await readTarballCache(upstream.host, packageName, cacheKey);
+    assert.ok(served);
+    assert.equal(dist.shasum, computeSha1(served!), "the published shasum must match the archive on disk");
+    assert.equal(
+      dist.integrity,
+      `sha512-${createHash("sha512").update(served!).digest("base64")}`,
+      "the published integrity must match the archive on disk"
+    );
+    assert.equal(oldIntegrity === newIntegrity, false, "precondition: the two archives must differ");
   });
 
   // Regression for the second review round: the pass ends by flushing the snapshot it
