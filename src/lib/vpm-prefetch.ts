@@ -75,6 +75,22 @@ async function readAuthorFromTgz(tgzPath: string): Promise<unknown> {
   }
 }
 
+// Re-runs, under the lock, the same question that was answered before it: does this archive
+// still have to be built? Another writer may have published it, or injected the author into
+// it, while this pass was downloading. Rebuilding on top of that would replace a published
+// archive with different bytes.
+async function stillNeedsConversion(
+  tgzPath: string,
+  node: any,
+  vpmAuthor: unknown
+): Promise<boolean> {
+  const exists = await stat(tgzPath).then(() => true).catch(() => false);
+  if (!exists) return true;
+  if (node?.author || !vpmAuthor) return false;
+  const currentAuthor = await readAuthorFromTgz(tgzPath);
+  return !currentAuthor;
+}
+
 async function fetchBufferWithRedirects(url: string, maxRedirects = 5): Promise<Buffer> {
   let current = url;
   for (let i = 0; i <= maxRedirects; i++) {
@@ -327,16 +343,28 @@ export async function prefetchForUpstream(
       // convertZipBufferToTgzUnlocked is used because the lock is not reentrant.
       try {
         await runTempLocked(dirname(tgzPath), async () => {
-          if (zipBuffer) {
-            await convertZipBufferToTgzUnlocked(zipBuffer, tgzPath, vpmAuthor);
+          // needsDownload was decided before the lock, and the download since then is slow
+          // enough for another writer to have published this version. Rebuilding on top of
+          // that would replace a published archive with different bytes (author injection
+          // rewrites package.json, so two conversions do not agree byte for byte), leaving
+          // a client that already has the first archive's metadata unable to verify the
+          // second one.
+          const converted = zipBuffer !== null && (await stillNeedsConversion(tgzPath, node, vpmAuthor));
+          if (converted) {
+            await convertZipBufferToTgzUnlocked(zipBuffer!, tgzPath, vpmAuthor);
             log.info({ packageName: name, version }, "vpm_prefetch_done");
           }
+          // See prefetchForPackage: once the new archive is published, a failure to write
+          // the metadata that describes it would leave the cache serving those bytes under
+          // the previous signature, with nothing to repair it later. Drop the archive on
+          // that path instead.
+          try {
           const tgzBuffer = await readFile(tgzPath);
           const previousShasum = node.dist.shasum;
           node.dist.shasum = computeSha1(tgzBuffer);
           // See prefetchForPackage: the cached signature may only be reused when the
           // archive was neither rebuilt by this pass nor changed underneath it.
-          if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
+          if (converted || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
             applyPackageSignature(name, version, tgzBuffer, node.dist);
           }
           applyAuthorIfMissing(node, vpmAuthor);
@@ -345,12 +373,18 @@ export async function prefetchForUpstream(
           // version's dist fields on disk since we last read. Merge in only the version we
           // just processed.
           await updateMetadataCache(upstream.host, name, (current) => {
-            const target = current?.metadata ?? metadata;
-            if (target !== metadata) {
-              mergeVersionsInto(target, { [version]: node });
+              const target = current?.metadata ?? metadata;
+              if (target !== metadata) {
+                mergeVersionsInto(target, { [version]: node });
+              }
+              return buildMetadataCacheEntry(target);
+            });
+          } catch (err) {
+            if (converted) {
+              await rm(tgzPath, { force: true }).catch(() => {});
             }
-            return buildMetadataCacheEntry(target);
-          });
+            throw err;
+          }
         });
       } catch (err) {
         log.info({ err, packageName: name, version }, "vpm_prefetch_skip");
@@ -435,10 +469,20 @@ export async function prefetchForPackage(
     // unlocked conversion helper is used because the lock is not reentrant.
     try {
       await runTempLocked(dirname(tgzPath), async () => {
-        if (zipBuffer) {
-          await convertZipBufferToTgzUnlocked(zipBuffer, tgzPath, vpmAuthor);
+        // See prefetchForUpstream: needsDownload was decided before the lock, and another
+        // writer may have published this version while the download ran. Rebuilding over it
+        // would replace a published archive with different bytes.
+        const converted = zipBuffer !== null && (await stillNeedsConversion(tgzPath, node, vpmAuthor));
+        if (converted) {
+          await convertZipBufferToTgzUnlocked(zipBuffer!, tgzPath, vpmAuthor);
           log.info({ packageName, version }, "vpm_prefetch_done");
         }
+        // From here on the new archive is already published. If the metadata write fails -
+        // the disk filling up while the temp JSON is created, say - the cache would be left
+        // serving these bytes under the previous signature, and nothing repairs that later:
+        // the signature reuse check passes because the keyid still matches. Dropping the
+        // archive on that path is the safe outcome; the next request fetches it again.
+        try {
         const tgzBuffer = await readFile(tgzPath);
         const previousShasum = node.dist.shasum;
         node.dist.shasum = computeSha1(tgzBuffer);
@@ -448,7 +492,7 @@ export async function prefetchForPackage(
         // signed under the current key. A differing hash means someone else rebuilt the
         // archive before this read - keeping the old integrity there would publish a hash
         // of an archive nobody serves any more, and every client would reject the download.
-        if (needsDownload || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
+        if (converted || previousShasum !== node.dist.shasum || !hasProxySignature(node.dist)) {
           applyPackageSignature(packageName, version, tgzBuffer, node.dist);
         }
         applyAuthorIfMissing(node, vpmAuthor);
@@ -456,12 +500,18 @@ export async function prefetchForPackage(
         // node onto whatever is currently on disk, so a concurrent writer's update to a
         // different version of this same package is not lost.
         await updateMetadataCache(upstream.host, packageName, (current) => {
-          const target = current?.metadata ?? metadata;
-          if (target !== metadata) {
-            mergeVersionsInto(target, { [version]: node });
+            const target = current?.metadata ?? metadata;
+            if (target !== metadata) {
+              mergeVersionsInto(target, { [version]: node });
+            }
+            return buildMetadataCacheEntry(target);
+          });
+        } catch (err) {
+          if (converted) {
+            await rm(tgzPath, { force: true }).catch(() => {});
           }
-          return buildMetadataCacheEntry(target);
-        });
+          throw err;
+        }
       });
     } catch (err) {
       log.info({ err, packageName, version }, "vpm_prefetch_skip");

@@ -10,7 +10,7 @@
 // startVpmPrefetchForPackage, so the prefetch pass can be awaited deterministically
 // instead of polled.
 import * as assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
@@ -554,6 +554,140 @@ describe("vpm-prefetch: skips re-signing already-signed cached tarballs", () => 
     const cachedDist = finalCache?.metadata.versions[cachedVersion]?.dist;
     assert.ok(cachedDist);
     assert.equal(cachedDist.signatures[0].sig, "SIGNATURE-OF-THE-CACHED-ARCHIVE");
+  });
+
+  // Regression for the seventh review round: the decision to download is taken before the
+  // lock, and the download is slow enough for another writer to publish the same version in
+  // the meantime. Converting anyway replaces a published archive with different bytes -
+  // author injection rewrites package.json, so two conversions do not agree byte for byte -
+  // and a client holding the first archive's metadata can no longer verify what it gets.
+  it("ロック取得前にダウンロードしても、既に公開済みのアーカイブは作り直さない", async () => {
+    const packageName = "com.example.prefetch.recheck";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const sourceUrl = `${ZIP_ORIGIN}${zipPath}`;
+
+    // No archive yet, so the pass decides to download.
+    await writeMetadataCache(upstream.host, packageName, {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: { tarball: "", original: sourceUrl }
+          }
+        }
+      }
+    });
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version }, null, 2), "utf-8")
+      }
+    ]);
+
+    // Published by "another writer" while this pass is downloading: the reply callback runs
+    // at exactly that point, and writes synchronously so it lands before the lock is taken.
+    const publishedBytes = Buffer.from("archive-published-by-another-writer");
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: zipPath, method: "GET" })
+      .reply(() => {
+        writeFileSync(getTarballCachePath(upstream.host, packageName, cacheKey), publishedBytes);
+        return { statusCode: 200, data: zipBuffer };
+      });
+
+    await prefetchForPackage(
+      upstream,
+      packageName,
+      { [version]: { name: packageName, version, url: sourceUrl } },
+      undefined,
+      0,
+      noopLog
+    );
+
+    const served = await readTarballCache(upstream.host, packageName, cacheKey);
+    assert.ok(served);
+    assert.deepEqual(served, publishedBytes, "the already-published archive must not be replaced");
+
+    // And the metadata must describe those same bytes.
+    const cache = await readMetadataCache(upstream.host, packageName);
+    const dist = cache?.metadata.versions[version].dist;
+    assert.ok(dist);
+    assert.equal(dist.shasum, computeSha1(publishedBytes));
+    assert.equal(
+      dist.integrity,
+      `sha512-${createHash("sha512").update(publishedBytes).digest("base64")}`
+    );
+  });
+
+  // Regression for the seventh review round: the conversion renames the new archive into
+  // place before the metadata that describes it is written. If that write fails, the cache
+  // was left serving the new bytes under the previous signature, and nothing repaired it -
+  // the signature reuse check passes because the keyid still matches.
+  it("メタデータ書き込みが失敗した場合、公開したアーカイブを残さない", async () => {
+    const packageName = "com.example.prefetch.publishfail";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = `/dl/${packageName}-${version}.zip`;
+    const sourceUrl = `${ZIP_ORIGIN}${zipPath}`;
+
+    await writeMetadataCache(upstream.host, packageName, {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: { tarball: "", original: sourceUrl }
+          }
+        }
+      }
+    });
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(JSON.stringify({ name: packageName, version }, null, 2), "utf-8")
+      }
+    ]);
+    mockAgent
+      .get(ZIP_ORIGIN)
+      .intercept({ path: zipPath, method: "GET" })
+      .reply(200, zipBuffer, { headers: { "content-type": "application/zip" } });
+
+    // Make the metadata write fail: a directory where the JSON file has to go cannot be
+    // replaced by a file, so writeJsonAtomic's rename throws.
+    const metadataPath = getMetadataCachePath(upstream.host, packageName);
+    rmSync(metadataPath, { force: true });
+    mkdirSync(metadataPath, { recursive: true });
+
+    await prefetchForPackage(
+      upstream,
+      packageName,
+      { [version]: { name: packageName, version, url: sourceUrl } },
+      undefined,
+      0,
+      noopLog
+    );
+
+    const served = await readTarballCache(upstream.host, packageName, cacheKey);
+    assert.equal(
+      served,
+      null,
+      "an archive whose metadata could not be published must not be left in the cache"
+    );
+
+    rmSync(metadataPath, { recursive: true, force: true });
   });
 
   // Regression for the second review round: the pass ends by flushing the snapshot it

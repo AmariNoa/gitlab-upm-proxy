@@ -617,8 +617,18 @@ async function serveVpmTarball(
     // the new archive beside the old signature. The unlocked conversion helper is used
     // because the lock is not reentrant.
     const tgzBuffer = await runTempLocked(dirname(tgzPath), async () => {
-      await convertZipBufferToTgzUnlocked(buffer, tgzPath, vpmAuthor);
-      const bytes = await readFile(tgzPath);
+      // The cache miss that led here was observed before the lock, and the download that
+      // followed is slow: another request (or a prefetch pass) can have converted and
+      // published this very version in the meantime. Converting again would replace a
+      // published archive with different bytes - author injection rewrites package.json, so
+      // two conversions do not agree byte for byte - and a client holding the first
+      // archive's metadata would then download the second one and fail verification.
+      const alreadyPublished = await readTarballCache(vpmUpstream.host, decodedName, cacheKey);
+      if (!alreadyPublished) {
+        await convertZipBufferToTgzUnlocked(buffer, tgzPath, vpmAuthor);
+      }
+      const bytes = alreadyPublished ?? (await readFile(tgzPath));
+      try {
       const shasum = computeSha1(bytes);
       const distUpdate: Record<string, unknown> = { shasum };
       applyPackageSignature(decodedName, decodedVersion, bytes, distUpdate);
@@ -651,6 +661,16 @@ async function serveVpmTarball(
             metadata: target
           };
         });
+      }
+      } catch (err) {
+        // The archive this call published is already in place; leaving it there with the
+        // metadata still describing the previous one would have the cache serve bytes no
+        // signature matches, and nothing repairs that afterwards. Drop it so the next
+        // request converts again.
+        if (!alreadyPublished) {
+          await rm(tgzPath, { force: true }).catch(() => {});
+        }
+        throw err;
       }
 
       return bytes;
