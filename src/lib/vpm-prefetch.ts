@@ -46,6 +46,7 @@ function sleep(ms: number): Promise<void> {
 async function fetchVpmIndex(upstream: UpstreamEntry): Promise<VpmIndex> {
   const res = await request(getVpmIndexUrl(upstream), { method: "GET" });
   if (res.statusCode >= 400) {
+    await res.body.dump();
     throw new Error(`vpm_index_failed:${res.statusCode}`);
   }
   return (await res.body.json()) as VpmIndex;
@@ -81,10 +82,14 @@ async function fetchBufferWithRedirects(url: string, maxRedirects = 5): Promise<
     const status = res.statusCode;
     if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
       const next = new URL(res.headers.location, current).toString();
+      // Release the redirect's body before the next hop; an unread undici body keeps its
+      // connection occupied.
+      await res.body.dump();
       current = next;
       continue;
     }
     if (status >= 400) {
+      await res.body.dump();
       throw new Error(`zip_download_failed:${status}`);
     }
     return Buffer.from(await res.body.arrayBuffer());
