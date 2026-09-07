@@ -178,3 +178,71 @@ test(
     assert.equal(versions["1.0.0"].dist.shasum, "a".repeat(40));
   }
 );
+
+// Regression for the seventh review round: the previous round kept every version that was on
+// disk but missing from the write, which also resurrected versions the upstream had
+// deliberately withdrawn - permanently, and as `latest`, since latestVersion is chosen from
+// what gets written. The baseline (the cache as the request first read it) separates a
+// concurrent publication from a withdrawal.
+test(
+  "refreshCachedVpmMetadataは、上流が削除した版を基準スナップショットと照合して復活させない",
+  async () => {
+    const upstream: UpstreamEntry = {
+      baseUrl: "https://vpm.example.com/index.json",
+      host: "vpm-refresh-withdraw.example.com",
+      type: "vpm"
+    };
+    const packageName = "com.example.refresh.withdraw";
+
+    const signedNode = (version: string, sig: string) => ({
+      name: packageName,
+      version,
+      dist: {
+        tarball: "",
+        shasum: "c".repeat(40),
+        integrity: `sha512-${sig}`,
+        signatures: [{ keyid: proxyKeyid, sig }]
+      }
+    });
+
+    // The request's baseline: 1.0.0 and 2.0.0 were both cached when it started.
+    const baseline = {
+      name: packageName,
+      versions: {
+        "1.0.0": signedNode("1.0.0", "ONE"),
+        "2.0.0": signedNode("2.0.0", "TWO")
+      }
+    };
+
+    // Meanwhile a prefetch published 3.0.0, so disk now holds all three.
+    await writeMetadataCache(upstream.host, packageName, {
+      latestVersion: "3.0.0",
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: "3.0.0" },
+        versions: {
+          "1.0.0": signedNode("1.0.0", "ONE"),
+          "2.0.0": signedNode("2.0.0", "TWO"),
+          "3.0.0": signedNode("3.0.0", "THREE")
+        }
+      }
+    });
+
+    // The index this request read no longer lists 2.0.0: the upstream withdrew it.
+    const rebuiltFromIndex = {
+      name: packageName,
+      versions: { "1.0.0": { name: packageName, version: "1.0.0", dist: { tarball: "" } } }
+    };
+
+    await refreshCachedVpmMetadata(upstream, packageName, rebuiltFromIndex, baseline);
+
+    const result = await readMetadataCache(upstream.host, packageName);
+    assert.ok(result);
+    const versions = result!.metadata.versions;
+    assert.ok(versions["1.0.0"], "a version still in the index must stay");
+    assert.equal(versions["2.0.0"], undefined, "a version the upstream withdrew must not be restored");
+    assert.ok(versions["3.0.0"], "a version published concurrently must survive");
+    assert.equal(versions["3.0.0"].dist.signatures[0].sig, "THREE");
+    assert.equal(result!.latestVersion, "3.0.0", "latestVersion must not come from the withdrawn version");
+  }
+);
