@@ -344,14 +344,27 @@ function applyAuthorIfMissing(node: any, authorValue: unknown): void {
   }
 }
 
-function mergeShasumFromCache(target: any, cached: any): void {
+// Exported for tests: the interleaving this guards against (a snapshot written back over a
+// freshly re-signed archive) is impractical to drive through the HTTP routes.
+export function mergeShasumFromCache(target: any, cached: any): void {
   if (!target?.versions || typeof target.versions !== "object") return;
   if (!cached?.versions || typeof cached.versions !== "object") return;
   for (const [version, node] of Object.entries<any>(target.versions)) {
-    if (!node?.dist || node.dist.shasum) continue;
+    if (!node?.dist) continue;
     const cachedNode = cached.versions[version];
     const cachedDist = cachedNode?.dist;
     if (!cachedDist?.shasum) continue;
+    if (node.dist.shasum) {
+      // `target` is a snapshot taken before the slow work that precedes this merge, so a
+      // shasum differing from disk means the archive was rebuilt and re-signed in the
+      // meantime (the prefetch does that to inject a missing author). Writing the
+      // snapshot back would advertise the hash of an archive the proxy no longer serves.
+      // Only the proxy's own archives are replaced this way: for a plain npm passthrough
+      // the upstream registry's shasum is authoritative and must not be overwritten by a
+      // cached value.
+      if (node.dist.shasum === cachedDist.shasum) continue;
+      if (!hasProxySignature(cachedDist)) continue;
+    }
     node.dist.shasum = cachedDist.shasum;
     // Signatures computed earlier (prefetch / tarball download) are reused so that
     // metadata responses do not re-sign every cached tarball on each request.
@@ -1126,16 +1139,20 @@ async function proxyGroupNpm(
     const decodedName = decodeURIComponent(encodedName);
     const decodedFile = decodeURIComponent(encodedVersion);
     let decodedVersion = "";
-    let cacheKey = "";
     if (decodedFile.endsWith(".tgz")) {
       const base = decodedFile.slice(0, -4);
       const prefix = `${decodedName}-`;
       decodedVersion = base.startsWith(prefix) ? base.slice(prefix.length) : base;
-      cacheKey = decodedFile;
     } else {
       decodedVersion = decodedFile;
-      cacheKey = decodedFile ? `${decodedFile}.tgz` : "";
     }
+    // Always the canonical "<name>-<version>.tgz" key, whichever spelling of this legacy
+    // URL was used. The bare-version form used to key its cache on "<version>.tgz", a
+    // second archive for the same version: serving it rebuilt the tgz (with a different
+    // package.json timestamp once the author is injected) and wrote that archive's
+    // integrity into the version node the canonical archive is advertised under, so the
+    // published signature stopped matching the bytes metadata-directed clients download.
+    const cacheKey = decodedVersion ? `${decodedName}-${decodedVersion}.tgz` : "";
 
     if (!decodedName) {
       reply.code(404).send();
