@@ -898,3 +898,93 @@ test("検索でGitLabの結果も、スコープ上の担当upstreamでなけれ
   );
   assert.equal(byName.get("gitlab-owned"), "1.0.0", "names GitLab does own are still listed");
 });
+
+// Regression for cycle 2 round 3: enrichment decides whether a cached archive belongs to this
+// response by comparing it against the shasum the upstream reported. Merging the cached shasum
+// in beforehand put the other group's checksum there for a version the upstream did not hash,
+// so the comparison matched that group's archive and the check was defeated.
+test("上流がshasumを返さない版では、キャッシュ由来のshasumで補完を通さない", async (t: TestContext) => {
+  const packageName = "no-shasum-enrich";
+  const version = "1.0.0";
+  const filename = `${packageName}-${version}.tgz`;
+
+  // Another group's archive and its cached metadata, carrying that group's author and shasum.
+  const sourceDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-noshasum-"));
+  mkdirSync(join(sourceDir, "package"), { recursive: true });
+  writeFileSync(
+    join(sourceDir, "package", "package.json"),
+    JSON.stringify({ name: packageName, version, author: { name: "Other Group Author" } }),
+    "utf-8"
+  );
+  const tgzPath = join(sourceDir, "other.tgz");
+  await tar.c({ gzip: true, file: tgzPath, cwd: sourceDir }, ["package"]);
+  const otherBytes = readFileSync(tgzPath);
+  enrichTempDirs.push(sourceDir);
+
+  const cacheDir = join(tarballCacheDir, DEFAULT_HOST, packageName);
+  mkdirSync(cacheDir, { recursive: true });
+  writeFileSync(join(cacheDir, filename), otherBytes);
+  writeFileSync(
+    join(cacheDir, "metadata.json"),
+    JSON.stringify({
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            dist: { tarball: "", shasum: createHash("sha1").update(otherBytes).digest("hex") }
+          }
+        }
+      }
+    }),
+    "utf-8"
+  );
+
+  // This group's upstream response has no shasum at all, and no author to enrich from.
+  const tarballUrl = `${DEFAULT_ORIGIN}/api/v4/groups/group-c/-/packages/npm/${packageName}/-/${filename}`;
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: `/api/v4/groups/group-c/-/packages/npm/${packageName}`, method: "GET" })
+    .reply(
+      200,
+      {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: { [version]: { name: packageName, version, dist: { tarball: tarballUrl } } }
+      },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  // Its own archive, with its own author, is what enrichment has to go and fetch.
+  const ownDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-noshasum-own-"));
+  mkdirSync(join(ownDir, "package"), { recursive: true });
+  writeFileSync(
+    join(ownDir, "package", "package.json"),
+    JSON.stringify({ name: packageName, version, author: { name: "Own Group Author" } }),
+    "utf-8"
+  );
+  const ownTgz = join(ownDir, "own.tgz");
+  await tar.c({ gzip: true, file: ownTgz, cwd: ownDir }, ["package"]);
+  const ownBytes = readFileSync(ownTgz);
+  enrichTempDirs.push(ownDir);
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: `/api/v4/groups/group-c/-/packages/npm/${packageName}/-/${filename}`, method: "GET" })
+    .reply(200, ownBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/group-c/${packageName}`,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = res.json() as { author?: string };
+  assert.equal(body.author, "Own Group Author", "a cache-supplied shasum must not authorize the reuse");
+});

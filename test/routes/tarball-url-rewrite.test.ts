@@ -177,3 +177,53 @@ test(
     );
   }
 );
+
+// Regression for cycle 2 round 3: same origin and under the registry's base path was not
+// enough. A tarball filed under another prefix rewrites to a path whose first segment is that
+// prefix, which the group route reads as the package name - so the published URL resolves to
+// a different upstream and the download breaks.
+test(
+  "書き換え後の経路が別のupstreamへ解決される場合は、元のURLを返す",
+  async (t: TestContext) => {
+    const packageName = "com.example.based.prefixed";
+    const version = "1.0.0";
+    // Same origin, under /registry, but filed beneath a "downloads" prefix.
+    const upstreamTarball = `${SCOPED_ORIGIN}/registry/downloads/${packageName}-${version}.tgz`;
+
+    mockAgent
+      .get(SCOPED_ORIGIN)
+      .intercept({ path: `/registry/${packageName}`, method: "GET" })
+      .reply(
+        200,
+        {
+          name: packageName,
+          "dist-tags": { latest: version },
+          versions: {
+            [version]: {
+              name: packageName,
+              version,
+              author: { name: "Test Author" },
+              displayName: "Prefixed Package",
+              dist: { tarball: upstreamTarball, shasum: "2".repeat(40) }
+            }
+          }
+        },
+        { headers: { "content-type": "application/json" } }
+      );
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { versions: Record<string, { dist: { tarball: string } }> };
+    assert.equal(
+      body.versions[version].dist.tarball,
+      upstreamTarball,
+      "a path that would route elsewhere must keep the upstream's own URL"
+    );
+  }
+);
