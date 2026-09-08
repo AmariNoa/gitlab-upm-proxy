@@ -13,9 +13,9 @@ Fastify 5 + TypeScript 製の Unity Package Manager 向け GitLab npm レジス�
 | src/lib/upstreams.ts | upstreams 設定ファイル（YAML / JSON）の読込、スコープマッチ、パッケージ名抽出 |
 | src/lib/vpm-prefetch.ts | 起動時に VPM インデックスを走査し zip から tgz へ変換・shasum・署名を先行付与。停止シグナル（stopVpmPrefetch）を持ち、サーバーを閉じると次の項目へ進まず、進行中の臨界区間の完了だけを待つ |
 | src/lib/npm-signatures.ts | 署名鍵の生成・読込、tarball 署名、上流 npm の /-/npm/v1/keys 取得とマージ |
-| src/lib/tgz.ts | zip から tgz への変換、展開、パッケージ root の判定、一時ディレクトリのロック、sha1 計算 |
+| src/lib/tgz.ts | zip から tgz への変換、展開（エントリ数・展開後サイズの上限と展開先の逸脱防止つき）、パッケージ root の判定、一時ディレクトリのロック、sha1 計算 |
 | src/lib/env.ts | 必須環境変数の読み出し（未設定なら即座に失敗する mustEnv） |
-| src/lib/http.ts | 上流へ送るヘッダの選別（資格情報・応答を狭めるヘッダの除去）と、リダイレクトを上限付きで追従する JSON 取得 |
+| src/lib/http.ts | 上流へ送るヘッダの選別（資格情報・応答を狭めるヘッダの除去）と、リダイレクトを上限付きで追従する JSON 取得・バイナリ取得（受信バイト数の上限つき） |
 | test/helper.ts | fastify-cli の helper.build で src/app.ts を起動するテストヘルパ |
 | test/lib/ | ライブラリ単体テスト（*.test.ts）と test 専用の補助モジュール |
 | test/routes/ | ルート統合テスト（*.test.ts）。helper.build でアプリを起動し、上流は MockAgent で差し替える。ログ出力を観測する test/routes/request-log.test.ts だけは、helper.build がロガーを無効化するため Fastify を直接起動する |
@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 89 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 95 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -71,6 +71,9 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 | VPM_PREFETCH_INTERVAL_SEC | 条件付き必須 | VPM prefetch の取得間隔（秒）。VPM 型 upstream があるとき必須だが、読み出しは背景 prefetch の中で行われ、欠けていても起動は止まらず `vpm_prefetch_failed` のログになるだけ |
 | NPM_SIGNATURE_KEY_PATH | 任意 | 署名鍵 PEM のパス（既定: TARBALL_CACHE_DIR/npm-signing-key.pem） |
 | NPM_SIGNATURE_PRIVATE_KEY_PEM | 任意 | 署名鍵 PEM を直接注入（KEY_PATH より優先） |
+| VPM_MAX_DOWNLOAD_BYTES | 任意 | 上流アーカイブ 1 件をメモリへ読み込む上限バイト数（既定: 536870912 = 512 MiB）。Content-Length が上限超過なら本文を読まずに拒否し、実受信量も監視する |
+| VPM_MAX_EXTRACT_BYTES | 任意 | zip 展開後の合計バイト数の上限（既定: 1073741824 = 1 GiB）。中央ディレクトリの申告値で事前に拒否し、実書き込み量も監視する |
+| VPM_MAX_EXTRACT_ENTRIES | 任意 | zip 内のファイルエントリ数の上限（既定: 20000） |
 
 ### 設定ファイル
 

@@ -1,4 +1,15 @@
 import { request } from "undici";
+import { positiveIntEnv } from "./env";
+
+/**
+ * Ceiling on how many bytes one upstream archive download may produce. The archive is buffered
+ * in memory before conversion, and its size is chosen by whoever published the package, not by
+ * this proxy - without a ceiling a single entry can exhaust the process. 512 MiB is far above
+ * any real Unity package and still bounded.
+ */
+function maxDownloadBytes(): number {
+  return positiveIntEnv("VPM_MAX_DOWNLOAD_BYTES", 512 * 1024 * 1024);
+}
 
 /**
  * Request headers that narrow what the upstream sends back. The proxy forwards the caller's
@@ -95,4 +106,65 @@ export async function fetchJsonWithRedirects<T>(
     return (await res.body.json()) as T;
   }
   throw new Error(`${errorPrefix}_redirects_exceeded`);
+}
+
+/**
+ * Downloads a binary body, following redirects up to a bounded number of hops, dropping the
+ * caller's authorization as soon as the chain leaves the origin it started from, and refusing to
+ * buffer more than the configured ceiling.
+ *
+ * The size limit matters because the body is an archive published by whoever owns the package,
+ * not by this proxy: it is read fully into memory and then expanded onto the cache filesystem.
+ * A declared Content-Length over the ceiling is rejected before a single byte is read, and the
+ * running total is checked as the body streams in so a missing or lying Content-Length cannot
+ * get past it.
+ */
+export async function fetchBufferWithRedirects(
+  url: string,
+  headers: Record<string, string> = {},
+  maxRedirects = 5
+): Promise<Buffer> {
+  const limit = maxDownloadBytes();
+  let current = url;
+  let currentHeaders = headers;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const res = await request(current, { method: "GET", headers: currentHeaders });
+    const status = res.statusCode;
+    if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
+      // Released before the Location is parsed: a malformed one makes the URL constructor
+      // throw, and doing this afterwards would leave the body unread on exactly the path where
+      // the request is abandoned.
+      await res.body.dump();
+      const next = new URL(String(res.headers.location), current).toString();
+      // Follow-the-credentials is how tokens end up in someone else's logs: once the redirect
+      // chain leaves the origin we were authorized for, drop them for good.
+      if (!isSameOrigin(next, url)) {
+        currentHeaders = withoutCredentials(currentHeaders);
+      }
+      current = next;
+      continue;
+    }
+    if (status >= 400) {
+      await res.body.dump();
+      throw new Error(`zip_download_failed:${status}`);
+    }
+    const declared = Number(res.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > limit) {
+      await res.body.dump();
+      throw new Error(`zip_download_too_large:${declared}`);
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for await (const chunk of res.body) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > limit) {
+        res.body.destroy();
+        throw new Error(`zip_download_too_large:${total}`);
+      }
+      chunks.push(buf);
+    }
+    return Buffer.concat(chunks, total);
+  }
+  throw new Error("zip_download_redirects_exceeded");
 }

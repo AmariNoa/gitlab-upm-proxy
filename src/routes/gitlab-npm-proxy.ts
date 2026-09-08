@@ -5,6 +5,7 @@ import * as semver from "semver";
 import * as tar from "tar";
 import { request } from "undici";
 import {
+  fetchBufferWithRedirects,
   fetchJsonWithRedirects,
   isSameOrigin,
   withoutCredentials,
@@ -741,39 +742,6 @@ async function handleNpmSigningKeys(_req: any, reply: any): Promise<void> {
 
   reply.code(200);
   reply.type("application/json").send(mergeSigningKeys(keys));
-}
-
-async function fetchBufferWithRedirects(
-  url: string,
-  headers: Record<string, string>,
-  maxRedirects = 5
-): Promise<Buffer> {
-  let current = url;
-  let currentHeaders = headers;
-  for (let i = 0; i <= maxRedirects; i++) {
-    const res = await request(current, { method: "GET", headers: currentHeaders });
-    const status = res.statusCode;
-    if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
-      // Released before the Location is parsed: a malformed one makes the URL constructor
-      // throw, and doing this afterwards would leave the body unread on exactly the path
-      // where the request is abandoned.
-      await res.body.dump();
-      const next = new URL(res.headers.location, current).toString();
-      // Follow-the-credentials is how tokens end up in someone else's logs: once the
-      // redirect chain leaves the origin we were authorized for, drop them for good.
-      if (!isSameOrigin(next, url)) {
-        currentHeaders = withoutCredentials(currentHeaders);
-      }
-      current = next;
-      continue;
-    }
-    if (status >= 400) {
-      await res.body.dump();
-      throw new Error(`zip_download_failed:${status}`);
-    }
-    return Buffer.from(await res.body.arrayBuffer());
-  }
-  throw new Error("zip_download_redirects_exceeded");
 }
 
 function normalizeSearchResponse(payload: any): { objects: any[]; total: number; time: string } {

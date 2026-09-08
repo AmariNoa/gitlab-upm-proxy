@@ -1,14 +1,13 @@
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import * as tar from "tar";
-import { request } from "undici";
 import * as semver from "semver";
 import { getTarballCachePath, readMetadataCache, updateMetadataCache, type MetadataCache } from "./cache";
 import { applyPackageSignature, hasProxySignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 import { mustEnv } from "./env";
 import { computeSha1, convertZipBufferToTgzUnlocked, runTempLocked } from "./tgz";
-import { fetchJsonWithRedirects } from "./http";
+import { fetchBufferWithRedirects, fetchJsonWithRedirects } from "./http";
 
 type VpmIndex = {
   author?: unknown;
@@ -176,28 +175,6 @@ async function stillNeedsConversion(
   if (node?.author || !vpmAuthor) return false;
   const currentAuthor = await readAuthorFromTgz(tgzPath);
   return !currentAuthor;
-}
-
-async function fetchBufferWithRedirects(url: string, maxRedirects = 5): Promise<Buffer> {
-  let current = url;
-  for (let i = 0; i <= maxRedirects; i++) {
-    const res = await request(current, { method: "GET" });
-    const status = res.statusCode;
-    if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
-      // Released before the Location is parsed: a malformed one makes the URL constructor
-      // throw, and an unread undici body keeps its connection occupied.
-      await res.body.dump();
-      const next = new URL(res.headers.location, current).toString();
-      current = next;
-      continue;
-    }
-    if (status >= 400) {
-      await res.body.dump();
-      throw new Error(`zip_download_failed:${status}`);
-    }
-    return Buffer.from(await res.body.arrayBuffer());
-  }
-  throw new Error("zip_download_redirects_exceeded");
 }
 
 function buildNpmMetadataFromVpm(
