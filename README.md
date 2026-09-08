@@ -85,6 +85,10 @@ Cached tarballs and merged metadata are stored under:
 Upstream registries are configured in a YAML (or JSON) file. The default upstream is GitLab.  
 If a package scope matches an upstream entry, search requests are sent to that registry.
 
+`scopes` must be a list of strings. A scalar value (`scopes: com.example.*`) is rejected at
+startup: it used to be read one character at a time, and the `*` among them matched every
+package, silently turning that entry into a catch-all for the whole proxy.
+
 Sample config (`config/upstreams_sample.yml`). Copy this to `config/upstreams.yml` and edit as needed:
 
 ````

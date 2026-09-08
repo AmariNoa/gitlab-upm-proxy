@@ -1,0 +1,7 @@
+# A scopes value written as a bare string instead of a list. Loading this must fail: iterating
+# it yields single characters, and the "*" among them matches every package name.
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://npm.example.org
+    scopes: com.example.*

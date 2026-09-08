@@ -30,6 +30,22 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
 }
 
+/**
+ * The parsed YAML is only asserted to have this shape, never checked, so a scopes value written
+ * as a bare string instead of a list used to survive all the way to selectUpstream - which
+ * iterates it, and therefore iterated its characters. The moment one of them was "*", matchScope
+ * matched every package name and the entry silently became a catch-all that took over routing
+ * for the whole proxy. A malformed entry has to fail at load, naming itself, rather than quietly
+ * change where packages come from.
+ */
+function toScopes(raw: unknown, context: string): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.some((scope) => typeof scope !== "string")) {
+    throw new Error(`Invalid scopes in ${context}: expected a list of strings`);
+  }
+  return raw as string[];
+}
+
 function toEntry(raw: RawEntry, context: string): UpstreamEntry {
   if (!raw?.baseUrl) {
     throw new Error(`Missing baseUrl in ${context}`);
@@ -40,7 +56,7 @@ function toEntry(raw: RawEntry, context: string): UpstreamEntry {
   const type = rawType === "vpm" ? "vpm" : "npm";
   return {
     baseUrl: normalized,
-    scopes: raw.scopes ?? [],
+    scopes: toScopes(raw.scopes, context),
     host,
     type
   };
