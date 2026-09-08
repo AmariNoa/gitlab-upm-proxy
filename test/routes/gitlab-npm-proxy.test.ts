@@ -1290,3 +1290,53 @@ test("エンコードされた#を含む名前でも、上流へは同じパス�
   assert.equal(res.statusCode, 200, "the upstream must be asked for the path the caller sent");
   assert.deepEqual(res.rawPayload, tarballBytes);
 });
+
+// Regression for the seventh round of the second review cycle: applyUpstreamHeaders excluded only
+// Transfer-Encoding. Two kinds of header should not have been copied.
+//
+// Hop-by-hop headers describe the proxy's connection to the upstream, not the client's connection
+// to the proxy: an upstream "Connection: close" told the client to close a connection that was
+// never the one being described, and fields the Connection header nominates escaped their hop.
+//
+// Byte-dependent validators are wrong whenever the proxy rewrites the body - which it does on
+// every metadata response, replacing tarball URLs and re-serializing. A client checking the
+// upstream's ETag or Content-MD5 against the proxy's own bytes fails, and one revalidating
+// against that ETag is told nothing changed when the representation did.
+test("書き換えたメタデータ応答から、接続ヘッダとバイト依存の検証ヘッダが除かれる", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: "/api/v4/groups/my-group/-/packages/npm/headers", method: "GET" })
+    .reply(
+      200,
+      { name: "headers", "dist-tags": { latest: "1.0.0" }, versions: {} },
+      {
+        headers: {
+          "content-type": "application/json",
+          etag: 'W/"upstream-etag"',
+          "content-md5": "upstream-digest",
+          connection: "close, x-hop-only",
+          "keep-alive": "timeout=5",
+          "x-hop-only": "should not survive",
+          "cache-control": "max-age=60"
+        }
+      }
+    );
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/headers",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.headers.etag, undefined, "a digest of bytes the client is not receiving");
+  assert.equal(res.headers["content-md5"], undefined, "same for Content-MD5");
+  // Fastify sets its own Connection header on the reply, so what matters is that the
+  // upstream's value did not replace it.
+  assert.notEqual(res.headers.connection, "close, x-hop-only", "hop-by-hop, not end-to-end");
+  assert.equal(res.headers["keep-alive"], undefined, "hop-by-hop as well");
+  assert.equal(res.headers["x-hop-only"], undefined, "nominated by Connection, so hop-by-hop too");
+  assert.equal(res.headers["cache-control"], "max-age=60", "end-to-end headers still travel");
+});

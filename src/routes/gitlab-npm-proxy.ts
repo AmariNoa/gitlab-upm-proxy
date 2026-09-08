@@ -163,16 +163,57 @@ async function validateGitlabPat(req: any, reply: any): Promise<boolean> {
   return true;
 }
 
+/**
+ * Headers that describe the connection they arrived on rather than the resource. They belong to
+ * the proxy-to-upstream hop and say nothing about the client's own connection - forwarding an
+ * upstream "Connection: close" told the client to close a connection that was never the one being
+ * described.
+ */
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade"
+];
+
+/**
+ * Validators and digests computed over the upstream's bytes. When the proxy rewrites a body -
+ * tarball URLs replaced, enrichment fields added, JSON re-serialized - these describe bytes the
+ * client is not receiving, so a client that checks them fails, and one that revalidates against
+ * the ETag is told nothing changed when the representation did.
+ */
+const BODY_DEPENDENT_HEADERS = ["content-length", "etag", "content-md5", "digest", "content-digest", "repr-digest"];
+
+/**
+ * Copies an upstream response's headers onto the reply.
+ *
+ * `bodyRewritten` says the body being sent is the proxy's own rendering rather than the upstream's
+ * bytes, which is what makes the digests and validators above wrong to pass on.
+ */
 function applyUpstreamHeaders(
   reply: any,
   headers: Record<string, unknown>,
-  skipContentLength: boolean
+  bodyRewritten: boolean
 ): void {
+  // Fields the upstream's own Connection header nominates are hop-by-hop for this response only.
+  const connection = headers["connection"];
+  const nominated = new Set(
+    String(Array.isArray(connection) ? connection.join(",") : (connection ?? ""))
+      .split(",")
+      .map((name) => name.trim().toLowerCase())
+      .filter(Boolean)
+  );
+
   for (const [k, v] of Object.entries(headers)) {
     if (typeof v !== "string") continue;
     const key = k.toLowerCase();
-    if (key === "transfer-encoding") continue;
-    if (skipContentLength && key === "content-length") continue;
+    if (HOP_BY_HOP_HEADERS.includes(key)) continue;
+    if (nominated.has(key)) continue;
+    if (bodyRewritten && BODY_DEPENDENT_HEADERS.includes(key)) continue;
     reply.header(k, v);
   }
 }
