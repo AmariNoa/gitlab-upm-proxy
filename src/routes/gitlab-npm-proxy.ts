@@ -1387,11 +1387,14 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       const u = new URL(`${upstream.baseUrl}/-/v1/search`);
       u.searchParams.set("text", text);
       u.searchParams.set("from", "0");
-      // Enough to build the page the caller asked for. Every upstream is queried from 0 and
-      // the merged list is then sliced by `from`, so asking for only `size` rows made every
-      // page after the first come back empty: the slice started past everything fetched.
-      // Capped so a large `from` cannot turn into an unbounded upstream request.
-      u.searchParams.set("size", String(Math.min(from + size, UPSTREAM_SEARCH_MAX_SIZE)));
+      // The same number of rows on every page, deliberately not derived from `from`. The
+      // merged list is sorted by name and then sliced, so what each page contains depends on
+      // which rows were fetched - and fetching a different-length prefix of the upstream's
+      // own (relevance) ordering per page made pages overlap and skip, with a `total` that
+      // moved as the caller paged. A fixed window keeps the merged list identical for every
+      // page of one search; results beyond it are not reachable, which is the same bound npm
+      // registries themselves apply.
+      u.searchParams.set("size", String(UPSTREAM_SEARCH_MAX_SIZE));
       const res = await request(u.toString(), {
         method: "GET",
         headers: buildUpstreamHeadersFor(upstream, req.headers as any)
