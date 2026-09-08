@@ -213,3 +213,29 @@ test(
     assert.equal(downloads, afterSecondClose, "closing the second server stops its own prefetch");
   }
 );
+
+// Regression for the same round: README promised that a malformed archive limit stops the proxy
+// at startup, but nothing read the limits until an archive was actually downloaded or expanded.
+// This case is here rather than beside the unit tests for the validators because those pass
+// whether or not the application calls them - which is exactly how the previous round shipped a
+// correct helper that nothing invoked.
+test(
+  "壊れた上限値を設定するとアプリの起動自体が失敗する",
+  async () => {
+    process.env.VPM_MAX_EXTRACT_ENTRIES = "not-a-number";
+    const server = Fastify({ logger: false });
+    void server.register(app);
+    try {
+      await assert.rejects(
+        async () => {
+          await server.ready();
+        },
+        /VPM_MAX_EXTRACT_ENTRIES/,
+        "a malformed limit must stop the server from starting"
+      );
+    } finally {
+      delete process.env.VPM_MAX_EXTRACT_ENTRIES;
+      await server.close();
+    }
+  }
+);
