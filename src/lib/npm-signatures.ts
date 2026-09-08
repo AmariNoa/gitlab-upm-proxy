@@ -8,6 +8,7 @@ import {
   sign as cryptoSign
 } from "node:crypto";
 import { request } from "undici";
+import { readUpstreamJson } from "./http";
 import { mustEnv } from "./env";
 import { UpstreamEntry } from "./upstreams";
 
@@ -162,7 +163,7 @@ export async function fetchUpstreamSigningKeys(
     await res.body.dump();
     return [];
   }
-  const body = (await res.body.json()) as Partial<NpmKeysResponse>;
+  const body = await readUpstreamJson<Partial<NpmKeysResponse>>(res as any);
   return Array.isArray(body.keys) ? body.keys.filter(isNpmSigningKey) : [];
 }
 
