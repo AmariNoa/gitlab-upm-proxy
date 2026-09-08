@@ -282,3 +282,62 @@ test(
     );
   }
 );
+
+// Regression for the eighth round of the second review cycle: an index that answered 503, a
+// connection that failed and a body over the ceiling all reached the same empty 404 as a package
+// that genuinely does not exist. That tells the client - and any cache between - to stop asking
+// for something that is merely temporarily unavailable.
+test(
+  "VPMインデックスが503を返した場合は404ではなく502になる",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.unavailable";
+    const marker = "case-unavailable";
+
+    mockAgent
+      .get(VPM_ORIGIN)
+      .intercept({
+        path: "/index.json",
+        method: "GET",
+        headers: (headers) => normalizeHeaders(headers)["x-vpm-test-route"] === marker
+      })
+      .reply(503, "upstream is unwell", { headers: { "content-type": "text/plain" } })
+      .persist();
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 502, "an upstream that failed to answer is not an absent package");
+  }
+);
+
+// The other half of the same rule: an index that answers perfectly well and does not list the
+// package is a confirmed absence, and must stay a 404.
+test(
+  "インデックスに載っていないパッケージは従来どおり404になる",
+  async (t: TestContext) => {
+    const marker = "case-absent";
+
+    mockAgent
+      .get(VPM_ORIGIN)
+      .intercept({
+        path: "/index.json",
+        method: "GET",
+        headers: (headers) => normalizeHeaders(headers)["x-vpm-test-route"] === marker
+      })
+      .reply(200, { packages: {} }, { headers: { "content-type": "application/json" } })
+      .persist();
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v4/groups/my-group/com.example.vpm.absent",
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 404, "a healthy index that omits the package does mean absent");
+  }
+);
