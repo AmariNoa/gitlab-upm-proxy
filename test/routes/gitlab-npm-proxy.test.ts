@@ -1008,3 +1008,70 @@ test("条件付きリクエストの304は、そのまま304として返る", as
 
   assert.equal(res.statusCode, 304, "a revalidation must not be turned into a server error");
 });
+
+// Regression for the fifth round of the second review cycle: both search sources were queried
+// with the caller's headers copied verbatim, response-narrowing ones included. Those validators
+// describe the search result the caller holds, not the upstream enumeration the proxy merges into
+// one - so a client revalidating its cached search turned the GitLab page into a bodyless 304
+// (failing the whole search) and the registry's page into one the catch silently dropped.
+test("検索の条件付きヘッダは上流の列挙へ転送されない", async (t: TestContext) => {
+  mockValidUser();
+
+  // Both interceptors answer only when no narrowing header survived; a request that still carries
+  // one finds no interceptor and fails the search outright.
+  const withoutNarrowing = (headers: unknown) => {
+    const h = normalizeHeaders(headers);
+    return !h["if-none-match"] && !h["range"] && !h["if-modified-since"];
+  };
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: (path) => path.startsWith("/api/v4/groups/my-group/packages"),
+      method: "GET",
+      headers: withoutNarrowing
+    })
+    .reply(200, [
+      {
+        package_type: "npm",
+        name: "gitlab.merged",
+        version: "1.0.0",
+        created_at: "2024-01-01T00:00:00Z"
+      }
+    ]);
+
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({
+      path: (path) => path.startsWith("/-/v1/search"),
+      method: "GET",
+      headers: withoutNarrowing
+    })
+    .reply(
+      200,
+      { objects: [{ package: { name: "com.example.other.mine", version: "1.0.0" } }], total: 1 },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/v1/search?text=e&from=0&size=20",
+    headers: {
+      "private-token": "valid-token",
+      "if-none-match": "*",
+      "if-modified-since": "Wed, 01 Jan 2025 00:00:00 GMT",
+      range: "bytes=0-10"
+    }
+  });
+
+  assert.equal(res.statusCode, 200, "a conditional search request must still be answered");
+  const names = (res.json() as { objects: Array<{ package: { name: string } }> }).objects
+    .map((o) => o.package.name)
+    .sort();
+  assert.deepEqual(
+    names,
+    ["com.example.other.mine", "gitlab.merged"],
+    "both sources must contribute to the merged result"
+  );
+});
