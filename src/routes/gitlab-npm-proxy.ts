@@ -931,6 +931,16 @@ function rewriteTarballUrl(
       path = path.slice(basePath.length);
     }
     const tarPath = `${path}${parsed.search}`.replace(/^\/+/, "");
+    // Last check, and the one that actually matters: the rewritten URL comes back on the
+    // group route, which reads its first path segment as the package name and picks the
+    // upstream from that. A tarball filed under some other prefix - ".../registry/downloads/
+    // pkg-1.0.0.tgz" - passes the origin and base-path tests and still resolves to a
+    // different upstream, turning a working download into a broken proxy URL. If the round
+    // trip does not land back here, publish the upstream's own URL.
+    const roundTripName = extractPackageName(tarPath);
+    if (!roundTripName || selectUpstream(roundTripName).baseUrl !== upstream.baseUrl) {
+      return tarballUrl;
+    }
     return `${PUBLIC_BASE_URL}/api/v4/groups/${groupEnc}/${tarPath}`;
   } catch {
     return tarballUrl;
@@ -1781,9 +1791,6 @@ async function proxyGroupNpm(
         // left `latest` alone, a new prerelease or a removed version among them. Only the
         // dist fields the proxy itself computed are carried over, below.
         const cached = await readMetadataCache(upstream.host, packageName);
-        if (cached?.metadata) {
-          mergeShasumFromCache(json, cached.metadata);
-        }
 
         // Enrichment only fills in author and displayName from inside the tarball, so a
         // failure here must not take the metadata response with it. It downloads the
@@ -1805,6 +1812,15 @@ async function proxyGroupNpm(
           );
         } catch (err) {
           req.log.info({ err, packageName }, "metadata_enrichment_failed");
+        }
+
+        // After enrichment, not before it. The archive cache has no group in its key, so
+        // enrichment decides whether a cached archive belongs to this response by comparing
+        // it against the shasum the UPSTREAM reported. Merging the cached shasum in first
+        // put another group's checksum there for a version the upstream did not hash, and
+        // the comparison then matched that group's archive - defeating the check entirely.
+        if (cached?.metadata) {
+          mergeShasumFromCache(json, cached.metadata);
         }
 
         const cacheMetadata = JSON.parse(JSON.stringify(json));
