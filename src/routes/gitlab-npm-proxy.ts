@@ -1249,7 +1249,12 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   const from = Number.parseInt((req.query.from ?? "0").toString(), 10) || 0;
   const sizeRaw = Number.parseInt((req.query.size ?? "20").toString(), 10) || 20;
   const size = Math.min(Math.max(sizeRaw, 1), 250);
-  const headers = buildUpstreamHeadersFor(defaultUpstream, req.headers as any);
+  // The enumeration is an input to the merged search result, not the resource the caller asked
+  // for, so their validators describe something else entirely. An `If-None-Match: *` would turn
+  // the page into a bodyless 304 and fail the whole search; a Range would truncate the JSON.
+  const headers = withoutResponseNarrowing(
+    buildUpstreamHeadersFor(defaultUpstream, req.headers as any)
+  );
 
   const base = `${defaultUpstream.baseUrl}/api/v4/groups/${groupEncOnce}/packages`;
   const perPage = 100;
@@ -1413,7 +1418,10 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       u.searchParams.set("size", String(UPSTREAM_SEARCH_MAX_SIZE));
       const res = await request(u.toString(), {
         method: "GET",
-        headers: buildUpstreamHeadersFor(upstream, req.headers as any)
+        // Same reason as the GitLab enumeration above: this registry's answer is one input to a
+        // merged result. A 304 here was swallowed by the catch below, silently dropping the
+        // registry's packages from the search instead of failing.
+        headers: withoutResponseNarrowing(buildUpstreamHeadersFor(upstream, req.headers as any))
       });
       const contentType = String(res.headers["content-type"] ?? "");
       if (res.statusCode >= 400 || !contentType.includes("application/json")) {
