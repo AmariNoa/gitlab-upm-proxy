@@ -40,7 +40,7 @@ Only the endpoints required for Unity Package Manager operation are supported.
 
 | Incoming Endpoint (Proxy) | Purpose | Response Format | Notes |
 |---|---|---|---|
-| GET /api/v4/groups/:groupEnc/-/v1/search | Package search (Unity-compatible) | JSON (npm search v1-like) | Routes by scope: upstream npm registry if matched, otherwise GitLab Groups Packages API |
+| GET /api/v4/groups/:groupEnc/-/v1/search | Package search (Unity-compatible) | JSON (npm search v1-like) | Aggregates: the GitLab Groups Packages API plus every configured upstream, with each result kept only if that upstream is the one scope routing would use for it. A GitLab enumeration failure fails the whole search |
 | GET /api/v4/groups/:groupEnc/<any> | Package metadata & registry access | JSON / Binary | Used when Unity treats the group root as the registry URL |
 | GET /api/v4/projects/:projectId/packages/npm/<any> | Tarball download (project-level) | Binary (`.tgz`) | Required because GitLab npm tarballs are project-scoped |
 
@@ -106,7 +106,9 @@ Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 
 Upstream registries are configured in a YAML (or JSON) file. The default upstream is GitLab.  
-If a package scope matches an upstream entry, search requests are sent to that registry.
+If a package scope matches an upstream entry, metadata and tarball requests for that package are
+sent to that registry. Search is different: it queries GitLab and every configured upstream, then
+drops any result whose name that upstream would not be the one to serve.
 
 `scopes` must be a list of strings. A scalar value (`scopes: com.example.*`) is rejected at
 startup: it used to be read one character at a time, and the `*` among them matched every

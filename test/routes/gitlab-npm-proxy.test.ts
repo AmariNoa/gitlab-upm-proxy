@@ -1449,3 +1449,46 @@ test("ルートの /-/whoami は中継されず404になる", async (t: TestCont
 
   assert.equal(res.statusCode, 404, "the root /-/* route serves tarballs only");
 });
+
+// Regression for the tenth round of the second review cycle: README described search as routing by
+// scope to one registry. It does not - it queries GitLab and every configured upstream and filters
+// the merged results by ownership, which also means a GitLab enumeration failure fails the whole
+// search even when the match would have come from elsewhere. The documentation now says that; this
+// pins the half a reader is most likely to be surprised by.
+test("GitLabの列挙が失敗すると、他の上流に一致があっても検索は失敗する", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: (path) => path.startsWith("/api/v4/groups/my-group/packages"),
+      method: "GET"
+    })
+    .reply(503, "unavailable", { headers: { "content-type": "text/plain" } });
+
+  // A configured registry that would have matched, and is never consulted.
+  let scopedQueried = false;
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({
+      path: (path) => {
+        if (path.startsWith("/-/v1/search")) scopedQueried = true;
+        return path.startsWith("/-/v1/search");
+      },
+      method: "GET"
+    })
+    .reply(
+      200,
+      { objects: [{ package: { name: "com.example.other.mine", version: "1.0.0" } }], total: 1 },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/v1/search?text=mine",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 503, "the GitLab enumeration decides the whole search");
+  assert.equal(scopedQueried, false, "and the other registry is not reached at all");
+});
