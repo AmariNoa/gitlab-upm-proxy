@@ -808,6 +808,24 @@ function appendRawQuery(url: string, req: any): string {
   return url.includes("?") ? `${url}&${query}` : `${url}?${query}`;
 }
 
+/**
+ * Re-encodes a route parameter as a single URL path segment.
+ *
+ * Fastify decodes route parameters, so a nested group or a project path written as "team%2Fsub"
+ * arrives here as "team/sub" despite the parameter's name. Interpolating that into a URL splits it
+ * into two segments: the upstream request then addresses a group that does not exist, and a
+ * rewritten tarball URL grows a segment that the next request reads as part of the package path.
+ */
+function asSinglePathSegment(value: string): string {
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    // A malformed percent escape is not ours to repair; encode what we were given.
+  }
+  return encodeURIComponent(decoded);
+}
+
 function getUpstreamBaseForGroup(
   upstream: UpstreamEntry,
   groupEnc: string,
@@ -815,9 +833,7 @@ function getUpstreamBaseForGroup(
 ): string {
   const normalizedRest = restPath.replace(/^\/+/, "");
   if (upstream.baseUrl === defaultUpstream.baseUrl) {
-    const groupPath = decodeURIComponent(groupEnc);
-    const groupEncOnce = encodeURIComponent(groupPath);
-    return `${upstream.baseUrl}/api/v4/groups/${groupEncOnce}/-/packages/npm/${normalizedRest}`;
+    return `${upstream.baseUrl}/api/v4/groups/${asSinglePathSegment(groupEnc)}/-/packages/npm/${normalizedRest}`;
   }
   return `${upstream.baseUrl}/${normalizedRest}`;
 }
@@ -871,7 +887,7 @@ function rewriteTarballUrl(
     if (!roundTripName || selectUpstream(roundTripName).baseUrl !== upstream.baseUrl) {
       return tarballUrl;
     }
-    return `${PUBLIC_BASE_URL}/api/v4/groups/${groupEnc}/${tarPath}`;
+    return `${PUBLIC_BASE_URL}/api/v4/groups/${asSinglePathSegment(groupEnc)}/${tarPath}`;
   } catch {
     return tarballUrl;
   }
@@ -1227,8 +1243,7 @@ async function mergeMetadataIfNeeded(
 const UPSTREAM_SEARCH_MAX_SIZE = 250;
 
 async function handleSearch(req: any, reply: any, groupEnc: string): Promise<void> {
-  const groupPath = decodeURIComponent(groupEnc);
-  const groupEncOnce = encodeURIComponent(groupPath);
+  const groupEncOnce = asSinglePathSegment(groupEnc);
 
   const text = (req.query.text ?? "").toString();
   const from = Number.parseInt((req.query.from ?? "0").toString(), 10) || 0;
@@ -1955,7 +1970,7 @@ const routes: FastifyPluginAsync = async (app) => {
         }
 
         const upstreamUrl = appendRawQuery(
-          `${defaultUpstream.baseUrl}/api/v4/projects/${projectId}/packages/npm/${restPath}`,
+          `${defaultUpstream.baseUrl}/api/v4/projects/${asSinglePathSegment(projectId)}/packages/npm/${restPath}`,
           req
         );
         const headers = buildUpstreamHeaders(req.headers as any);
