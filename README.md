@@ -79,6 +79,17 @@ Required for VPM prefetch:
 VPM_PREFETCH_INTERVAL_SEC=0.5
 ````
 
+Optional limits on what one upstream archive may cost. A VPM package's zip is published by
+whoever owns that package, so its size is not this proxy's to trust. The defaults are far above
+any real Unity package; set them lower on a small cache volume. A value that is present but not a
+positive integer fails at startup rather than falling back to the default.
+
+````
+VPM_MAX_DOWNLOAD_BYTES=536870912
+VPM_MAX_EXTRACT_BYTES=1073741824
+VPM_MAX_EXTRACT_ENTRIES=20000
+````
+
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 

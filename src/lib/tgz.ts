@@ -1,17 +1,91 @@
-import { createReadStream } from "node:fs";
+import { createWriteStream } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import * as tar from "tar";
 import * as unzipper from "unzipper";
+import { positiveIntEnv } from "./env";
 
-// Extracts a zip archive (VPM package payload) into targetDir.
+/**
+ * Ceilings on what one archive may expand to. The zip is published by whoever owns the package,
+ * not by this proxy, and it used to be handed straight to unzipper with no limit at all: a small,
+ * highly compressible archive could fill the cache filesystem during a download or a startup
+ * prefetch, and the cleanup only ran once extraction had finished or failed. The defaults are far
+ * above any real Unity package.
+ */
+function maxExtractBytes(): number {
+  return positiveIntEnv("VPM_MAX_EXTRACT_BYTES", 1024 * 1024 * 1024);
+}
+
+function maxExtractEntries(): number {
+  return positiveIntEnv("VPM_MAX_EXTRACT_ENTRIES", 20000);
+}
+
+/**
+ * Resolves an archive entry's path inside targetDir, refusing anything that would land outside
+ * it. Absolute paths and `..` segments are a property of the archive, so they are attacker
+ * controlled in exactly the same way its size is.
+ */
+function resolveEntryPath(targetDir: string, entryPath: string): string {
+  const normalized = entryPath.replace(/\\/g, "/");
+  if (isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
+    throw new Error(`zip_entry_outside_target:${entryPath}`);
+  }
+  const base = resolvePath(targetDir);
+  const full = resolvePath(base, normalized);
+  const rel = relative(base, full);
+  if (rel === "" || rel.startsWith("..") || rel.split(sep).includes("..")) {
+    throw new Error(`zip_entry_outside_target:${entryPath}`);
+  }
+  return full;
+}
+
+/**
+ * Extracts a zip archive (VPM package payload) into targetDir, bounded by entry count and total
+ * expanded bytes.
+ *
+ * The central directory is checked first, so an archive that admits up front how large it is gets
+ * rejected before anything is written. Because a zip may understate its own sizes, the bytes
+ * actually written are counted as well and the extraction is abandoned the moment they exceed the
+ * ceiling. Callers already remove the temp directory on failure, so a partial extraction does not
+ * survive the throw.
+ */
 export async function unzipToDirectory(zipPath: string, targetDir: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(zipPath).pipe(unzipper.Extract({ path: targetDir }));
-    stream.on("close", () => resolve());
-    stream.on("error", (err) => reject(err));
-  });
+  const byteLimit = maxExtractBytes();
+  const entryLimit = maxExtractEntries();
+
+  const directory = await unzipper.Open.file(zipPath);
+  const files = directory.files.filter((file) => file.type !== "Directory");
+  if (files.length > entryLimit) {
+    throw new Error(`zip_too_many_entries:${files.length}`);
+  }
+  let declared = 0;
+  for (const file of files) {
+    const size = Number(file.uncompressedSize);
+    if (Number.isFinite(size)) declared += size;
+  }
+  if (declared > byteLimit) {
+    throw new Error(`zip_expanded_too_large:${declared}`);
+  }
+
+  let written = 0;
+  for (const file of files) {
+    const destination = resolveEntryPath(targetDir, file.path);
+    await mkdir(dirname(destination), { recursive: true });
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        written += chunk.length;
+        if (written > byteLimit) {
+          callback(new Error(`zip_expanded_too_large:${written}`));
+          return;
+        }
+        callback(null, chunk);
+      }
+    });
+    await pipeline(file.stream(), counter, createWriteStream(destination));
+  }
 }
 
 // Locates the package.json root inside an extracted archive (handles a single wrapping directory).
