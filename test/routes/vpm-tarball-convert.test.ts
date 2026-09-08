@@ -550,3 +550,83 @@ test(
     assert.equal(dist.signatures[0].keyid, proxyKeyid);
   }
 );
+
+// ---------------------------------------------------------------------------------
+// (g) グローバル経路のファイル名のデコード境界
+// ---------------------------------------------------------------------------------
+// Regression for the sixth round of the second review cycle. The router already decodes the
+// wildcard, and the public tarball URL puts the whole filename into one encoded segment - but the
+// handler split that on "/" and decoded it a second time. A scoped package therefore lost its
+// scope (resolved as "pkg", answered 404 with the right archive cached), and a filename holding a
+// literal "%" made the second decode throw, turning a request into a 500.
+test(
+  "スコープ付きパッケージのグローバルtarball URLはスコープを保って解決される",
+  async (t: TestContext) => {
+    const packageName = "@vpmscope/pkg";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = "/dl/vpmscope-pkg-1.0.0.zip";
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "the scope must survive the route's filename resolution");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+  }
+);
+
+test(
+  "パーセント記号を含むファイル名でも500にならず、通常どおり解決される",
+  async (t: TestContext) => {
+    // The name ends in a literal "%", so decoding the already-decoded filename again sees "%-1"
+    // and throws.
+    const packageName = "com.example.vpm.pct%";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = "/dl/pct-1.0.0.zip";
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "a literal percent sign must not fail the request");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+  }
+);

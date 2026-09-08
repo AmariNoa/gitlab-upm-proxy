@@ -1075,3 +1075,36 @@ test("検索の条件付きヘッダは上流の列挙へ転送されない", as
     "both sources must contribute to the merged result"
   );
 });
+
+// Regression for the sixth round of the second review cycle: extractTarballFilenameFromPath
+// decoded the rest path's last segment, which the router had already decoded. A package whose
+// tarball filename holds a literal "%" made that second decode throw, and the relay answered 500
+// before it ever reached the upstream.
+test("パーセント記号を含むtarballファイル名でも中継が500にならない", async (t: TestContext) => {
+  mockValidUser();
+  const packageName = "pct%pkg";
+  const filename = `${packageName}-1.0.0.tgz`;
+  const tarballBytes = Buffer.from("percent-in-the-filename");
+
+  // The rest path is forwarded as the router handed it over, so the upstream sees the decoded
+  // name. Re-encoding it on the way out is deliberately not done here: it would also change the
+  // URL of every scoped package, which is not something this change set can verify against a
+  // real GitLab.
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: `/api/v4/groups/my-group/-/packages/npm/${packageName}/-/${filename}`,
+      method: "GET"
+    })
+    .reply(200, tarballBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/my-group/${encodeURIComponent(packageName)}/-/${encodeURIComponent(filename)}`,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200, "a literal percent sign must not fail the relay");
+  assert.deepEqual(res.rawPayload, tarballBytes);
+});

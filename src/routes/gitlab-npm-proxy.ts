@@ -883,7 +883,8 @@ function rewriteTarballUrl(
     // pkg-1.0.0.tgz" - passes the origin and base-path tests and still resolves to a
     // different upstream, turning a working download into a broken proxy URL. If the round
     // trip does not land back here, publish the upstream's own URL.
-    const roundTripName = extractPackageName(tarPath);
+    // tarPath comes out of a URL, so it is still percent-encoded here.
+    const roundTripName = extractPackageName(tarPath, true);
     if (!roundTripName || selectUpstream(roundTripName).baseUrl !== upstream.baseUrl) {
       return tarballUrl;
     }
@@ -1094,10 +1095,18 @@ function isCompleteTarballResponse(statusCode: number, headers: Record<string, u
   return headers["content-range"] === undefined;
 }
 
+/**
+ * The filename at the end of a route's rest path - "pkg/-/pkg-1.0.0.tgz" gives "pkg-1.0.0.tgz".
+ *
+ * The value arrives already decoded: the router decodes route parameters, wildcards included.
+ * Decoding it a second time was wrong twice over - a filename holding a literal "%" made
+ * decodeURIComponent throw, turning a valid request into a 500 before anything was fetched, and
+ * one holding "%41" quietly became "A", selecting a different cache entry than the one asked for.
+ */
 function extractTarballFilenameFromPath(restPath: string): string | null {
   const parts = restPath.split("/").filter(Boolean);
   if (parts.length === 0) return null;
-  return decodeURIComponent(parts[parts.length - 1]);
+  return parts[parts.length - 1];
 }
 
 async function downloadTarballToCache(
@@ -1851,18 +1860,11 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
     return;
   }
 
-  const filename = extractTarballFilenameFromPath(normalizedRest);
-  if (!filename) {
-    reply.code(404).send();
-    return;
-  }
-
-  const decodedFile = decodeURIComponent(filename);
-  if (!decodedFile.endsWith(".tgz")) {
-    reply.code(404).send();
-    return;
-  }
-
+  // The whole wildcard is the filename here, already decoded by the router: the public tarball
+  // URL puts the entire name into one encoded segment. Splitting it on "/" and taking the last
+  // part dropped the scope of a scoped package - "@scope/pkg-1.0.0.tgz" was resolved as "pkg" and
+  // answered 404 even with the right archive cached.
+  const decodedFile = normalizedRest;
   const base = decodedFile.slice(0, -4);
   const split = await resolveTarballBasename(base, req.log);
   if (!split) {
