@@ -711,3 +711,49 @@ test(
     );
   }
 );
+
+// Regression for cycle 2 round 2: semver.minVersion throws on a range it cannot parse, and
+// neither dependency-normalisation loop caught it. One malformed dependency in one old version
+// therefore took the whole package's metadata with it - a cold request answered 404 even
+// though the other versions were perfectly usable.
+test(
+  "依存範囲が不正な版があっても、パッケージのメタデータは組み立てられる",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.baddep";
+    const broken = "1.0.0";
+    const good = "2.0.0";
+    const marker = "bad-dependency";
+
+    mockVpmIndex(marker, {
+      packages: {
+        [packageName]: {
+          versions: {
+            [broken]: {
+              name: packageName,
+              version: broken,
+              url: `${VPM_ORIGIN}/dl/${packageName}-${broken}.zip`,
+              vpmDependencies: { "com.example.dep": "not-a-range" }
+            },
+            [good]: {
+              name: packageName,
+              version: good,
+              url: `${VPM_ORIGIN}/dl/${packageName}-${good}.zip`,
+              vpmDependencies: { "com.example.dep": "1.2.3" }
+            }
+          }
+        }
+      }
+    });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 200, "one unparseable range must not fail the whole package");
+    const body = res.json() as { name: string };
+    assert.equal(body.name, packageName);
+  }
+);

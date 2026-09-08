@@ -330,9 +330,17 @@ function buildNpmMetadataFromVpm(
         /<(\d+\.\d+\.\d+)-[A-Za-z][^ ]*/g,
         "<$1-0"
       );
-      const min = semver.minVersion(normalizedRange);
-      if (min) {
-        normalizedDeps[depName] = min.version;
+      // semver.minVersion throws on a range it cannot parse, and one such dependency in one
+      // old version used to take the whole package's metadata with it - a cold request
+      // answered 404 even though every other version was fine. A dependency the proxy
+      // cannot express is dropped from the normalised set instead.
+      try {
+        const min = semver.minVersion(normalizedRange);
+        if (min) {
+          normalizedDeps[depName] = min.version;
+        }
+      } catch {
+        // unparseable range: leave this dependency out rather than fail the version
       }
     }
     out.versions[version] = {
@@ -1270,6 +1278,15 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
   for (let page = 1; page <= maxPages; page++) {
     const u = new URL(base);
     u.searchParams.set("package_type", "npm");
+    // Push the search text upstream as well. The enumeration below is capped, and it filters
+    // by text only after the cap has already been applied - so a matching package that first
+    // appears past the cap is reported as "no results" rather than as truncation. Narrowing
+    // the enumeration is what keeps it inside the cap. GitLab's own filter is a substring
+    // match, the same as the local one, which stays as the backstop for a server that
+    // ignores the parameter.
+    if (text) {
+      u.searchParams.set("package_name", text);
+    }
     u.searchParams.set("exclude_subgroups", "false");
     u.searchParams.set("per_page", String(perPage));
     u.searchParams.set("page", String(page));
@@ -1291,6 +1308,15 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
     const items = (await res.body.json()) as any[];
     all.push(...items);
     if (items.length < perPage) break;
+    if (page === maxPages) {
+      // The enumeration stopped at the cap with more still available upstream, so what
+      // follows describes a truncated set. Silently reporting it as complete is what made
+      // a package past the cap look like it does not exist.
+      req.log.info(
+        { groupEnc, text, enumerated: all.length, maxPages, perPage },
+        "gitlab_packages_enumeration_truncated"
+      );
+    }
   }
 
   const gitlabFiltered = all
