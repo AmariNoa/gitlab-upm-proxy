@@ -11,7 +11,15 @@
 // case. Instead a single temp directory is created for the whole file before
 // the app is built for the first time, and removed again after all tests
 // finish.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -131,6 +139,18 @@ test("GitLabの/api/v4/userがリダイレクトを返す場合も401 invalid_to
   assert.equal(res.statusCode, 401);
   assert.deepEqual(res.json(), { error: "invalid_token" });
 });
+
+// The relay streams the body to the caller and writes it to the cache at the same time, so cache
+// publication finishes after the response does. Tests that assert on the file wait for it rather
+// than assuming it is already there.
+async function waitForCacheFile(path: string, timeoutMs = 2000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return existsSync(path);
+}
 
 test("有効なPATでsearchがレスポンスを返し、GitLabへPATヘッダが転送される", async (t: TestContext) => {
   const user = mockValidUser();
@@ -1156,14 +1176,16 @@ test("Content-Encodingの付いたtarball応答はキャッシュされない", 
 
   assert.equal(second.statusCode, 200);
   assert.deepEqual(second.rawPayload, plainBytes, "the identity response is what gets served");
-  assert.deepEqual(readFileSync(cachedPath), plainBytes, "and it is the one that gets cached");
+  assert.ok(await waitForCacheFile(cachedPath), "the identity response is the one that gets cached");
+  assert.deepEqual(readFileSync(cachedPath), plainBytes);
 });
 
-// Regression for the sixth round of the second review cycle: the npm relay read the whole
-// upstream body into memory with no bound, so an oversized archive - published by whoever owns
-// the package, not by this proxy - could exhaust the process on a single authenticated request.
-// The VPM ceiling added two rounds earlier did not cover this path.
-test("上限を超える上流ボディは中継されずキャッシュもされない", async (t: TestContext) => {
+// The relay no longer buffers the body, so memory does not scale with the response and the
+// ceiling has nothing to protect there. What it still governs is the cache volume: an archive over
+// the limit is relayed to the caller in full and simply not stored. Before streaming, the same
+// archive failed the request outright - a legitimate package larger than the ceiling could not be
+// fetched at all, which is what carry-over (23) was about.
+test("上限を超えるtarballは中継されるが、キャッシュはされない", async (t: TestContext) => {
   process.env.MAX_UPSTREAM_BODY_BYTES = "1024";
   try {
     mockValidUser();
@@ -1185,10 +1207,17 @@ test("上限を超える上流ボディは中継されずキャッシュもさ�
       headers: { "private-token": "valid-token" }
     });
 
-    assert.notEqual(res.statusCode, 200, "an oversized body must not be relayed as the archive");
+    assert.equal(res.statusCode, 200, "an oversized archive is still the caller's to fetch");
+    assert.equal(res.rawPayload.length, 8192, "and it arrives whole");
 
     const cachedPath = join(tarballCacheDir, DEFAULT_HOST, "oversized", "oversized-1.0.0.tgz");
-    assert.ok(!existsSync(cachedPath), "and nothing may reach the cache");
+    // Long enough for the cache write to have finished had it been going to.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(!existsSync(cachedPath), "but it does not go into the cache");
+    const leftovers = readdirSync(join(tarballCacheDir, DEFAULT_HOST, "oversized")).filter((name) =>
+      name.endsWith(".tmp")
+    );
+    assert.deepEqual(leftovers, [], "and no temp file survives the refusal");
   } finally {
     delete process.env.MAX_UPSTREAM_BODY_BYTES;
   }
@@ -1539,4 +1568,74 @@ test("エラー応答に上流のホスト名や内部メッセージが含ま�
   assert.ok(!res.body.includes("gitlab.example.com"), "no upstream hostname in the response");
   assert.ok(!res.body.includes("ECONNREFUSED"), "no internal error text either");
   assert.deepEqual(res.json(), { error: "upstream_failed" }, "just what happened, in one word");
+});
+
+// Regression for carry-over (23): the relay buffered the whole archive before sending anything, so
+// memory scaled with the response and a legitimate package over the ceiling could not be fetched
+// at all. It now streams to the caller and tees into the cache, so the ceiling governs only what
+// may be stored.
+test("上限内のtarballは中継され、キャッシュへも書かれる", async (t: TestContext) => {
+  mockValidUser();
+  const path = "/api/v4/groups/my-group/streamed/-/streamed-1.0.0.tgz";
+  const upstreamPath = "/api/v4/groups/my-group/-/packages/npm/streamed/-/streamed-1.0.0.tgz";
+  const bytes = Buffer.alloc(4096, 0x53);
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: upstreamPath, method: "GET" })
+    .reply(200, bytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const first = await app.inject({
+    method: "GET",
+    url: path,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(first.statusCode, 200);
+  assert.deepEqual(first.rawPayload, bytes, "the archive reaches the caller whole");
+
+  const cachedPath = join(tarballCacheDir, DEFAULT_HOST, "streamed", "streamed-1.0.0.tgz");
+  assert.ok(await waitForCacheFile(cachedPath), "and is published to the cache");
+  assert.deepEqual(readFileSync(cachedPath), bytes);
+
+  // No second interceptor: the next request has to be answered from cache or it fails.
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: "/api/v4/groups/my-group/-/packages/npm/streamed", method: "HEAD" })
+    .reply(200, "", { headers: { "content-type": "application/json" } });
+
+  const second = await app.inject({
+    method: "GET",
+    url: path,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(second.statusCode, 200, "served from cache without going upstream for the archive");
+  assert.deepEqual(second.rawPayload, bytes);
+});
+
+// A stream that fails partway must not leave a partial archive - nor a temp file - behind.
+test("中継中に上流が切断された場合、不完全なアーカイブは公開されない", async (t: TestContext) => {
+  mockValidUser();
+  const path = "/api/v4/groups/my-group/truncated/-/truncated-1.0.0.tgz";
+  const upstreamPath = "/api/v4/groups/my-group/-/packages/npm/truncated/-/truncated-1.0.0.tgz";
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: upstreamPath, method: "GET" })
+    .reply(200, () => {
+      throw new Error("socket hang up");
+    });
+
+  const app = await build(t);
+  await app
+    .inject({ method: "GET", url: path, headers: { "private-token": "valid-token" } })
+    .catch(() => undefined);
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const packageDir = join(tarballCacheDir, DEFAULT_HOST, "truncated");
+  const entries = existsSync(packageDir) ? readdirSync(packageDir) : [];
+  assert.deepEqual(entries, [], "neither the archive nor a temp file may survive");
 });

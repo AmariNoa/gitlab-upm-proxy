@@ -93,10 +93,11 @@ VPM_MAX_EXTRACT_BYTES=1073741824
 VPM_MAX_EXTRACT_ENTRIES=20000
 ````
 
-The same ceiling applies to every other upstream body read into memory: the npm passthrough,
-which relays a tarball by buffering it whole, the metadata enrichment download, and the JSON of
-metadata, search, VPM index and signing key responses. It is separate from the VPM archive limits
-because the two kinds of traffic are configured independently:
+The same ceiling applies to the metadata enrichment download and to the JSON of metadata, search,
+VPM index and signing key responses. The npm passthrough streams a tarball to the client rather
+than buffering it, so there the ceiling governs how large an archive may be written to the cache:
+a larger one is still relayed in full, it is simply not stored. It is separate from the VPM
+archive limits because the two kinds of traffic are configured independently:
 
 ````
 MAX_UPSTREAM_BODY_BYTES=536870912

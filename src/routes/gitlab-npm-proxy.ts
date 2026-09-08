@@ -1,5 +1,6 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { PassThrough } from "node:stream";
 import type { FastifyPluginAsync } from "fastify";
 import * as semver from "semver";
 import * as tar from "tar";
@@ -8,6 +9,7 @@ import {
   fetchBufferWithRedirects,
   fetchJsonWithRedirects,
   isSameOrigin,
+  maxUpstreamBodyBytes,
   readUpstreamBody,
   readUpstreamJson,
   requestUpstream,
@@ -25,7 +27,8 @@ import {
   readMetadataCache,
   readTarballCache,
   updateMetadataCache,
-  writeTarballCache
+  writeTarballCache,
+  writeTarballCacheStream
 } from "../lib/cache";
 import {
   extractPackageName,
@@ -1713,6 +1716,63 @@ function rawRestFromRequest(req: any, decodedRest: string): string | null {
 }
 
 /**
+ * Relays a non-JSON upstream body to the caller without buffering it, and caches it on the way
+ * past when it is a complete tarball.
+ *
+ * The body used to be read into memory whole before anything was sent, which made a ceiling
+ * necessary and made a legitimate archive above that ceiling impossible to fetch at all. Streaming
+ * removes both problems: memory no longer scales with the response, and the ceiling now governs
+ * only what may be written to the cache volume. An archive past it is relayed in full and simply
+ * not stored.
+ *
+ * A cache write that fails does not take the response with it. The caller asked for the archive,
+ * not for it to be cached, and the next request will fetch it again.
+ */
+async function relayBodyAndMaybeCache(
+  req: any,
+  reply: any,
+  res: any,
+  cacheTarget: { upstream: UpstreamEntry; packageName: string; filename: string } | null
+): Promise<void> {
+  if (!cacheTarget) {
+    reply.send(res.body);
+    return;
+  }
+  const toCache = new PassThrough();
+  const toClient = new PassThrough();
+  res.body.on("error", (err: unknown) => {
+    toCache.destroy(err as Error);
+    toClient.destroy(err as Error);
+  });
+  res.body.on("data", (chunk: Buffer) => {
+    toCache.write(chunk);
+    toClient.write(chunk);
+  });
+  res.body.on("end", () => {
+    toCache.end();
+    toClient.end();
+  });
+
+  // Started before the response is sent so no chunk is missed, and awaited after: a cache write
+  // that fails or exceeds the ceiling must not fail the relay.
+  const cacheWrite = writeTarballCacheStream(
+    cacheTarget.upstream.host,
+    cacheTarget.packageName,
+    cacheTarget.filename,
+    toCache,
+    maxUpstreamBodyBytes()
+  ).catch((err) => {
+    req.log.info(
+      { err, packageName: cacheTarget.packageName, filename: cacheTarget.filename },
+      "tarball_cache_write_failed"
+    );
+  });
+
+  reply.send(toClient);
+  await cacheWrite;
+}
+
+/**
  * npm registry 透過（groupEnc を受け取って upstream npm registry に中継）
  */
 async function proxyGroupNpm(
@@ -2095,17 +2155,18 @@ async function proxyGroupNpm(
 
   reply.code(res.statusCode);
   applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
-  const buffer = await readUpstreamBody(res as any);
-  if (
+  const cacheable =
     isTarball &&
     method === "GET" &&
     packageName &&
     tarballFilename &&
-    isCompleteTarballResponse(res.statusCode, res.headers as Record<string, unknown>)
-  ) {
-    await writeTarballCache(upstream.host, packageName, tarballFilename, buffer);
-  }
-  reply.send(buffer);
+    isCompleteTarballResponse(res.statusCode, res.headers as Record<string, unknown>);
+  await relayBodyAndMaybeCache(
+    req,
+    reply,
+    res,
+    cacheable ? { upstream, packageName, filename: tarballFilename } : null
+  );
 }
 
 async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promise<void> {
