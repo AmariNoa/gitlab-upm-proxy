@@ -630,3 +630,80 @@ test(
     assert.deepEqual(cachedTgz, res.rawPayload);
   }
 );
+
+// ---------------------------------------------------------------------------------
+// (h) 旧形式エイリアスのデコード境界
+// ---------------------------------------------------------------------------------
+// Regression for the seventh round of the second review cycle. The round before fixed the global
+// and group routes but left both legacy aliases decoding their already-decoded segments: a name
+// holding a literal "%" threw URIError and answered 500, and a scoped name was split across two
+// segments, so "vpm/@scope/pkg/1.0.0" was read as package "@scope" at version "pkg".
+test(
+  "旧形式 /vpm/<package>/<version> はスコープ付き名前を1つの名前として解決する",
+  async (t: TestContext) => {
+    const packageName = "@vpmscope/legacy";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = "/dl/vpmscope-legacy-1.0.0.zip";
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/vpm/${encodeURIComponent(packageName)}/${version}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "the scope must not be split off as the package name");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+  }
+);
+
+test(
+  "旧形式 /npm/<package>/-/<file> はパーセント記号を含む名前でも500にならない",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.legacy%";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = "/dl/legacy-pct-1.0.0.zip";
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/npm/${encodeURIComponent(packageName)}/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "a literal percent sign must not fail the legacy alias");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+  }
+);

@@ -1529,10 +1529,15 @@ async function proxyGroupNpm(
   // caller's credentials used to reach other registries and third-party download hosts.
 
   if (normalizedRest.startsWith("npm/")) {
+    // Segments arrive decoded, so a scoped name occupies two of them and must not be decoded
+    // again: "@scope%2Fpkg" reaches here as "@scope/pkg", and decoding a name holding a literal
+    // "%" threw outright.
     const parts = normalizedRest.split("/").filter(Boolean);
-    if (parts.length >= 4 && parts[2] === "-") {
-      const decodedName = decodeURIComponent(parts[1] ?? "");
-      const decodedFile = decodeURIComponent(parts[3] ?? "");
+    const rest = parts.slice(1);
+    const dashIndex = rest.indexOf("-");
+    if ((dashIndex === 1 || (dashIndex === 2 && (rest[0] ?? "").startsWith("@"))) && rest.length > dashIndex + 1) {
+      const decodedName = rest.slice(0, dashIndex).join("/");
+      const decodedFile = rest[dashIndex + 1] ?? "";
       const prefix = `${decodedName}-`;
       if (decodedName && decodedFile.startsWith(prefix) && decodedFile.endsWith(".tgz")) {
         const decodedVersion = decodedFile.slice(prefix.length, -4);
@@ -1558,11 +1563,13 @@ async function proxyGroupNpm(
   }
 
   if (normalizedRest.startsWith("vpm/")) {
+    // Same decoding boundary as the npm/ branch above: the segments are already decoded, and a
+    // scoped name spans two of them.
     const parts = normalizedRest.split("/").filter(Boolean);
-    const encodedName = parts[1] ?? "";
-    const encodedVersion = parts[2] ?? "";
-    const decodedName = decodeURIComponent(encodedName);
-    const decodedFile = decodeURIComponent(encodedVersion);
+    const rest = parts.slice(1);
+    const scoped = (rest[0] ?? "").startsWith("@") && rest.length >= 3;
+    const decodedName = scoped ? `${rest[0]}/${rest[1]}` : (rest[0] ?? "");
+    const decodedFile = (scoped ? rest[2] : rest[1]) ?? "";
     let decodedVersion = "";
     if (decodedFile.endsWith(".tgz")) {
       const base = decodedFile.slice(0, -4);
