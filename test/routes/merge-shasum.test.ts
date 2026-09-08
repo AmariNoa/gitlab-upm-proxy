@@ -246,3 +246,59 @@ test(
     assert.equal(result!.latestVersion, "3.0.0", "latestVersion must not come from the withdrawn version");
   }
 );
+
+// Regression for the tenth review round: when a prefetch deletes an archive whose metadata it
+// could not publish, it clears that version's availability on disk. A metadata request holding
+// a snapshot from before that cleanup would write its own shasum and signature back, undoing
+// the cleanup for good - mergeShasumFromCache cannot help, because the cleared disk entry has
+// nothing left to copy.
+test(
+  "ディスク側で可用性が消された版は、古いスナップショットの署名で復活しない",
+  async () => {
+    const upstream: UpstreamEntry = {
+      baseUrl: "https://vpm.example.com/index.json",
+      host: "vpm-refresh-cleared.example.com",
+      type: "vpm"
+    };
+    const packageName = "com.example.refresh.cleared";
+    const version = "1.0.0";
+
+    // What the rollback left: the version is still listed, but nothing says it is available.
+    await writeMetadataCache(upstream.host, packageName, {
+      latestVersion: "",
+      metadata: {
+        name: packageName,
+        "dist-tags": {},
+        versions: {
+          [version]: { name: packageName, version, dist: { tarball: "", original: "https://vpm.example.com/dl/x.zip" } }
+        }
+      }
+    });
+
+    // What the request still believes: signed, under the current key.
+    const staleSnapshot = {
+      name: packageName,
+      versions: {
+        [version]: {
+          name: packageName,
+          version,
+          dist: {
+            tarball: "",
+            shasum: "7".repeat(40),
+            integrity: "sha512-BEFORE-THE-ROLLBACK",
+            signatures: [{ keyid: proxyKeyid, sig: "BEFORE-THE-ROLLBACK" }]
+          }
+        }
+      }
+    };
+
+    await refreshCachedVpmMetadata(upstream, packageName, staleSnapshot, staleSnapshot);
+
+    const result = await readMetadataCache(upstream.host, packageName);
+    const dist = result?.metadata.versions[version]?.dist;
+    assert.ok(dist, "the version itself stays listed");
+    assert.equal(dist.shasum, undefined, "the cleared availability must not be written back");
+    assert.equal(dist.integrity, undefined);
+    assert.equal(dist.signatures, undefined);
+  }
+);
