@@ -168,31 +168,43 @@ sudo ls -la /var/lib/gitlab-upm-proxy/cache/vpm.example.com/
 sudo rm -rf /var/lib/gitlab-upm-proxy/cache/vpm.example.com/com.example.vpm.pkg
 sudo systemctl start gitlab-upm-proxy
 
-# (2) 1 回目の取得
+# (2) prefetch の完了を待つ
+# 起動時の prefetch は待たれずに走り、tgz を取得し終えていないバージョンは応答から除外される。
+# キャッシュを消した直後に取得すると、正常なサーバーでも versions['1.0.0'] が存在せず、
+# 以降の手順が誤って失敗する。最大 120 秒だけ待ち、出てこなければ prefetch 側の問題として
+# 切り分ける（journalctl の vpm_prefetch_failed / vpm_prefetch_skip を確認する）。
+for i in $(seq 1 60); do
+  curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg" \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);sys.exit(0 if d.get('versions',{}).get('1.0.0',{}).get('dist',{}).get('integrity') else 1)" && break
+  sleep 2
+done
+
+# (3) 1 回目の取得
 curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg" > /tmp/vpm-meta-1.json
 python3 -c "import json;d=json.load(open('/tmp/vpm-meta-1.json'));v=d['versions']['1.0.0']['dist'];print(v.get('integrity'));print(json.dumps(v.get('signatures')))"
 
-# (3) ディスク上のキャッシュを確認
+# (4) ディスク上のキャッシュを確認
 sudo python3 -c "import json;d=json.load(open('/var/lib/gitlab-upm-proxy/cache/vpm.example.com/com.example.vpm.pkg/metadata.json'));v=d['metadata']['versions']['1.0.0']['dist'];print(v.get('integrity'));print(json.dumps(v.get('signatures')))"
 
-# (4) 2 回目の取得（署名が再計算されないことの確認）
+# (5) 2 回目の取得（署名が再計算されないことの確認）
 curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg" > /tmp/vpm-meta-2.json
 diff <(python3 -c "import json;print(json.dumps(json.load(open('/tmp/vpm-meta-1.json'))['versions']['1.0.0']['dist'],sort_keys=True))") <(python3 -c "import json;print(json.dumps(json.load(open('/tmp/vpm-meta-2.json'))['versions']['1.0.0']['dist'],sort_keys=True))") && echo "IDENTICAL"
 
-# (5) tarball の取得と integrity の突き合わせ
+# (6) tarball の取得と integrity の突き合わせ
 curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" -o /tmp/vpm-pkg.tgz "https://upm.example.com/-/com.example.vpm.pkg-1.0.0.tgz"
 echo "sha512-$(openssl dgst -sha512 -binary /tmp/vpm-pkg.tgz | base64 -w0)"
 ```
 
 **期待される結果**
 
-- (2) `dist.integrity` が `sha512-` で始まる文字列、`dist.signatures` が `[{"keyid":"SHA256:...","sig":"..."}]` の形で返る。
-- (3) ディスクの `metadata.json` にも (2) と同じ `integrity` と `signatures` が保存されている（署名が永続化されている）。
-- (4) `diff` が差分なしで `IDENTICAL` を表示する（2 回目に署名が作り直されていない）。
-- (5) 計算した `sha512-...` が (2) の `dist.integrity` と一致する（署名対象が実際に配信される tarball と同一）。
+- (2) のループが 120 秒以内に抜ける。抜けない場合は prefetch が完了していないか失敗しているので、`journalctl -u gitlab-upm-proxy -n 200 --no-pager | grep vpm_prefetch` を確認し、**署名機能の失敗と混同しない**。
+- (3) `dist.integrity` が `sha512-` で始まる文字列、`dist.signatures` が `[{"keyid":"SHA256:...","sig":"..."}]` の形で返る。
+- (4) ディスクの `metadata.json` にも (3) と同じ `integrity` と `signatures` が保存されている（署名が永続化されている）。
+- (5) `diff` が差分なしで `IDENTICAL` を表示する（2 回目に署名が作り直されていない）。
+- (6) 計算した `sha512-...` が (3) の `dist.integrity` と一致する（署名対象が実際に配信される tarball と同一）。
 - 一連の操作で 500 系のエラーが出ない。
 
-**判定の注意**: (4) は「値が同じ」ことしか示さない。再計算そのものが行われていないかを厳密に見るなら、(4) の実行前後で CPU 時間やレスポンス時間の差、あるいは `journalctl` のログ量を併せて観察する。
+**判定の注意**: (5) は「値が同じ」ことしか示さない。再計算そのものが行われていないかを厳密に見るなら、(5) の実行前後で CPU 時間やレスポンス時間の差、あるいは `journalctl` のログ量を併せて観察する。
 
 ---
 
