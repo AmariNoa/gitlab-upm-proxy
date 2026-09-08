@@ -985,7 +985,9 @@ function isPlainObject(value: unknown): value is Record<string, any> {
  * flight - so only the versions the baseline knew about are removed, together with their
  * archives. The package itself goes only when that leaves nothing behind.
  */
-async function removeWithdrawnPackage(
+// Exported so a test can drive the withdrawal directly and race a concurrent publication
+// against it; the HTTP route reaches it only through a full metadata request.
+export async function removeWithdrawnPackage(
   upstream: UpstreamEntry,
   packageName: string,
   baselineMetadata: any
@@ -993,40 +995,41 @@ async function removeWithdrawnPackage(
   const baselineVersions = isPlainObject(baselineMetadata?.versions)
     ? baselineMetadata.versions
     : {};
-  const removed: string[] = [];
-  let nothingLeft = false;
-
-  await updateMetadataCache(upstream.host, packageName, (current) => {
-    const target = current?.metadata;
-    if (!isPlainObject(target?.versions)) {
-      nothingLeft = true;
-      return null;
-    }
-    for (const version of Object.keys(target.versions)) {
-      if (baselineVersions[version] === undefined) continue;
-      delete target.versions[version];
-      removed.push(version);
-    }
-    if (Object.keys(target.versions).length === 0) {
-      nothingLeft = true;
-      return null;
-    }
-    return {
-      latestVersion: pickLatestVpmVersion(target.versions) ?? "",
-      author: current?.author,
-      displayName: current?.displayName,
-      metadata: target
-    };
+  // Both locks, in the order the prefetch takes them (archive, then metadata), and held across the
+  // decision AND the deletion. Deciding "nothing is left" under the metadata lock and then
+  // releasing it before deleting the directory left a window in which a concurrent prefetch could
+  // publish a new version - and the delete took that version's metadata and archive with it.
+  const packageDir = getPackageCacheDir(upstream.host, packageName);
+  await runTempLocked(packageDir, async () => {
+    await updateMetadataCache(upstream.host, packageName, async (current) => {
+      const target = current?.metadata;
+      if (!isPlainObject(target?.versions)) {
+        await deletePackageCache(upstream, packageName);
+        return null;
+      }
+      const removed: string[] = [];
+      for (const version of Object.keys(target.versions)) {
+        if (baselineVersions[version] === undefined) continue;
+        delete target.versions[version];
+        removed.push(version);
+      }
+      if (Object.keys(target.versions).length === 0) {
+        // Re-read under the lock, so this is the current state and not the one the caller saw.
+        await deletePackageCache(upstream, packageName);
+        return null;
+      }
+      for (const version of removed) {
+        const path = getTarballCachePath(upstream.host, packageName, `${packageName}-${version}.tgz`);
+        await rm(path, { force: true }).catch(() => {});
+      }
+      return {
+        latestVersion: pickLatestVpmVersion(target.versions) ?? "",
+        author: current?.author,
+        displayName: current?.displayName,
+        metadata: target
+      };
+    });
   });
-
-  if (nothingLeft) {
-    await deletePackageCache(upstream, packageName);
-    return;
-  }
-  for (const version of removed) {
-    const path = getTarballCachePath(upstream.host, packageName, `${packageName}-${version}.tgz`);
-    await rm(path, { force: true }).catch(() => {});
-  }
 }
 
 async function deletePackageCache(upstream: UpstreamEntry, packageName: string): Promise<void> {
