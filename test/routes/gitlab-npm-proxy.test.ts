@@ -1108,3 +1108,54 @@ test("パーセント記号を含むtarballファイル名でも中継が500に�
   assert.equal(res.statusCode, 200, "a literal percent sign must not fail the relay");
   assert.deepEqual(res.rawPayload, tarballBytes);
 });
+
+// Regression for the sixth round of the second review cycle: a 200 carrying Content-Encoding was
+// cached as the raw HTTP-encoded bytes. The cache miss forwarded the header, so that caller could
+// decode it - but the cache serves its bytes back with no encoding header at all, so every later
+// request received the still-encoded body labelled as the archive.
+test("Content-Encodingの付いたtarball応答はキャッシュされない", async (t: TestContext) => {
+  mockValidUser();
+  const path = "/api/v4/groups/my-group/encoded/-/encoded-1.0.0.tgz";
+  const upstreamPath = "/api/v4/groups/my-group/-/packages/npm/encoded/-/encoded-1.0.0.tgz";
+  const encodedBytes = Buffer.from("pretend-this-is-gzipped");
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: upstreamPath, method: "GET" })
+    .reply(200, encodedBytes, {
+      headers: { "content-type": "application/octet-stream", "content-encoding": "gzip" }
+    });
+
+  const app = await build(t);
+  const first = await app.inject({
+    method: "GET",
+    url: path,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(first.statusCode, 200, "the response is still relayed to the caller");
+
+  const cachedPath = join(tarballCacheDir, DEFAULT_HOST, "encoded", "encoded-1.0.0.tgz");
+  assert.ok(
+    !existsSync(cachedPath),
+    "an encoded body must not be stored as the archive: the cache serves it back undeclared"
+  );
+
+  // Proof that it was not cached: the next request has to go upstream again.
+  mockValidUser();
+  const plainBytes = Buffer.from("the-real-archive");
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: upstreamPath, method: "GET" })
+    .reply(200, plainBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const second = await app.inject({
+    method: "GET",
+    url: path,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(second.statusCode, 200);
+  assert.deepEqual(second.rawPayload, plainBytes, "the identity response is what gets served");
+  assert.deepEqual(readFileSync(cachedPath), plainBytes, "and it is the one that gets cached");
+});
