@@ -50,7 +50,7 @@ function maxDownloadBytes(): number {
  * are configured for different traffic, and because changing what an existing VPM_* variable
  * governs would be a silent semantic change.
  */
-function maxUpstreamBodyBytes(): number {
+export function maxUpstreamBodyBytes(): number {
   return positiveIntEnv("MAX_UPSTREAM_BODY_BYTES", 512 * 1024 * 1024);
 }
 

@@ -1,6 +1,9 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Transform, type Readable } from "node:stream";
 import { mustEnv } from "./env";
 
 const CACHE_DIR = mustEnv("TARBALL_CACHE_DIR");
@@ -154,6 +157,47 @@ export async function deleteMetadataCache(
 ): Promise<void> {
   const path = getMetadataCachePath(upstreamHost, packageName);
   await rm(path, { force: true });
+}
+
+/**
+ * Publishes a tarball read from a stream, the same way the buffered version does: a uniquely named
+ * temp file in the target directory, then a rename. A reader that takes no lock therefore never
+ * sees a partial archive at the final path.
+ *
+ * `limit` bounds what may be written. The relay that feeds this no longer buffers the body, so the
+ * ceiling is about the cache volume rather than memory: an archive past it is still relayed to the
+ * caller, it simply is not stored. Exceeding it, or any failure while writing, removes the temp
+ * file and leaves the cache as it was.
+ */
+export async function writeTarballCacheStream(
+  upstreamHost: string,
+  packageName: string,
+  filename: string,
+  source: Readable,
+  limit: number
+): Promise<string> {
+  const path = getTarballCachePath(upstreamHost, packageName, filename);
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = join(dirname(path), `.${randomUUID()}.tmp`);
+  let written = 0;
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      written += chunk.length;
+      if (written > limit) {
+        callback(new Error(`tarball_cache_too_large:${written}`));
+        return;
+      }
+      callback(null, chunk);
+    }
+  });
+  try {
+    await pipeline(source, counter, createWriteStream(tempPath));
+    await rename(tempPath, path);
+  } catch (err) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw err;
+  }
+  return path;
 }
 
 export function getTarballCachePath(
