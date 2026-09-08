@@ -1131,6 +1131,13 @@ function extractTarballFilenameFromUrl(url: string): string | null {
  * complete archive to every later request - and now that publication is atomic, it would do
  * so reliably.
  */
+/** The path of a request URL with any query string removed, for logging. */
+export function pathWithoutQuery(url: unknown): string {
+  const raw = typeof url === "string" ? url : "";
+  const queryStart = raw.indexOf("?");
+  return queryStart < 0 ? raw : raw.slice(0, queryStart);
+}
+
 /** Statuses HTTP defines as carrying no message body, whatever Content-Type accompanies them. */
 function isBodylessStatus(statusCode: number): boolean {
   return statusCode === 204 || statusCode === 205 || statusCode === 304;
@@ -1947,7 +1954,10 @@ async function proxyDefaultGitlabApi(req: any, reply: any): Promise<void> {
 
 const routes: FastifyPluginAsync = async (app) => {
   app.addHook("onRequest", async (req, reply) => {
-    req.log.info({ method: req.method, url: req.url }, "req_in");
+    // Path only. Tarball URLs carry whatever query the upstream signed them with, and the
+    // proxy now deliberately preserves it end to end - so logging the URL verbatim wrote a
+    // working download credential into the application log on every request.
+    req.log.info({ method: req.method, path: pathWithoutQuery(req.url) }, "req_in");
     const ok = await validateGitlabPat(req, reply);
     if (!ok) return reply;
   });

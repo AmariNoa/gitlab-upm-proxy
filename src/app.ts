@@ -10,6 +10,23 @@ export interface AppOptions extends FastifyServerOptions, Partial<AutoloadPlugin
 }
 // Pass --options via CLI arguments in command to enable these options.
 const options: AppOptions = {
+  logger: {
+    serializers: {
+      // Fastify's own request log prints req.url, and tarball URLs carry the query the
+      // upstream signed them with - which this proxy deliberately preserves end to end. The
+      // path alone is what belongs in a log; the signature is a credential.
+      req(request: any) {
+        const url = typeof request?.url === "string" ? request.url : "";
+        const queryStart = url.indexOf("?");
+        return {
+          method: request?.method,
+          path: queryStart < 0 ? url : url.slice(0, queryStart),
+          host: request?.host,
+          remoteAddress: request?.ip
+        };
+      }
+    }
+  }
 }
 
 const app: FastifyPluginAsync<AppOptions> = async (

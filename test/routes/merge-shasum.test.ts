@@ -20,7 +20,11 @@ process.env.TARBALL_CACHE_DIR = tarballCacheDir;
 process.env.UPSTREAM_CONFIG_PATH = "test/fixtures/upstreams.test.yml";
 process.env.PUBLIC_BASE_URL = "https://proxy.merge-shasum.example.net";
 
-import { mergeShasumFromCache, refreshCachedVpmMetadata } from "../../src/routes/gitlab-npm-proxy";
+import {
+  mergeShasumFromCache,
+  pathWithoutQuery,
+  refreshCachedVpmMetadata
+} from "../../src/routes/gitlab-npm-proxy";
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
 import { readMetadataCache, writeMetadataCache, type MetadataCache } from "../../src/lib/cache";
 import type { UpstreamEntry } from "../../src/lib/upstreams";
@@ -302,3 +306,18 @@ test(
     assert.equal(dist.signatures, undefined);
   }
 );
+
+// Regression for the third round of the second review cycle: the per-request log printed
+// req.url verbatim. Tarball URLs carry the query the upstream signed them with - which this
+// proxy deliberately preserves end to end - so every tarball request wrote a working download
+// credential into the log, where it outlives the signature's own expiry.
+test("pathWithoutQueryはログへ出すパスからクエリ文字列を落とす", () => {
+  assert.equal(
+    pathWithoutQuery("/api/v4/groups/g/com.example.pkg/-/com.example.pkg-1.0.0.tgz?signature=s&expires=1"),
+    "/api/v4/groups/g/com.example.pkg/-/com.example.pkg-1.0.0.tgz"
+  );
+  assert.equal(pathWithoutQuery("/api/v4/groups/g/com.example.pkg"), "/api/v4/groups/g/com.example.pkg");
+  assert.equal(pathWithoutQuery("/?a=b"), "/");
+  // A non-string url (never expected from Fastify, but the logger must not throw).
+  assert.equal(pathWithoutQuery(undefined), "");
+});
