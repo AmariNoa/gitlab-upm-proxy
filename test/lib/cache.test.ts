@@ -65,6 +65,11 @@ test(
     })();
 
     await writeTarballCache(host, packageName, filename, payload);
+    // One observation the scheduler cannot take away. The poller only looks again after a
+    // setImmediate, so it can legitimately stop having seen nothing at all - and the
+    // assertion below, which exists to keep this test from being vacuous, would then fail on
+    // a perfectly atomic write.
+    observedSizes.push((await stat(finalPath)).size);
     polling = false;
     await poller;
 

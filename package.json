@@ -7,7 +7,7 @@
     "test": "test"
   },
   "scripts": {
-    "test": "tsc --noEmit -p test/tsconfig.json && cross-env DOTENV_CONFIG_PATH=test/.env.test TS_NODE_PROJECT=test/tsconfig.json TS_NODE_TRANSPILE_ONLY=true node --require dotenv/config --require ts-node/register --test test/routes/gitlab-npm-proxy.test.ts test/lib/npm-signatures.test.ts test/routes/vpm-signatures.test.ts test/routes/vpm-tarball-convert.test.ts test/lib/tgz.test.ts test/lib/cache.test.ts test/lib/npm-signatures-key-validation.test.ts test/lib/vpm-prefetch.test.ts test/routes/npm-signing-keys.test.ts test/routes/security-guards.test.ts test/routes/merge-shasum.test.ts test/routes/tarball-url-rewrite.test.ts",
+    "test": "tsc --noEmit -p test/tsconfig.json && cross-env DOTENV_CONFIG_PATH=test/.env.test TS_NODE_PROJECT=test/tsconfig.json TS_NODE_TRANSPILE_ONLY=true node --require dotenv/config --require ts-node/register --test test/routes/gitlab-npm-proxy.test.ts test/lib/npm-signatures.test.ts test/routes/vpm-signatures.test.ts test/routes/vpm-tarball-convert.test.ts test/lib/tgz.test.ts test/lib/cache.test.ts test/lib/npm-signatures-key-validation.test.ts test/lib/vpm-prefetch.test.ts test/routes/npm-signing-keys.test.ts test/routes/security-guards.test.ts test/routes/merge-shasum.test.ts test/routes/tarball-url-rewrite.test.ts test/routes/request-log.test.ts",
     "start": "npm run build:ts && fastify start -l info dist/app.js",
     "build:ts": "tsc",
     "watch:ts": "tsc -w",
