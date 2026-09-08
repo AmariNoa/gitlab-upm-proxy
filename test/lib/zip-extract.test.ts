@@ -93,3 +93,44 @@ test(
     );
   }
 );
+
+// Regression for the sixth round of the second review cycle: the entry-count ceiling was applied
+// to files only, and the directory loop added right before it created every declared directory.
+// An archive of nothing but empty directories weighs nothing against the byte ceiling, so it went
+// straight past both limits while still costing an inode and a syscall each.
+test(
+  "ディレクトリエントリもエントリ数の上限に数えられる",
+  async () => {
+    process.env.VPM_MAX_EXTRACT_ENTRIES = "4";
+    try {
+      const entries = [
+        { name: "package.json", data: Buffer.from(JSON.stringify({ name: "com.example.many" })) },
+        ...Array.from({ length: 8 }, (_, i) => ({ name: `dir${i}/`, data: Buffer.alloc(0) }))
+      ];
+      await assert.rejects(
+        () => extract(entries),
+        /zip_too_many_entries/,
+        "empty directories must count against the ceiling"
+      );
+    } finally {
+      delete process.env.VPM_MAX_EXTRACT_ENTRIES;
+    }
+  }
+);
+
+// Regression for the same round: a zip may carry "./" as a directory record for its own root. It
+// resolves to the extraction directory itself, which the containment check rejected - failing the
+// conversion of an otherwise ordinary package.
+test(
+  "ルート自身を指すディレクトリレコードは変換を失敗させない",
+  async () => {
+    const outDir = await extract([
+      { name: "./", data: Buffer.alloc(0) },
+      { name: "./package.json", data: Buffer.from(JSON.stringify({ name: "com.example.root" })) },
+      { name: "Runtime/", data: Buffer.alloc(0) }
+    ]);
+
+    const names = (await readdir(outDir)).sort();
+    assert.deepEqual(names, ["Runtime", "package.json"]);
+  }
+);
