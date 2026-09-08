@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 144 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 146 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -95,6 +95,8 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 - 404 は上流が不在を確認した場合に限る（インデックスが正常に応答してそのパッケージを載せていない、上流が 404/410 を返した等）。
 - 上流が応答できなかった場合（インデックスの 5xx、接続失敗、本文の上限超過など）は 502、プロキシ自身の処理が失敗した場合は 500 を返す。
 - いずれの失敗も `vpm_metadata_failed` / `vpm_tarball_failed` としてログに残す。
+- 分類は routes プラグインの `setErrorHandler` が全経路に対して一括で行う（子スコープへ継承される）。VPM 経路と認可確認は自前で応答するためハンドラへは到達しない。
+- エラー応答の本文は `{ "error": "not_found" | "upstream_failed" | "internal_error" }` の最小形とし、内部メッセージを含めない。Fastify 既定のハンドラは `err.message` を本文へ入れるが、この経路のメッセージには上流の URL（実環境のホスト名）が入りうるため。詳細は `request_failed` としてログへ残す。
 - 分類はエラーの種別フィールド（`UpstreamError` の kind / status）で行い、メッセージ文字列からは読み取らない。上限超過のメッセージは末尾がバイト数であり、ステータスコードと区別できないため。
 
 ## 並行性の前提（単一プロセス）
