@@ -44,21 +44,38 @@ function parseFloatEnv(name: string): number {
 // directory the process was done with, and its pacing timer kept the process alive on its own.
 // The flag below is the shutdown signal; every loop checks it between items, and a pass in its
 // pacing sleep is woken immediately rather than waited out.
-let prefetchStopping = false;
-const pendingSleeps = new Set<{ cancel: () => void }>();
-const runningPasses = new Set<Promise<unknown>>();
+//
+// The state belongs to one server, not to the process. A first attempt kept it in module-level
+// variables, which meant closing one server stopped a second one built in the same process, and
+// starting the second cleared the first one's stop. Each application registration creates its own
+// lifecycle and stops that one.
+export type PrefetchLifecycle = {
+  stopping: boolean;
+  sleeps: Set<{ cancel: () => void }>;
+  passes: Set<Promise<unknown>>;
+  running: Set<string>;
+};
 
-/** True once shutdown started, so a loop can stop between items instead of mid-write. */
-function stopRequested(): boolean {
-  return prefetchStopping;
+export function createPrefetchLifecycle(): PrefetchLifecycle {
+  return { stopping: false, sleeps: new Set(), passes: new Set(), running: new Set() };
 }
 
-function sleep(ms: number): Promise<void> {
-  if (prefetchStopping) return Promise.resolve();
+// Used by callers that drive a pass directly and own its completion themselves - the tests that
+// await prefetchForUpstream, and the fallback below when no lifecycle was threaded through. It is
+// never stopped, which is correct for a pass whose caller is already waiting for it.
+const detachedLifecycle = createPrefetchLifecycle();
+
+/** True once shutdown started, so a loop can stop between items instead of mid-write. */
+function stopRequested(lifecycle: PrefetchLifecycle): boolean {
+  return lifecycle.stopping;
+}
+
+function sleep(ms: number, lifecycle: PrefetchLifecycle): Promise<void> {
+  if (lifecycle.stopping) return Promise.resolve();
   return new Promise((resolve) => {
     const entry = { cancel: () => {} };
     const done = () => {
-      pendingSleeps.delete(entry);
+      lifecycle.sleeps.delete(entry);
       resolve();
     };
     const timer = setTimeout(done, ms);
@@ -68,31 +85,42 @@ function sleep(ms: number): Promise<void> {
       clearTimeout(timer);
       done();
     };
-    pendingSleeps.add(entry);
+    lifecycle.sleeps.add(entry);
   });
 }
 
+/**
+ * Waits out the pacing interval and reports whether the pass may go on. Cancelling a sleep
+ * resolves it normally, so without the check here shutdown woke the pass straight into the
+ * download it was pausing before - closing an idle, sleeping prefetch started one more download
+ * and made close() wait for it.
+ */
+async function pacedContinue(ms: number, lifecycle: PrefetchLifecycle): Promise<boolean> {
+  if (ms > 0) await sleep(ms, lifecycle);
+  return !stopRequested(lifecycle);
+}
+
 /** Tracks a background pass so shutdown can wait for the critical section it is inside. */
-function track<T>(pass: Promise<T>): Promise<T> {
-  runningPasses.add(pass);
-  void pass.catch(() => {}).finally(() => runningPasses.delete(pass));
+function track<T>(lifecycle: PrefetchLifecycle, pass: Promise<T>): Promise<T> {
+  lifecycle.passes.add(pass);
+  void pass.catch(() => {}).finally(() => lifecycle.passes.delete(pass));
   return pass;
 }
 
 /**
- * Stops the background prefetch and waits for whatever it is in the middle of. Called from the
- * application's onClose hook, so a closed server leaves nothing writing behind it. Publication
- * is already atomic and holds a per-package lock, so waiting here is what keeps a half-finished
- * conversion from being abandoned rather than completed.
+ * Stops one server's background prefetch and waits for whatever it is in the middle of. Called
+ * from that application's onClose hook, so a closed server leaves nothing writing behind it.
+ * Publication is already atomic and holds a per-package lock, so waiting here is what keeps a
+ * half-finished conversion from being abandoned rather than completed.
  *
- * The wait is bounded: passes only shrink the set (no new one starts while stopping), so a
- * couple of rounds settle it, and the cap keeps a wedged pass from blocking shutdown forever.
+ * The wait is bounded: passes only shrink the set (no new one starts while stopping), so a couple
+ * of rounds settle it, and the cap keeps a wedged pass from blocking shutdown forever.
  */
-export async function stopVpmPrefetch(): Promise<void> {
-  prefetchStopping = true;
-  for (const entry of Array.from(pendingSleeps)) entry.cancel();
-  for (let round = 0; round < 5 && runningPasses.size > 0; round++) {
-    await Promise.allSettled(Array.from(runningPasses));
+export async function stopVpmPrefetch(lifecycle: PrefetchLifecycle): Promise<void> {
+  lifecycle.stopping = true;
+  for (const entry of Array.from(lifecycle.sleeps)) entry.cancel();
+  for (let round = 0; round < 5 && lifecycle.passes.size > 0; round++) {
+    await Promise.allSettled(Array.from(lifecycle.passes));
   }
 }
 
@@ -280,8 +308,6 @@ function mergeMissingVersions(target: any, source: any): void {
   }
 }
 
-const runningPrefetch = new Set<string>();
-
 function shouldIncludePackage(name: string, scopes: string[] | undefined): boolean {
   if (!scopes || scopes.length === 0) return true;
   return scopes.some((scope) => matchScope(name, scope));
@@ -340,18 +366,16 @@ function insertMissingVersionsInto(target: any, versionNodes: Record<string, any
 export async function prefetchForUpstream(
   upstream: UpstreamEntry,
   intervalMs: number,
-  log: { info: (obj: any, msg?: string) => void }
+  log: { info: (obj: any, msg?: string) => void },
+  lifecycle: PrefetchLifecycle = detachedLifecycle
 ): Promise<void> {
   const index = await fetchVpmIndex(upstream);
   const vpmAuthor = index.author;
   const packages = index.packages ?? {};
   const metadataByPackage = new Map<string, any>();
-  const delay = async () => {
-    if (intervalMs > 0) await sleep(intervalMs);
-  };
 
   for (const [name, pkg] of Object.entries(packages)) {
-    if (stopRequested()) return;
+    if (stopRequested(lifecycle)) return;
     if (!shouldIncludePackage(name, upstream.scopes)) continue;
     const versions = pkg?.versions;
     if (!versions) continue;
@@ -380,7 +404,7 @@ export async function prefetchForUpstream(
     });
 
     for (const [version, node] of versionEntries) {
-      if (stopRequested()) return;
+      if (stopRequested(lifecycle)) return;
       const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
       if (!sourceUrl) continue;
       node.dist = node.dist ?? {};
@@ -400,8 +424,8 @@ export async function prefetchForUpstream(
       // from the cache directory.
       let zipBuffer: Buffer | null = null;
       if (needsDownload) {
+        if (!(await pacedContinue(intervalMs, lifecycle))) return;
         try {
-          await delay();
           zipBuffer = await fetchBufferWithRedirects(sourceUrl);
         } catch (err) {
           log.info({ err, packageName: name, version }, "vpm_prefetch_skip");
@@ -492,7 +516,8 @@ export async function prefetchForPackage(
   versions: Record<string, any>,
   vpmAuthor: unknown,
   intervalMs: number,
-  log: { info: (obj: any, msg?: string) => void }
+  log: { info: (obj: any, msg?: string) => void },
+  lifecycle: PrefetchLifecycle = detachedLifecycle
 ): Promise<void> {
   const cached = await readMetadataCache(upstream.host, packageName);
   const fresh = buildNpmMetadataFromVpm(packageName, versions);
@@ -512,7 +537,7 @@ export async function prefetchForPackage(
   });
 
   for (const [version, node] of versionEntries) {
-    if (stopRequested()) return;
+    if (stopRequested(lifecycle)) return;
     const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
     if (!sourceUrl) continue;
     node.dist = node.dist ?? {};
@@ -532,7 +557,7 @@ export async function prefetchForPackage(
     // cache directory.
     let zipBuffer: Buffer | null = null;
     if (needsDownload) {
-      if (intervalMs > 0) await sleep(intervalMs);
+      if (!(await pacedContinue(intervalMs, lifecycle))) return;
       try {
         zipBuffer = await fetchBufferWithRedirects(sourceUrl);
       } catch (err) {
@@ -603,7 +628,8 @@ export async function prefetchForPackage(
 }
 
 async function prefetchVpmShasums(
-  log: { info: (obj: any, msg?: string) => void }
+  log: { info: (obj: any, msg?: string) => void },
+  lifecycle: PrefetchLifecycle
 ): Promise<void> {
   const config = getUpstreamConfig();
   const upstreams = [config.default, ...config.upstreams].filter((u) => u.type === "vpm");
@@ -613,24 +639,22 @@ async function prefetchVpmShasums(
   const intervalMs = Math.max(0, intervalSec * 1000);
 
   for (const upstream of upstreams) {
-    if (stopRequested()) return;
+    if (stopRequested(lifecycle)) return;
     log.info({ host: upstream.host }, "vpm_prefetch_start");
-    await prefetchForUpstream(upstream, intervalMs, log);
+    await prefetchForUpstream(upstream, intervalMs, log, lifecycle);
     log.info({ host: upstream.host }, "vpm_prefetch_complete");
   }
 }
 
 export function startVpmPrefetch(
-  log: { info: (obj: any, msg?: string) => void }
+  log: { info: (obj: any, msg?: string) => void },
+  lifecycle: PrefetchLifecycle
 ): void {
-  // A start is the beginning of a lifecycle, so it clears a stop left by a previous one: the
-  // same process can build a second server after closing the first, and that server's prefetch
-  // must run.
-  prefetchStopping = false;
   track(
+    lifecycle,
     (async () => {
       try {
-        await prefetchVpmShasums(log);
+        await prefetchVpmShasums(log, lifecycle);
       } catch (err) {
         log.info({ err }, "vpm_prefetch_failed");
       }
@@ -643,24 +667,36 @@ export function startVpmPrefetchForPackage(
   upstream: UpstreamEntry,
   packageName: string,
   versions: Record<string, any>,
-  vpmAuthor: unknown
+  vpmAuthor: unknown,
+  lifecycle: PrefetchLifecycle = detachedLifecycle
 ): void {
   // Unlike startVpmPrefetch this is triggered by a request, not by startup, so it must not
   // revive a prefetch the shutdown just stopped.
-  if (stopRequested()) return;
+  if (stopRequested(lifecycle)) return;
   const key = `${upstream.host}|${packageName}`;
-  if (runningPrefetch.has(key)) return;
-  runningPrefetch.add(key);
+  // Dedupe is per lifecycle for the same reason the stop signal is: two servers in one process
+  // have separate caches of in-flight work as far as their own shutdown is concerned.
+  if (lifecycle.running.has(key)) return;
+  lifecycle.running.add(key);
   track(
+    lifecycle,
     (async () => {
       try {
         const intervalSec = parseFloatEnv("VPM_PREFETCH_INTERVAL_SEC");
         const intervalMs = Math.max(0, intervalSec * 1000);
-        await prefetchForPackage(upstream, packageName, versions, vpmAuthor, intervalMs, log);
+        await prefetchForPackage(
+          upstream,
+          packageName,
+          versions,
+          vpmAuthor,
+          intervalMs,
+          log,
+          lifecycle
+        );
       } catch (err) {
         log.info({ err, packageName }, "vpm_prefetch_failed");
       } finally {
-        runningPrefetch.delete(key);
+        lifecycle.running.delete(key);
       }
     })()
   );

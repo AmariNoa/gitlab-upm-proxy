@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import AutoLoad, { AutoloadPluginOptions } from '@fastify/autoload'
 import { FastifyPluginAsync, FastifyServerOptions } from 'fastify'
 import "dotenv/config";
-import { startVpmPrefetch, stopVpmPrefetch } from "./lib/vpm-prefetch";
+import { createPrefetchLifecycle, startVpmPrefetch, stopVpmPrefetch } from "./lib/vpm-prefetch";
 
 
 export interface AppOptions extends FastifyServerOptions, Partial<AutoloadPluginOptions> {
@@ -34,13 +34,19 @@ const app: FastifyPluginAsync<AppOptions> = async (
   opts
 ): Promise<void> => {
   // Place here your custom code!
-  startVpmPrefetch(fastify.log);
+  //
+  // One lifecycle per server, decorated onto the instance so the routes can hand it to the
+  // request-triggered prefetch. Keeping it in the module instead meant closing one server
+  // stopped another built in the same process, and starting the second cleared the first's stop.
+  const prefetchLifecycle = createPrefetchLifecycle();
+  fastify.decorate("vpmPrefetchLifecycle", prefetchLifecycle);
+  startVpmPrefetch(fastify.log, prefetchLifecycle);
 
   // Nothing awaits the prefetch, so without this a closed server kept downloading archives and
   // writing them into a cache directory the process was finished with. Closing now stops it and
   // waits for whatever critical section it is inside, so publication is never abandoned midway.
   fastify.addHook("onClose", async () => {
-    await stopVpmPrefetch();
+    await stopVpmPrefetch(prefetchLifecycle);
   });
 
   // Do not touch the following lines

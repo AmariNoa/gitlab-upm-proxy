@@ -1326,7 +1326,16 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
             return !cachedNode?.dist?.shasum;
           });
           if (needsPrefetch) {
-            startVpmPrefetchForPackage(req.log, upstream, name, versions, vpmAuthor);
+            // The lifecycle belongs to the server this request arrived at, so closing that
+            // server stops the pass this triggers - and closing a different one does not.
+            startVpmPrefetchForPackage(
+              req.log,
+              upstream,
+              name,
+              versions,
+              vpmAuthor,
+              req.server?.vpmPrefetchLifecycle
+            );
           }
           const latestVersion = pickLatestVpmVersion(versions);
           if (!latestVersion) continue;
