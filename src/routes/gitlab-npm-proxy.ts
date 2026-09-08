@@ -9,6 +9,7 @@ import {
   fetchJsonWithRedirects,
   isSameOrigin,
   readUpstreamBody,
+  readUpstreamJson,
   withoutCredentials,
   withoutResponseNarrowing
 } from "../lib/http";
@@ -1319,7 +1320,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       return;
     }
 
-    const items = (await res.body.json()) as any[];
+    const items = await readUpstreamJson<any[]>(res as any);
     all.push(...items);
     if (items.length < perPage) break;
     if (page === maxPages) {
@@ -1457,7 +1458,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
         await res.body.dump();
         continue;
       }
-      const payload = await res.body.json();
+      const payload = await readUpstreamJson<any>(res as any);
       const normalized = normalizeSearchResponse(payload);
       for (const obj of normalized.objects) {
         const pkg = obj?.package ?? obj;
@@ -1781,7 +1782,7 @@ async function proxyGroupNpm(
   }
 
   if (contentType.includes("application/json")) {
-    const json = (await res.body.json()) as any;
+    const json = await readUpstreamJson<any>(res as any);
 
     if (json && typeof json === "object" && json.versions && typeof json.versions === "object") {
       if (packageName) {
@@ -2043,7 +2044,7 @@ const routes: FastifyPluginAsync = async (app) => {
         }
 
         if (contentType.includes("application/json")) {
-          const json = (await res.body.json()) as any;
+          const json = await readUpstreamJson<any>(res as any);
 
           if (json && typeof json === "object" && json.versions && typeof json.versions === "object") {
             for (const v of Object.values<any>(json.versions)) {

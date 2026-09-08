@@ -1194,3 +1194,69 @@ test("上限を超える上流ボディは中継されずキャッシュもさ�
     delete process.env.MAX_UPSTREAM_BODY_BYTES;
   }
 });
+
+// Regression for the seventh round of the second review cycle: the ceiling added the round before
+// covered the binary paths only. Every JSON read still went through undici's body.json(), which
+// reads to the end with no bound - so an upstream could exhaust memory with a large metadata or
+// search document, including a VPM index fetched at startup with no request behind it.
+test("上限を超えるJSON応答も読み込まれない", async (t: TestContext) => {
+  process.env.MAX_UPSTREAM_BODY_BYTES = "1024";
+  try {
+    mockValidUser();
+    const oversized = JSON.stringify({ name: "huge", filler: "x".repeat(8192) });
+
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({
+        path: "/api/v4/groups/my-group/-/packages/npm/huge",
+        method: "GET"
+      })
+      // No content-length: only the running total can catch this one.
+      .reply(200, oversized, {
+        headers: { "content-type": "application/json", "transfer-encoding": "chunked" }
+      });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v4/groups/my-group/huge",
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.notEqual(res.statusCode, 200, "an oversized JSON document must not be parsed");
+  } finally {
+    delete process.env.MAX_UPSTREAM_BODY_BYTES;
+  }
+});
+
+test("Content-Lengthが上限を超えるJSON応答は本文を読まずに拒否される", async (t: TestContext) => {
+  process.env.MAX_UPSTREAM_BODY_BYTES = "1024";
+  try {
+    mockValidUser();
+    const oversized = JSON.stringify({ name: "declared", filler: "y".repeat(8192) });
+
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({
+        path: "/api/v4/groups/my-group/-/packages/npm/declared",
+        method: "GET"
+      })
+      .reply(200, oversized, {
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(oversized))
+        }
+      });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v4/groups/my-group/declared",
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.notEqual(res.statusCode, 200, "a declared size over the ceiling must be refused");
+  } finally {
+    delete process.env.MAX_UPSTREAM_BODY_BYTES;
+  }
+});

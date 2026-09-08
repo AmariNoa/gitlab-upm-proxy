@@ -65,6 +65,22 @@ export function validateUpstreamBodyLimit(): void {
 }
 
 /**
+ * Parses an upstream JSON body under the shared ceiling.
+ *
+ * undici's body.json() reads to the end with no bound, which left every JSON response - package
+ * metadata, search results, a VPM index fetched at startup with no request behind it - able to
+ * exhaust memory on an upstream's say-so. The ceiling that already covers archives covers these
+ * too; a document that large is not one this proxy can use anyway.
+ */
+export async function readUpstreamJson<T>(res: {
+  headers: Record<string, unknown>;
+  body: any;
+}): Promise<T> {
+  const buffer = await readUpstreamBody(res);
+  return JSON.parse(buffer.toString("utf-8")) as T;
+}
+
+/**
  * Reads the limit once so a malformed value stops the process at startup. The limit is otherwise
  * only read when an archive is actually downloaded, which meant a typo surfaced as a failed
  * download hours later - and an operator could not read a successful start as evidence that the
@@ -166,7 +182,7 @@ export async function fetchJsonWithRedirects<T>(
       await res.body.dump();
       throw new Error(`${errorPrefix}:${status}`);
     }
-    return (await res.body.json()) as T;
+    return readUpstreamJson<T>(res as any);
   }
   throw new Error(`${errorPrefix}_redirects_exceeded`);
 }
