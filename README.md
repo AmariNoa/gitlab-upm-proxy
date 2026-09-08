@@ -215,20 +215,14 @@ upstreams:
       - com.fuga.*
 ```
 
-### 8) Create `dist/plugins`
-
-```bash
-mkdir -p /opt/gitlab-upm-proxy/dist/plugins
-```
-
-### 9) Create cache directory
+### 8) Create cache directory
 
 ```bash
 sudo mkdir -p /var/lib/gitlab-upm-proxy/cache
 sudo chown -R $USER:$USER /var/lib/gitlab-upm-proxy /var/lib/gitlab-upm-proxy/cache
 ```
 
-### 10) Create systemd service
+### 9) Create systemd service
 
 Create `/etc/systemd/system/gitlab-upm-proxy.service`:
 
@@ -261,7 +255,7 @@ sudo systemctl start gitlab-upm-proxy
 sudo systemctl status gitlab-upm-proxy
 ```
 
-### 11) Nginx reverse proxy (HTTP -> HTTPS)
+### 10) Nginx reverse proxy (HTTP -> HTTPS)
 
 ```bash
 sudo apt-get install -y nginx
@@ -307,14 +301,14 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-### 12) HTTPS with Let’s Encrypt
+### 11) HTTPS with Let’s Encrypt
 
 ```bash
 sudo apt-get install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d upm.example.com
 ```
 
-### 13) Firewall (optional)
+### 12) Firewall (optional)
 
 ```bash
 sudo ufw allow OpenSSH
@@ -324,7 +318,7 @@ sudo ufw enable
 sudo ufw status
 ```
 
-### 14) Smoke test
+### 13) Smoke test
 
 ```bash
 curl -I https://upm.example.com
@@ -360,20 +354,14 @@ npm install
 npm run build:ts
 ```
 
-### 5) Ensure `dist/plugins` exists
-
-```bash
-mkdir -p /opt/gitlab-upm-proxy/dist/plugins
-```
-
-### 6) Start the service
+### 5) Start the service
 
 ```bash
 sudo systemctl start gitlab-upm-proxy
 sudo systemctl status gitlab-upm-proxy
 ```
 
-### 7) Smoke test (optional)
+### 6) Smoke test (optional)
 
 ```bash
 curl -I https://upm.example.com

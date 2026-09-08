@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import AutoLoad, { AutoloadPluginOptions } from '@fastify/autoload'
 import { FastifyPluginAsync, FastifyServerOptions } from 'fastify'
@@ -63,11 +64,18 @@ const app: FastifyPluginAsync<AppOptions> = async (
   // This loads all plugins defined in plugins
   // those should be support plugins that are reused
   // through your application
-  // eslint-disable-next-line no-void
-  void fastify.register(AutoLoad, {
-    dir: join(__dirname, 'plugins'),
-    options: opts
-  })
+  //
+  // Guarded because the directory is currently empty: the only tracked entry is a .gitkeep, which
+  // tsc does not emit, so a clean build has no dist/plugins at all and AutoLoad throws on a
+  // missing directory. Deployment used to paper over that with a manual mkdir in the README.
+  const pluginsDir = join(__dirname, 'plugins')
+  if (existsSync(pluginsDir)) {
+    // eslint-disable-next-line no-void
+    void fastify.register(AutoLoad, {
+      dir: pluginsDir,
+      options: opts
+    })
+  }
 
   // This loads all plugins defined in routes
   // define your routes in one of these

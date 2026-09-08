@@ -41,7 +41,6 @@ read -rs GITLAB_PAT && export GITLAB_PAT
 cd /opt/gitlab-upm-proxy
 git status --short
 npm run build:ts
-mkdir -p /opt/gitlab-upm-proxy/dist/plugins
 ```
 
 `git status --short` で作業ツリーがクリーンであること（検証したいコミットの状態であること）を先に確認する。
