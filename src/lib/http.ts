@@ -12,6 +12,59 @@ function maxDownloadBytes(): number {
 }
 
 /**
+ * Ceiling on any other upstream body this proxy buffers whole: the npm passthrough relays and the
+ * metadata enrichment download. Those are archives published by whoever owns the package too, and
+ * they were read into memory with no bound at all. Separate from the VPM ceiling because the two
+ * are configured for different traffic, and because changing what an existing VPM_* variable
+ * governs would be a silent semantic change.
+ */
+function maxUpstreamBodyBytes(): number {
+  return positiveIntEnv("MAX_UPSTREAM_BODY_BYTES", 512 * 1024 * 1024);
+}
+
+/**
+ * Reads an undici response body into memory, refusing to buffer more than `limit` bytes. A
+ * declared Content-Length over the ceiling is rejected before a byte is read, and the running
+ * total is checked as the body arrives so a missing or understated one cannot get past it.
+ */
+export async function readBodyWithLimit(
+  res: { headers: Record<string, unknown>; body: any },
+  limit: number,
+  errorPrefix: string
+): Promise<Buffer> {
+  const declared = Number(res.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > limit) {
+    await res.body.dump();
+    throw new Error(`${errorPrefix}:${declared}`);
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of res.body) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > limit) {
+      res.body.destroy();
+      throw new Error(`${errorPrefix}:${total}`);
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+/** Buffers an upstream body under the shared ceiling, for callers that already have a response. */
+export async function readUpstreamBody(res: {
+  headers: Record<string, unknown>;
+  body: any;
+}): Promise<Buffer> {
+  return readBodyWithLimit(res, maxUpstreamBodyBytes(), "upstream_body_too_large");
+}
+
+/** Reads the limit once so a malformed value stops the process at startup. */
+export function validateUpstreamBodyLimit(): void {
+  maxUpstreamBodyBytes();
+}
+
+/**
  * Reads the limit once so a malformed value stops the process at startup. The limit is otherwise
  * only read when an archive is actually downloaded, which meant a typo surfaced as a failed
  * download hours later - and an operator could not read a successful start as evidence that the
@@ -158,23 +211,7 @@ export async function fetchBufferWithRedirects(
       await res.body.dump();
       throw new Error(`zip_download_failed:${status}`);
     }
-    const declared = Number(res.headers["content-length"]);
-    if (Number.isFinite(declared) && declared > limit) {
-      await res.body.dump();
-      throw new Error(`zip_download_too_large:${declared}`);
-    }
-    const chunks: Buffer[] = [];
-    let total = 0;
-    for await (const chunk of res.body) {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      total += buf.length;
-      if (total > limit) {
-        res.body.destroy();
-        throw new Error(`zip_download_too_large:${total}`);
-      }
-      chunks.push(buf);
-    }
-    return Buffer.concat(chunks, total);
+    return readBodyWithLimit(res as any, limit, "zip_download_too_large");
   }
   throw new Error("zip_download_redirects_exceeded");
 }

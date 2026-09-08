@@ -1159,3 +1159,38 @@ test("Content-Encodingの付いたtarball応答はキャッシュされない", 
   assert.deepEqual(second.rawPayload, plainBytes, "the identity response is what gets served");
   assert.deepEqual(readFileSync(cachedPath), plainBytes, "and it is the one that gets cached");
 });
+
+// Regression for the sixth round of the second review cycle: the npm relay read the whole
+// upstream body into memory with no bound, so an oversized archive - published by whoever owns
+// the package, not by this proxy - could exhaust the process on a single authenticated request.
+// The VPM ceiling added two rounds earlier did not cover this path.
+test("上限を超える上流ボディは中継されずキャッシュもされない", async (t: TestContext) => {
+  process.env.MAX_UPSTREAM_BODY_BYTES = "1024";
+  try {
+    mockValidUser();
+    const path = "/api/v4/groups/my-group/oversized/-/oversized-1.0.0.tgz";
+    const upstreamPath =
+      "/api/v4/groups/my-group/-/packages/npm/oversized/-/oversized-1.0.0.tgz";
+
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({ path: upstreamPath, method: "GET" })
+      .reply(200, Buffer.alloc(8192, 0x41), {
+        headers: { "content-type": "application/octet-stream" }
+      });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: path,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.notEqual(res.statusCode, 200, "an oversized body must not be relayed as the archive");
+
+    const cachedPath = join(tarballCacheDir, DEFAULT_HOST, "oversized", "oversized-1.0.0.tgz");
+    assert.ok(!existsSync(cachedPath), "and nothing may reach the cache");
+  } finally {
+    delete process.env.MAX_UPSTREAM_BODY_BYTES;
+  }
+});
