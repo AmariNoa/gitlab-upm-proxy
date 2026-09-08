@@ -10,6 +10,7 @@ import {
   isSameOrigin,
   readUpstreamBody,
   readUpstreamJson,
+  UpstreamError,
   withoutCredentials,
   withoutResponseNarrowing
 } from "../lib/http";
@@ -1152,32 +1153,18 @@ function isBodylessStatus(statusCode: number): boolean {
  * body over the ceiling say nothing of the sort - reporting them as absence tells a client to stop
  * asking, and lets an intermediary cache that answer.
  */
-/** Trailing HTTP status in an upstream failure message. */
-const UPSTREAM_STATUS_PATTERN = /:\s*(\d{3})$/;
-
-function isUpstreamFailure(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err ?? "");
-  return (
-    /^(vpm_index_failed|zip_download_failed|zip_download_too_large|upstream_body_too_large):/.test(
-      message
-    ) ||
-    message.endsWith("_redirects_exceeded") ||
-    message.startsWith("Tarball download failed:")
-  );
-}
-
 /**
  * 404 only when an upstream actually said the thing is not there, 502 when it failed to answer,
  * 500 when the failure was ours. Everything used to collapse into 404, which told clients and
  * caches that a package was gone whenever a registry was merely unwell.
+ *
+ * Read from the error's own fields, not from its message. The first version of this matched a
+ * trailing three-digit number, which called a 404-byte body over the ceiling an absent package and
+ * missed a refused connection entirely - a message is prose, and prose is not a status code.
  */
 function failureStatus(err: unknown): number {
-  const message = err instanceof Error ? err.message : String(err ?? "");
-  if (!isUpstreamFailure(err)) return 500;
-  // The upstream's own status, when the error carries one: "...failed:404" or "...failed: 404".
-  const matched = message.match(UPSTREAM_STATUS_PATTERN);
-  const status = matched ? Number(matched[1]) : NaN;
-  if (status === 404 || status === 410) return 404;
+  if (!(err instanceof UpstreamError)) return 500;
+  if (err.kind === "status" && (err.status === 404 || err.status === 410)) return 404;
   return 502;
 }
 
@@ -1227,7 +1214,11 @@ async function downloadTarballToCache(
   // forwarded Range could turn the response into a 206 fragment.
   if (!isCompleteTarballResponse(res.statusCode, res.headers as Record<string, unknown>)) {
     await res.body.dump();
-    throw new Error(`Tarball download failed: ${res.statusCode}`);
+    throw new UpstreamError(
+      `Tarball download failed: ${res.statusCode}`,
+      "status",
+      res.statusCode
+    );
   }
   const buffer = await readUpstreamBody(res as any);
   return await writeTarballCache(upstream.host, packageName, filename, buffer);

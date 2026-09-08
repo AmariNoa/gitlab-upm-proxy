@@ -341,3 +341,72 @@ test(
     assert.equal(res.statusCode, 404, "a healthy index that omits the package does mean absent");
   }
 );
+
+// Regression for the ninth round of the second review cycle: the first version of the failure
+// classification read a trailing three-digit number out of the error message. A body-limit error
+// ends in a byte count, so an index of exactly 404 bytes over the ceiling was reported as an
+// absent package - the one status that tells clients and caches to stop asking.
+test(
+  "上限超過が404バイトちょうどでも、不在ではなく502になる",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.limit404";
+    const marker = "case-limit404";
+    process.env.MAX_UPSTREAM_BODY_BYTES = "400";
+    try {
+      // 404 bytes exactly: the number the old message-matching classifier would have read.
+      const filler = "x".repeat(404 - JSON.stringify({ packages: {}, filler: "" }).length);
+      const body = JSON.stringify({ packages: {}, filler });
+      assert.equal(Buffer.byteLength(body), 404, "the body must be exactly 404 bytes");
+
+      mockAgent
+        .get(VPM_ORIGIN)
+        .intercept({
+          path: "/index.json",
+          method: "GET",
+          headers: (headers) => normalizeHeaders(headers)["x-vpm-test-route"] === marker
+        })
+        .reply(200, body, { headers: { "content-type": "application/json" } })
+        .persist();
+
+      const app = await build(t);
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/v4/groups/my-group/${packageName}`,
+        headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+      });
+
+      assert.equal(res.statusCode, 502, "a byte count is not a status code");
+    } finally {
+      delete process.env.MAX_UPSTREAM_BODY_BYTES;
+    }
+  }
+);
+
+// The other misclassification: a connection that never completed carries no recognisable prefix at
+// all, so it was reported as this proxy's own failure rather than the upstream's.
+test(
+  "接続自体が失敗した場合も500ではなく502になる",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.unreachable";
+    const marker = "case-unreachable";
+
+    mockAgent
+      .get(VPM_ORIGIN)
+      .intercept({
+        path: "/index.json",
+        method: "GET",
+        headers: (headers) => normalizeHeaders(headers)["x-vpm-test-route"] === marker
+      })
+      .replyWithError(new Error("connect ECONNREFUSED 203.0.113.1:443"))
+      .persist();
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 502, "a refused connection is the upstream failing, not us");
+  }
+);
