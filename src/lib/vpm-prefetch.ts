@@ -4,7 +4,7 @@ import * as tar from "tar";
 import * as semver from "semver";
 import { getTarballCachePath, readMetadataCache, updateMetadataCache, type MetadataCache } from "./cache";
 import { applyPackageSignature, hasProxySignature } from "./npm-signatures";
-import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
+import { getUpstreamConfig, matchScope, selectUpstream, UpstreamEntry } from "./upstreams";
 import { mustEnv } from "./env";
 import { computeSha1, convertZipBufferToTgzUnlocked, runTempLocked } from "./tgz";
 import { fetchBufferWithRedirects, fetchJsonWithRedirects } from "./http";
@@ -308,9 +308,27 @@ function mergeMissingVersions(target: any, source: any): void {
   }
 }
 
-function shouldIncludePackage(name: string, scopes: string[] | undefined): boolean {
-  if (!scopes || scopes.length === 0) return true;
-  return scopes.some((scope) => matchScope(name, scope));
+/**
+ * Whether this upstream is the one that will actually serve the package.
+ *
+ * Matching the entry's own scopes is not enough. Scopes can overlap, and selectUpstream picks the
+ * first entry that matches - so a package can match a VPM entry's scopes while being served by an
+ * npm entry listed before it. The cache is keyed on the upstream's HOST and the package name, so
+ * two entries on the same host share a directory: the prefetch would publish its converted archive
+ * where a download from the other registry then finds it, and serve it without ever asking that
+ * registry. The request path already applies this check when merging search results; the prefetch
+ * has to apply it before touching the cache at all.
+ */
+function shouldIncludePackage(name: string, upstream: UpstreamEntry): boolean {
+  const scopes = upstream.scopes;
+  const inScope = !scopes || scopes.length === 0 || scopes.some((scope) => matchScope(name, scope));
+  if (!inScope) return false;
+  const selected = selectUpstream(name);
+  if (selected.baseUrl === upstream.baseUrl) return true;
+  // Another entry serves this package. That only collides when the two share a cache directory,
+  // and the cache is keyed on the host - so a different host is not this proxy's problem here, and
+  // treating it as one would also stop a caller that drives a pass for an upstream of its own.
+  return selected.host !== upstream.host;
 }
 
 function pickLatestWithShasum(metadata: any): string {
@@ -376,7 +394,7 @@ export async function prefetchForUpstream(
 
   for (const [name, pkg] of Object.entries(packages)) {
     if (stopRequested(lifecycle)) return;
-    if (!shouldIncludePackage(name, upstream.scopes)) continue;
+    if (!shouldIncludePackage(name, upstream)) continue;
     const versions = pkg?.versions;
     if (!versions) continue;
     const cached = await readMetadataCache(upstream.host, name);

@@ -1,0 +1,13 @@
+# Two upstreams on the SAME host, with overlapping scopes. selectUpstream picks the first match,
+# so the npm entry serves com.example.shared.* - but the VPM entry's own scopes match it too, and
+# the tarball cache is keyed on the host, so both would write into one directory.
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://registry.example.org/npm
+    scopes:
+      - com.example.shared.*
+  - baseUrl: https://registry.example.org/vpm.json
+    scopes:
+      - com.example.shared.*
+    type: vpm
