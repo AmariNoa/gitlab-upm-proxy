@@ -270,3 +270,50 @@ test(
     }
   }
 );
+
+// Regression for cycle 2 round 3: the structural filter accepted only `expires: null`, so an
+// otherwise valid upstream key carrying an expiry was dropped before it could even be checked
+// for authenticity. Packages signed with it then had no publishable key, and clients could not
+// verify them.
+test(
+  "有効期限を持つ正当な上流鍵も、そのまま公開される",
+  async (t: TestContext) => {
+    const expiringPair = generateKeyPairSync("ec", {
+      namedCurve: "prime256v1",
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" }
+    });
+    const { entry } = keyEntryFor(expiringPair.publicKey);
+    const expiringKey = { ...entry, expires: "2030-01-01T00:00:00.000Z" };
+
+    for (const origin of [DEFAULT_ORIGIN, NPM_A_ORIGIN, NPM_B_ORIGIN, NPM_C_ORIGIN]) {
+      mockAgent
+        .get(origin)
+        .intercept({ path: "/-/npm/v1/keys", method: "GET" })
+        .reply(
+          200,
+          { keys: origin === NPM_A_ORIGIN ? [expiringKey] : [] },
+          { headers: { "content-type": "application/json" } }
+        );
+    }
+
+    // Valid PAT for the onRequest hook's /api/v4/user check.
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({ path: "/api/v4/user", method: "GET" })
+      .reply(200, { id: 1, username: "tester" });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: "/-/npm/v1/keys",
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { keys: Array<{ keyid: string; expires: string | null }> };
+    const published = body.keys.find((k) => k.keyid === expiringKey.keyid);
+    assert.ok(published, "a key with an expiry must not be discarded");
+    assert.equal(published!.expires, "2030-01-01T00:00:00.000Z", "and its expiry must be preserved");
+  }
+);

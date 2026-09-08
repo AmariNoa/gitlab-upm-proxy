@@ -12,7 +12,10 @@ import { mustEnv } from "./env";
 import { UpstreamEntry } from "./upstreams";
 
 type NpmSigningKey = {
-  expires: null;
+  // null for a key that does not expire, or the timestamp the registry published. The proxy
+  // never issues an expiring key of its own, but an upstream may, and dropping those left
+  // clients unable to verify anything signed with them.
+  expires: string | null;
   keyid: string;
   keytype: "ecdsa-sha2-nistp256";
   scheme: "ecdsa-sha2-nistp256";
@@ -194,7 +197,7 @@ function isNpmSigningKey(value: unknown): value is NpmSigningKey {
   if (!value || typeof value !== "object") return false;
   const key = value as Partial<NpmSigningKey>;
   return (
-    key.expires === null &&
+    (key.expires === null || typeof key.expires === "string") &&
     typeof key.keyid === "string" &&
     key.keytype === "ecdsa-sha2-nistp256" &&
     key.scheme === "ecdsa-sha2-nistp256" &&

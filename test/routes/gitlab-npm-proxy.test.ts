@@ -988,3 +988,23 @@ test("上流がshasumを返さない版では、キャッシュ由来のshasum�
   const body = res.json() as { author?: string };
   assert.equal(body.author, "Own Group Author", "a cache-supplied shasum must not authorize the reuse");
 });
+
+// Regression for cycle 2 round 3: the proxy forwards the caller's conditional headers, so a
+// successful revalidation comes back as a bodyless 304 that still carries the JSON content
+// type. Parsing it threw, and the caller got a 500 for the cheapest possible upstream answer.
+test("条件付きリクエストの304は、そのまま304として返る", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: "/api/v4/groups/my-group/-/packages/npm/widget", method: "GET" })
+    .reply(304, "", { headers: { "content-type": "application/json", etag: '"abc"' } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/widget",
+    headers: { "private-token": "valid-token", "if-none-match": '"abc"' }
+  });
+
+  assert.equal(res.statusCode, 304, "a revalidation must not be turned into a server error");
+});
