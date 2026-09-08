@@ -635,3 +635,90 @@ test("上流への中継でクエリ文字列が保持される", async (t: Test
   assert.match(seenPath, /signature=abc/, "the signed parameter must reach the upstream verbatim");
   assert.match(seenPath, /expires=1/);
 });
+
+// Regression for the second cycle: search took every name a configured registry returned,
+// without asking whether that registry is the one the metadata route would use for it. A
+// registry scoped to "com.example.other.*" advertising an unrelated name promises something
+// the proxy will not deliver - the metadata request routes by scope and goes elsewhere.
+test("検索結果は、そのupstreamがスコープ上担当する名前だけを含む", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: (path) => path.startsWith("/api/v4/groups/my-group/packages"), method: "GET" })
+    .reply(200, []);
+
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({ path: (path) => path.startsWith("/-/v1/search"), method: "GET" })
+    .reply(
+      200,
+      {
+        objects: [
+          { package: { name: "com.example.other.mine", version: "1.0.0", description: "in scope" } },
+          { package: { name: "unrelated.pkg", version: "2.0.0", description: "out of scope" } }
+        ],
+        total: 2
+      },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/v1/search?text=e&from=0&size=20",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = res.json() as { objects: Array<{ package: { name: string } }>; total: number };
+  const names = body.objects.map((o) => o.package.name);
+  assert.deepEqual(names, ["com.example.other.mine"], "only names this upstream would serve");
+  assert.equal(body.total, 1);
+});
+
+// Regression for the second cycle: every upstream was queried from 0 with the caller's page
+// size, and the merged list was then sliced by the caller's `from`. Asking for the second page
+// therefore sliced past everything that had been fetched and came back empty.
+test("検索の2ページ目以降もupstreamの結果を返す", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: (path) => path.startsWith("/api/v4/groups/my-group/packages"), method: "GET" })
+    .reply(200, []);
+
+  // 30 in-scope packages, named so the sort order is predictable.
+  const objects = Array.from({ length: 30 }, (_, i) => ({
+    package: {
+      name: `com.example.other.p${String(i).padStart(2, "0")}`,
+      version: "1.0.0",
+      description: `pkg ${i}`
+    }
+  }));
+
+  let requestedSize = "";
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({
+      path: (path) => {
+        if (!path.startsWith("/-/v1/search")) return false;
+        requestedSize = new URL(path, SCOPED_ORIGIN).searchParams.get("size") ?? "";
+        return true;
+      },
+      method: "GET"
+    })
+    .reply(200, { objects, total: objects.length }, { headers: { "content-type": "application/json" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/v1/search?text=p&from=20&size=10",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = res.json() as { objects: Array<{ package: { name: string } }>; total: number };
+  assert.equal(requestedSize, "30", "the upstream must be asked for enough rows to build this page");
+  assert.equal(body.objects.length, 10, "the second page must not be empty");
+  assert.equal(body.objects[0].package.name, "com.example.other.p20");
+  assert.equal(body.total, 30);
+});
