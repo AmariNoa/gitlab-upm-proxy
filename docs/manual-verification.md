@@ -6,7 +6,7 @@
 
 - 対象: gitlab-upm-proxy の npm ECDSA 署名機能（VPM 由来 tarball の署名、`/-/npm/v1/keys` の公開、署名のキャッシュ永続化と再利用）と、既存の中継・認証・キャッシュの基本動作。
 - 実施環境: **検証系のサーバーで実施する**。本番系では実施しない（キャッシュディレクトリの内容を確認・削除する手順を含むため）。
-- 自動テストで確認済みの範囲: `npm test`（2026-09-07 時点で 28 ケース）は上流を undici の MockAgent でモックし、単一プロセス内でルート中継、PAT 認証、署名の生成、`/-/npm/v1/keys` の集約（重複排除・自鍵の優先・keyid 不一致の鍵の除外）、署名のキャッシュ永続化と再利用、zip から tgz への変換、キャッシュの並行制御を確認している。署名の検証も node:crypto による同一プロセス内での照合にとどまる。
+- 自動テストで確認済みの範囲: `npm test`（2026-09-09 時点で 140 ケース）は上流を undici の MockAgent でモックし、単一プロセス内でルート中継、PAT 認証、署名の生成、`/-/npm/v1/keys` の集約（重複排除・自鍵の優先・keyid 不一致の鍵の除外）、署名のキャッシュ永続化と再利用、zip から tgz への変換、キャッシュの並行制御に加えて、URL のデコード境界とスコープ付き名前、上流失敗の分類（404 / 502 / 500）、応答ヘッダの選別、アーカイブとダウンロードの上限、prefetch の停止と所有権、撤回削除の排他を確認している。署名の検証も node:crypto による同一プロセス内での照合にとどまる。
 - 自動テストに含まれない範囲: 実サーバーの起動、実 GitLab / 実 VPM レジストリとの通信、実クライアント（npm CLI の `npm audit signatures`、Unity Package Manager）による署名検証と取得、複数プロセスで同一キャッシュディレクトリを共有する構成での動作。本手順書はこの差分を埋めるためのもの。
 - 実施者: 人間。エージェントは本手順書の記述までを担当し、実機での実行と結果の判定は行わない。
 - 表記: 実環境の値はすべてプレースホルダで書いている。実施時に自分の環境の値へ読み替える。
@@ -62,6 +62,12 @@ grep -nE '^(default|upstreams):|baseUrl|type|scopes' /opt/gitlab-upm-proxy/confi
 | `UPSTREAM_CONFIG_PATH` | 必須 | upstreams 設定のパス |
 | `VPM_PREFETCH_INTERVAL_SEC` | VPM 型 upstream があるとき必須 | prefetch の取得間隔（秒） |
 | `NPM_SIGNATURE_KEY_PATH` | 任意（推奨） | 署名鍵を固定するパス。未設定だと `TARBALL_CACHE_DIR/npm-signing-key.pem` に自動生成される |
+| `VPM_MAX_DOWNLOAD_BYTES` | 任意 | VPM アーカイブ 1 件をメモリへ読み込む上限（既定 536870912 = 512 MiB） |
+| `VPM_MAX_EXTRACT_BYTES` | 任意 | zip 展開後の合計サイズの上限（既定 1073741824 = 1 GiB） |
+| `VPM_MAX_EXTRACT_ENTRIES` | 任意 | zip 内のエントリ数（ファイルとディレクトリの合計）の上限（既定 20000） |
+| `MAX_UPSTREAM_BODY_BYTES` | 任意 | 上流の 1 応答をメモリへ読み込む上限（既定 536870912 = 512 MiB）。npm 中継・メタデータ補完・JSON 読み出しに適用 |
+
+上限 4 つはいずれも任意で、未設定なら既定値が使われる。設定する場合は正の整数であること。正の整数でない値を設定すると**起動時に**失敗するので、起動できていれば値は解釈されている。
 
 ```bash
 sudo systemctl cat gitlab-upm-proxy | grep -n '^Environment='
@@ -94,10 +100,15 @@ sudo journalctl -u gitlab-upm-proxy -n 50 --no-pager
 **期待される結果**
 
 - `systemctl status` が `active (running)` を示す。
+- `ExecStart` に `--options` が含まれている。これが無いと fastify-cli は `src/app.ts` がエクスポートするサーバーオプションを読まず、リクエストログのシリアライザが無効になる。**起動もリクエスト処理も成功するため、欠けていても症状は M-8 のログ確認でしか現れない。**
+  ```bash
+  sudo systemctl cat gitlab-upm-proxy | grep -n ExecStart
+  ```
 - 起動ログに例外・スタックトレースが出ていない。
 - `PUBLIC_BASE_URL`・`TARBALL_CACHE_DIR`・`UPSTREAM_CONFIG_PATH` のいずれかが欠けている場合は、モジュール読み込みの時点で `Missing env: <変数名>` のエラーとなり、プロセスが起動しない（設定漏れが黙って無視されない）。
 - `VPM_PREFETCH_INTERVAL_SEC` はこれらと扱いが異なる。読み出しが背景の prefetch の中で行われ、そこでの例外は捕捉されて `vpm_prefetch_failed` のログになるだけなので、**欠けていてもサーバーは起動して動き続ける**。VPM 型 upstream を設定しているのにこのログが出ている場合は、prefetch が一度も動いていないことを意味するため、設定を確認する。
-- VPM 型 upstream を設定している場合、`vpm_prefetch_start` に続いて `vpm_prefetch_done` または `vpm_prefetch_skip` のログが出る（起動時の prefetch が動いている）。
+- VPM 型 upstream を設定している場合、upstream ごとに `vpm_prefetch_start` と `vpm_prefetch_complete` が出て、その間にバージョンごとの `vpm_prefetch_done`（取得・変換・署名まで完了）または `vpm_prefetch_skip`（当該バージョンを飛ばした）が出る（起動時の prefetch が動いている）。
+- サーバーを停止すると prefetch も停止する。`systemctl stop` の後に `vpm_prefetch_done` が続かないことを確認する（停止はサーバー単位で、進行中の変換の完了だけを待つ）。
 
 ---
 
@@ -147,6 +158,7 @@ curl -s -H "PRIVATE-TOKEN: $GITLAB_PAT" "https://upm.example.com/api/v4/groups/m
 **期待される結果**
 
 - 検索は `objects` 配列と `total` を含む JSON を返す（npm search v1 互換の形）。
+- 検索は GitLab の Packages API と設定済みの全 upstream を引いて結果を統合し、その upstream がスコープ上担当しない名前は落とす。したがって `objects` には複数のレジストリ由来の結果が混ざりうる。**GitLab の列挙が失敗すると検索全体が失敗する**（他のレジストリに一致があっても同じ）ので、検索が失敗した場合はまず GitLab 側の応答を確認する。
 - メタデータは `name`、`dist-tags`、`versions` を含む JSON を返す。
 - `versions.<version>.dist.tarball` が `https://upm.example.com/` で始まる URL に書き換わっている（クライアントがプロキシ経由で取得できる形になっている）。
 
@@ -286,6 +298,76 @@ cd / && rm -rf "$WORKDIR" && unset WORKDIR
 
 ---
 
+## M-8 リクエストログに署名付きクエリが残らない
+
+**前提条件**: M-4 で tarball の取得まで到達していること。
+
+GitLab は tarball の URL に署名付きのクエリを付けることがあり、このプロキシはそれを上流へそのまま渡す。
+つまりリクエスト URL には有効なダウンロード資格情報が乗りうる。ログへ URL をそのまま書くと、
+署名の有効期限より長く残る資格情報がログに残る。プロキシは自身の `req_in` 行と Fastify 標準の
+incoming request 行の両方でパスだけを記録する。
+
+この確認が必要なのは、`ExecStart` の `--options` が欠けていても**起動もリクエスト処理も成功する**ためで、
+症状はログを見るまで現れない。
+
+**操作手順**
+
+```bash
+# 署名付きクエリを模したパラメータを付けて 1 回リクエストする（値はダミーでよい）
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "PRIVATE-TOKEN: ${GITLAB_PAT}" \
+  "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg?signature=MANUAL-CHECK-VALUE"
+
+# 直近のログに、そのパラメータ名と値が現れないことを確認する
+sudo journalctl -u gitlab-upm-proxy -n 50 --no-pager | grep -c 'MANUAL-CHECK-VALUE'
+```
+
+**期待される結果**
+
+- `grep -c` の結果が `0`。値がどのログ行にも現れない。
+- 同じログに `req_in` の行があり、`path` がクエリを含まないパスだけになっている。
+- Fastify の incoming request 行にも、`path` としてクエリ抜きのパスだけが出ている。
+
+`0` にならない場合は `ExecStart` の `--options` を確認する（M-1 参照）。
+
+---
+
+## M-9 上流の障害が「不在」として報告されない
+
+**前提条件**: M-1 が成功していること。VPM 型 upstream が設定されていること。
+
+404 は「上流がその物は無いと確認した」という意味に限る。上流が応答できなかっただけの場合に 404 を返すと、
+クライアントにも中間キャッシュにも「そのパッケージは消えた」と伝わってしまう。
+到達できない上流は 502、プロキシ自身の処理の失敗は 500 になる。
+
+**操作手順**
+
+```bash
+# (1) 実在しないパッケージ名（インデックスは正常に応答し、その名前を載せていない）
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "PRIVATE-TOKEN: ${GITLAB_PAT}" \
+  "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.does-not-exist"
+
+# (2) 到達できない VPM upstream
+# config/upstreams.yml の VPM 型 upstream の baseUrl を一時的に到達不能な URL へ変え、
+# サービスを再起動してから、その upstream が担当するパッケージを取得する。
+# 確認後は必ず設定を元へ戻して再起動する。
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "PRIVATE-TOKEN: ${GITLAB_PAT}" \
+  "https://upm.example.com/api/v4/groups/my-group/com.example.vpm.pkg"
+
+sudo journalctl -u gitlab-upm-proxy -n 30 --no-pager | grep -n 'vpm_metadata_failed'
+```
+
+**期待される結果**
+
+- (1) が `404`。インデックスが正常に応答してその名前を載せていない場合は、確認された不在である。
+- (2) が `502`。到達できない上流は不在ではない。あわせて `vpm_metadata_failed` のログが出ている。
+- (2) の後、設定を戻して再起動すると、同じ URL が再び `200` を返す。
+  **キャッシュが消えていないこと**（障害を撤回と解釈して削除していないこと）をここで確認する。
+
+---
+
 ## 結果記録表
 
 実施のたびに行を追加する。**エージェントはこの表を代筆しない**（実機確認は実施者本人の観察に基づく記録とするため）。
@@ -299,5 +381,7 @@ cd / && rm -rf "$WORKDIR" && unset WORKDIR
 | M-5 署名鍵エンドポイント | | | | | |
 | M-6 npm クライアントでの署名検証 | | | | | |
 | M-7 Unity からの取得 | | | | | |
+| M-8 ログに署名付きクエリが残らない | | | | | |
+| M-9 上流障害が不在として報告されない | | | | | |
 
 不合格だったケースは、対象コミット・実行したコマンド・出力（秘密情報を除く）・ログの該当箇所を控えたうえで報告する。
