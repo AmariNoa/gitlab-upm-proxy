@@ -7,11 +7,11 @@ Fastify 5 + TypeScript 製の Unity Package Manager 向け GitLab npm レジス�
 
 | パス | 役割 |
 |------|------|
-| src/app.ts | Fastify 起点。VPM prefetch を起動し、onClose で停止させ、AutoLoad で plugins/ と routes/ を読み込む |
+| src/app.ts | Fastify 起点。サーバーごとの prefetch ライフサイクルを作って起動し、インスタンスへ decorate して onClose で停止させ、AutoLoad で plugins/ と routes/ を読み込む |
 | src/routes/gitlab-npm-proxy.ts | PAT 検証フック、search、npm / VPM 中継、tarball 配信、署名適用、全ルート登録（約 1,500 行。最大のファイル） |
 | src/lib/cache.ts | metadata.json と tarball のファイルキャッシュ I/O |
 | src/lib/upstreams.ts | upstreams 設定ファイル（YAML / JSON）の読込、スコープマッチ、パッケージ名抽出 |
-| src/lib/vpm-prefetch.ts | 起動時に VPM インデックスを走査し zip から tgz へ変換・shasum・署名を先行付与。停止シグナル（stopVpmPrefetch）を持ち、サーバーを閉じると次の項目へ進まず、進行中の臨界区間の完了だけを待つ |
+| src/lib/vpm-prefetch.ts | 起動時に VPM インデックスを走査し zip から tgz へ変換・shasum・署名を先行付与。停止シグナルはサーバーごとのライフサイクル（createPrefetchLifecycle / stopVpmPrefetch）で持ち、閉じたサーバーの pass だけが次の項目へ進まず、進行中の臨界区間の完了だけを待つ |
 | src/lib/npm-signatures.ts | 署名鍵の生成・読込、tarball 署名、上流 npm の /-/npm/v1/keys 取得とマージ |
 | src/lib/tgz.ts | zip から tgz への変換、展開（エントリ数・展開後サイズの上限と展開先の逸脱防止つき）、パッケージ root の判定、一時ディレクトリのロック、sha1 計算 |
 | src/lib/env.ts | 必須環境変数の読み出し（未設定なら即座に失敗する mustEnv） |
@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 98 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 100 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
