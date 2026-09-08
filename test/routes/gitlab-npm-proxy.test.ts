@@ -1492,3 +1492,51 @@ test("GitLabの列挙が失敗すると、他の上流に一致があっても�
   assert.equal(res.statusCode, 503, "the GitLab enumeration decides the whole search");
   assert.equal(scopedQueried, false, "and the other registry is not reached at all");
 });
+
+// Regression for carry-over (24): the failure classification the VPM paths follow - and that
+// PROJECT_MAP states as the policy - had never been applied to the npm relay. An unreachable
+// upstream surfaced as 500, telling the caller the proxy broke rather than that the registry did.
+test("npm中継の上流へ到達できない場合は500ではなく502になる", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: "/api/v4/groups/my-group/-/packages/npm/com.example.unreachable",
+      method: "GET"
+    })
+    .replyWithError(new Error("connect ECONNREFUSED 203.0.113.1:443"));
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/com.example.unreachable",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 502, "the registry failed to answer, not this proxy");
+});
+
+// The same handler stops Fastify's default one from putting err.message in the response. These
+// errors carry upstream URLs, which are the deployment's own hostnames.
+test("エラー応答に上流のホスト名や内部メッセージが含まれない", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: "/api/v4/groups/my-group/-/packages/npm/com.example.leaky",
+      method: "GET"
+    })
+    .replyWithError(new Error("connect ECONNREFUSED gitlab.example.com:443"));
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/com.example.leaky",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 502);
+  assert.ok(!res.body.includes("gitlab.example.com"), "no upstream hostname in the response");
+  assert.ok(!res.body.includes("ECONNREFUSED"), "no internal error text either");
+  assert.deepEqual(res.json(), { error: "upstream_failed" }, "just what happened, in one word");
+});

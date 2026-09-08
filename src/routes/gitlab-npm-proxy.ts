@@ -1274,7 +1274,7 @@ async function downloadTarballToCache(
   if (!filename) {
     throw new Error("Tarball filename not found");
   }
-  const res = await request(tarballUrl, { method: "GET", headers });
+  const res = await requestUpstream(tarballUrl, { method: "GET", headers });
   // This is the proxy's own download, not a relay of the caller's request, so anything but
   // a complete 200 must not reach the cache. Redirects are not followed here: their body
   // would otherwise be stored under the tarball's name and served as the archive, and a
@@ -1455,7 +1455,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
     u.searchParams.set("order_by", "name");
     u.searchParams.set("sort", "asc");
 
-    const res = await request(u.toString(), { method: "GET", headers });
+    const res = await requestUpstream(u.toString(), { method: "GET", headers });
 
     if (res.statusCode >= 400) {
       // Bounded like every other upstream read: an error body is still a body the upstream
@@ -1590,7 +1590,7 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       // page of one search; results beyond it are not reachable, which is the same bound npm
       // registries themselves apply.
       u.searchParams.set("size", String(UPSTREAM_SEARCH_MAX_SIZE));
-      const res = await request(u.toString(), {
+      const res = await requestUpstream(u.toString(), {
         method: "GET",
         // Same reason as the GitLab enumeration above: this registry's answer is one input to a
         // merged result. A 304 here was swallowed by the catch below, silently dropping the
@@ -1985,7 +1985,7 @@ async function proxyGroupNpm(
     }
   }
 
-  const res = await request(upstreamUrl, {
+  const res = await requestUpstream(upstreamUrl, {
     method,
     // A tarball is relayed byte for byte, so the caller's validators describe the same
     // representation the upstream holds and belong on that request. Metadata does not: the proxy
@@ -2162,7 +2162,7 @@ async function proxyDefaultGitlabApi(req: any, reply: any): Promise<void> {
   const method = req.method.toUpperCase();
   const body = method === "GET" || method === "HEAD" ? undefined : (req.body as any);
 
-  const res = await request(upstreamUrl, {
+  const res = await requestUpstream(upstreamUrl, {
     method,
     headers: buildUpstreamHeadersFor(defaultUpstream, req.headers as any),
     body: body as any
@@ -2186,6 +2186,27 @@ const routes: FastifyPluginAsync = async (app) => {
     req.log.info({ method: req.method, path: pathWithoutQuery(req.url) }, "req_in");
     const ok = await validateGitlabPat(req, reply);
     if (!ok) return reply;
+  });
+
+  // One handler for every route registered below, inherited by the nested scopes. The VPM paths
+  // classify their own failures and answer before throwing, so they never reach this; everything
+  // else - the npm relay, search, the global tarball route, /self, the keys endpoint - had no
+  // classification at all and turned an unreachable upstream into a 500, contradicting the policy
+  // the VPM paths follow. Putting it here rather than around each handler is deliberate: a route
+  // added later is covered without anyone remembering to cover it.
+  //
+  // The body is minimal on purpose. Fastify's default handler puts err.message in the response,
+  // and these errors carry upstream URLs - the deployment's own hostnames - so the detail belongs
+  // in the log and not in an answer to the caller.
+  app.setErrorHandler((err, req, reply) => {
+    const status = failureStatus(err);
+    req.log.info(
+      { err, method: req.method, path: pathWithoutQuery(req.url), status },
+      "request_failed"
+    );
+    const error =
+      status === 404 ? "not_found" : status === 502 ? "upstream_failed" : "internal_error";
+    reply.code(status).type("application/json").send({ error });
   });
 
   app.register(async (r) => {
@@ -2284,7 +2305,7 @@ const routes: FastifyPluginAsync = async (app) => {
 
         // Same split as the group route: conditionals belong on a byte-for-byte tarball relay,
         // not on metadata the proxy re-renders.
-        const res = await request(upstreamUrl, {
+        const res = await requestUpstream(upstreamUrl, {
           method,
           headers: isTarball ? headers : withoutResponseNarrowing(headers),
           body: body as any
