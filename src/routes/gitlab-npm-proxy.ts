@@ -1092,7 +1092,17 @@ function isBodylessStatus(statusCode: number): boolean {
 
 function isCompleteTarballResponse(statusCode: number, headers: Record<string, unknown>): boolean {
   if (statusCode !== 200) return false;
-  return headers["content-range"] === undefined;
+  if (headers["content-range"] !== undefined) return false;
+  // The cache stores bytes and serves them back with no Content-Encoding of its own, so an
+  // encoded body must not go in: the first caller would decode it correctly from the forwarded
+  // header, and every later one would receive the still-encoded bytes labelled as the archive.
+  // A .tgz is already compressed, so this only ever fires on an upstream that gzips it again.
+  const encoding = headers["content-encoding"];
+  if (encoding !== undefined) {
+    const value = (Array.isArray(encoding) ? encoding.join(",") : String(encoding)).trim();
+    if (value !== "" && value.toLowerCase() !== "identity") return false;
+  }
+  return true;
 }
 
 /**
