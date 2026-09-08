@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 133 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 134 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -95,6 +95,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 
 - キャッシュディレクトリ（TARBALL_CACHE_DIR）を書き換えるのは 1 プロセスだけ、という前提で実装している。metadata の read-modify-write（src/lib/cache.ts の updateMetadataCache）と zip から tgz への変換（src/lib/tgz.ts の runTempLocked）は Promise ベースのロック表で直列化しているが、このロックはプロセス内でしか効かない。
 - したがって、同一の TARBALL_CACHE_DIR を複数プロセス（多重起動、複数インスタンス、クラスタ構成）で共有する構成は想定していない。共有が必要になった場合は、ファイルロック等のプロセス間排他を別途導入する必要がある。
+- 撤回によるパッケージ削除（`removeWithdrawnPackage`）も、判定と削除を同じ臨界区間に入れる。アーカイブのロック、次にメタデータのロックの順で取り、prefetch と同じ順序に揃えている。判定後にロックを手放すと、その間に公開された新しい版ごと削除されるため。
 - VPM アーカイブの変換・hash・署名・メタデータ公開は、パッケージ単位のロック（`src/lib/tgz.ts` の `runTempLocked`）の下で 1 つの臨界区間として実行する。アーカイブの公開とそれを説明するメタデータの公開は利用者から見て 1 つの変更であり、途中でロックを手放すと新しいアーカイブと古い署名の組み合わせが観測されるため。`serveVpmTarball` のキャッシュヒット時の読み取りも同じロックを取るので、同一パッケージへの同時ダウンロードは直列化され、そのパッケージの変換中は変換完了まで待つ。いずれもローカルファイルの読み取りであり、影響は限定的。
 - ただしキャッシュへの公開はいずれも一時ファイルへ書いてから rename する方式で行う。対象は metadata.json（`writeJsonAtomic`）、VPM の zip から変換した tgz（`convertZipBufferToTgz`）、npm 中継の tarball（`writeTarballCache`）の 3 経路で、これがキャッシュへ書き込む経路のすべてである。したがってロックを取らない読み手（別プロセスを含む）が書きかけのファイルを読むことはない。失われうるのは同時更新のうち一方であり、壊れたファイルが残ることではない。
 
