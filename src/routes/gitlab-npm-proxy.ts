@@ -1515,6 +1515,23 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
 }
 
 /**
+ * The still-encoded portion of the request path after its first `skip` segments.
+ *
+ * Route parameters arrive decoded, and interpolating a decoded path back into an upstream URL
+ * changes which resource is asked for: a name holding "%23" comes back as "#", so URL parsing
+ * treats the rest as a fragment and the upstream sees a shorter path; "%3F" becomes a query
+ * delimiter the same way. Forwarding the bytes the caller actually sent avoids having to decide
+ * how to re-encode anything - the decoded values stay in use for routing and cache lookup.
+ */
+function rawRestFromRequest(req: any, skip: number): string | null {
+  const raw =
+    typeof req?.raw?.url === "string" ? req.raw.url : typeof req?.url === "string" ? req.url : "";
+  const segments = pathWithoutQuery(raw).replace(/^\/+/, "").split("/");
+  if (segments.length <= skip) return null;
+  return segments.slice(skip).join("/");
+}
+
+/**
  * npm registry 透過（groupEnc を受け取って upstream npm registry に中継）
  */
 async function proxyGroupNpm(
@@ -1621,8 +1638,11 @@ async function proxyGroupNpm(
     return;
   }
   const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
+  // "/api/v4/groups/<group>/" is four segments; everything after them is the rest path, taken
+  // here in the encoding the caller sent rather than the decoded copy used for routing above.
+  const rawRest = rawRestFromRequest(req, 4) ?? normalizedRest;
   const upstreamUrl = appendRawQuery(
-    getUpstreamBaseForGroup(upstream, groupEnc, normalizedRest),
+    getUpstreamBaseForGroup(upstream, groupEnc, rawRest),
     req
   );
 
@@ -2006,8 +2026,11 @@ const routes: FastifyPluginAsync = async (app) => {
           return;
         }
 
+        // "/api/v4/projects/<id>/packages/npm/" is six segments; the rest is forwarded in the
+        // encoding the caller sent, for the same reason as the group route.
+        const rawRest = rawRestFromRequest(req, 6) ?? restPath;
         const upstreamUrl = appendRawQuery(
-          `${defaultUpstream.baseUrl}/api/v4/projects/${asSinglePathSegment(projectId)}/packages/npm/${restPath}`,
+          `${defaultUpstream.baseUrl}/api/v4/projects/${asSinglePathSegment(projectId)}/packages/npm/${rawRest}`,
           req
         );
         const headers = buildUpstreamHeaders(req.headers as any);
