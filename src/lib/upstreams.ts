@@ -121,15 +121,34 @@ export function selectUpstreamForScopeText(scopeText: string): UpstreamEntry {
   return config.default;
 }
 
-export function extractPackageName(restPath: string): string | null {
+/**
+ * The package name at the head of a path, handling the two segments of a scoped name.
+ *
+ * `encoded` says whether the caller's path still carries percent escapes. A route handler's rest
+ * path does not - the router decoded it - and decoding it again was wrong twice over: a name
+ * holding a literal "%" made decodeURIComponent throw, answering 500 before anything was fetched,
+ * and one holding "%41" quietly became "A", selecting a different package than the caller asked
+ * for. A path taken out of a URL still is encoded, which is why the flag exists rather than a
+ * single rule.
+ */
+export function extractPackageName(restPath: string, encoded = false): string | null {
+  const decode = (value: string): string => {
+    if (!encoded) return value;
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      // Not valid percent-encoding after all; the literal text is the best answer available.
+      return value;
+    }
+  };
   const trimmed = restPath.replace(/^\/+/, "");
   const parts = trimmed.split("/");
   if (parts.length === 0) return null;
   if (parts[0].startsWith("@")) {
-    const decodedFirst = decodeURIComponent(parts[0]);
+    const decodedFirst = decode(parts[0]);
     if (decodedFirst.includes("/")) return decodedFirst;
     if (parts.length < 2) return null;
-    return decodeURIComponent(`${parts[0]}/${parts[1]}`);
+    return decode(`${parts[0]}/${parts[1]}`);
   }
-  return decodeURIComponent(parts[0]);
+  return decode(parts[0]);
 }

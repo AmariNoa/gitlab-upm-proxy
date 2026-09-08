@@ -48,7 +48,7 @@ test(
     process.env.UPSTREAM_CONFIG_PATH = "test/fixtures/upstreams.vpm.test.yml";
     const config = getUpstreamConfig();
     assert.equal(config.default.baseUrl, "https://gitlab.example.com");
-    assert.deepEqual(config.upstreams[0].scopes, ["com.example.vpm.*"]);
+    assert.deepEqual(config.upstreams[0].scopes, ["com.example.vpm.*", "@vpmscope/*"]);
     // An entry without a scopes key keeps defaulting to an empty list rather than failing.
     assert.deepEqual(config.default.scopes, []);
     assert.equal(selectUpstream("com.example.vpm.pkg").type, "vpm");

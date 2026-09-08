@@ -4,4 +4,6 @@ upstreams:
   - baseUrl: https://vpm.example.com/index.json
     scopes:
       - com.example.vpm.*
+      # A scoped name, so the global tarball route can be exercised with one.
+      - "@vpmscope/*"
     type: vpm
