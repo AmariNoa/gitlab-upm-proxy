@@ -1158,6 +1158,23 @@ async function readPackageInfoFromTarballPath(
   }
 }
 
+/**
+ * True when the cached archive is the one the upstream's own metadata describes. A missing
+ * or non-string shasum means the upstream said nothing to check against, and the cached
+ * bytes cannot be attributed to this response - the safe answer there is "no".
+ */
+async function cachedTarballMatchesShasum(
+  upstream: UpstreamEntry,
+  packageName: string,
+  filename: string,
+  expectedShasum: unknown
+): Promise<boolean> {
+  if (typeof expectedShasum !== "string" || !expectedShasum) return false;
+  const cached = await readTarballCache(upstream.host, packageName, filename);
+  if (!cached) return false;
+  return computeSha1(cached) === expectedShasum;
+}
+
 async function mergeMetadataIfNeeded(
   metadata: any,
   packageName: string,
@@ -1189,7 +1206,20 @@ async function mergeMetadataIfNeeded(
       const filename = extractTarballFilenameFromUrl(tarballUrl);
       if (filename) {
         let tarballPath = getTarballCachePath(upstream.host, packageName, filename);
-        const cachedTarball = await hasTarballCache(upstream.host, packageName, filename);
+        // The archive cache is keyed on the upstream host, the package name and the
+        // filename - no group in it - so two GitLab groups publishing the same name at the
+        // same version share one entry. Reading it blind would take the author and
+        // displayName out of the OTHER group's archive and put them in this caller's
+        // response. The shasum the upstream just told us about is what says the cached
+        // bytes are the ones this response is about; without a match, fetch our own copy.
+        const cachedTarball =
+          (await hasTarballCache(upstream.host, packageName, filename)) &&
+          (await cachedTarballMatchesShasum(
+            upstream,
+            packageName,
+            filename,
+            versionNode?.dist?.shasum
+          ));
         if (!cachedTarball) {
           tarballPath = await downloadTarballToCache(
             tarballUrl,
@@ -1289,6 +1319,12 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
         const packages = index.packages ?? {};
         for (const [name, pkg] of Object.entries(packages)) {
           if (text && !name.includes(text)) continue;
+          // Before anything is read, written or advertised: a VPM index lists whatever its
+          // publisher put in it, and a package this upstream does not own is one the
+          // metadata route will send somewhere else. Advertising it promises a package the
+          // proxy will not serve, and seeding a cache entry for it under this upstream's
+          // host would put that promise on disk too.
+          if (selectUpstream(name).baseUrl !== upstream.baseUrl) continue;
           const versions = pkg?.versions;
           if (!versions) continue;
           const cached = await readMetadataCache(upstream.host, name);
@@ -1395,7 +1431,10 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
     merged.set(item.name, item);
   }
   for (const item of gitlabLatest) {
-    if (!item.name) continue;
+    // Same ownership rule as the upstream results below: GitLab used to be merged last and
+    // therefore won every shared name, even one routed to a configured registry - so search
+    // could advertise a version the metadata route would never serve.
+    if (!item.name || selectUpstream(item.name).baseUrl !== defaultUpstream.baseUrl) continue;
     merged.set(item.name, item);
   }
 
