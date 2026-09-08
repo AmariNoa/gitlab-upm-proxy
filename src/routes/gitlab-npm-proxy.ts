@@ -1218,6 +1218,10 @@ async function mergeMetadataIfNeeded(
 /**
  * npm search の実装本体（groupEnc を受け取って GitLab Packages API から列挙）
  */
+// Upper bound on how many rows a single upstream search may be asked for, so a caller's
+// `from` cannot be turned into an unbounded request. npm's own registry caps `size` at 250.
+const UPSTREAM_SEARCH_MAX_SIZE = 250;
+
 async function handleSearch(req: any, reply: any, groupEnc: string): Promise<void> {
   const groupPath = decodeURIComponent(groupEnc);
   const groupEncOnce = encodeURIComponent(groupPath);
@@ -1347,7 +1351,11 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       const u = new URL(`${upstream.baseUrl}/-/v1/search`);
       u.searchParams.set("text", text);
       u.searchParams.set("from", "0");
-      u.searchParams.set("size", String(size));
+      // Enough to build the page the caller asked for. Every upstream is queried from 0 and
+      // the merged list is then sliced by `from`, so asking for only `size` rows made every
+      // page after the first come back empty: the slice started past everything fetched.
+      // Capped so a large `from` cannot turn into an unbounded upstream request.
+      u.searchParams.set("size", String(Math.min(from + size, UPSTREAM_SEARCH_MAX_SIZE)));
       const res = await request(u.toString(), {
         method: "GET",
         headers: buildUpstreamHeadersFor(upstream, req.headers as any)
@@ -1362,8 +1370,15 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
       const normalized = normalizeSearchResponse(payload);
       for (const obj of normalized.objects) {
         const pkg = obj?.package ?? obj;
+        const name = String(pkg?.name ?? "");
+        // Only what this upstream would actually serve. A registry configured for one scope
+        // can return anything its own search matched, and advertising those names here
+        // promises something the metadata route will not deliver: it routes by scope, so the
+        // request goes to a different upstream and 404s. Checking with selectUpstream also
+        // makes the precedence here agree with routing, instead of "whoever was merged last".
+        if (!name || selectUpstream(name).baseUrl !== upstream.baseUrl) continue;
         upstreamResults.push({
-          name: String(pkg?.name ?? ""),
+          name,
           version: String(pkg?.version ?? ""),
           description: String(pkg?.description ?? ""),
           date: pkg?.date ?? new Date().toISOString()
