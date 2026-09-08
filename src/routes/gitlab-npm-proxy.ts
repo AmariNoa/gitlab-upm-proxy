@@ -1770,17 +1770,18 @@ async function proxyGroupNpm(
       // checks the status code and content type. Treating it as "everything is withdrawn"
       // would delete the whole package, archives included, on a 200 carrying `{}`.
       if (!isPlainObject(index.packages)) {
-        reply.code(404).send();
-        return;
+        // ...and it is not an absence either, so it must not be reported as one. A 200 carrying
+        // "{}" means the registry answered without saying anything usable, which is a failure on
+        // its side, not a package that is gone. Nothing cached is deleted here.
+        throw new UpstreamError("vpm_index_malformed:packages", "status");
       }
       const listed = Object.prototype.hasOwnProperty.call(index.packages, packageName);
       const listedVersions = listed ? (index.packages as any)[packageName]?.versions : undefined;
       if (listed && !isPlainObject(listedVersions)) {
-        // The index does name this package but the entry is unusable. That says the
-        // document is malformed, not that the package was withdrawn, so nothing is
-        // removed.
-        reply.code(404).send();
-        return;
+        // The index does name this package but the entry is unusable. That says the document is
+        // malformed, not that the package was withdrawn, so nothing is removed - and not that it
+        // is absent either, so the answer is a gateway failure rather than a 404.
+        throw new UpstreamError("vpm_index_malformed:versions", "status");
       }
       const versions = listedVersions as Record<string, any> | undefined;
       if (!versions) {

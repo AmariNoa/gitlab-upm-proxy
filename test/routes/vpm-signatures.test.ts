@@ -452,7 +452,9 @@ test(
       headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
     });
 
-    assert.equal(res.statusCode, 404, "an unusable index answers 404");
+    // A 200 carrying nothing usable is the registry failing to answer, not a statement that
+    // the package is gone - reporting absence would tell clients and caches to stop asking.
+    assert.equal(res.statusCode, 502, "an unusable index is an upstream failure, not an absence");
     const disk = await readMetadataCache(VPM_HOST, packageName);
     assert.ok(disk, "but the cache must survive it");
     assert.equal(disk!.metadata.versions[version].dist.integrity, "sha512-KEEP");
@@ -564,7 +566,7 @@ test(
       headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
     });
 
-    assert.equal(res.statusCode, 404);
+    assert.equal(res.statusCode, 502, "a malformed entry is an upstream failure, not an absence");
     const disk = await readMetadataCache(VPM_HOST, packageName);
     assert.ok(disk, "a malformed entry must not delete the cache");
     assert.equal(disk!.metadata.versions[version].dist.integrity, "sha512-KEEP-ENTRY");
