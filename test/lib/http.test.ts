@@ -8,7 +8,11 @@ import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher, type Dispatcher } from "undici";
 
-import { fetchJsonWithRedirects } from "../../src/lib/http";
+import {
+  fetchBufferWithRedirects,
+  fetchJsonWithRedirects,
+  UpstreamError
+} from "../../src/lib/http";
 
 const FIRST_ORIGIN = "https://registry.example.com";
 const OTHER_ORIGIN = "https://cdn.example.org";
@@ -109,6 +113,49 @@ test(
     await assert.rejects(
       () => fetchJsonWithRedirects(`${FIRST_ORIGIN}/empty.json`, {}, "test_fetch_failed"),
       /test_fetch_failed:204/
+    );
+  }
+);
+
+// Regression for the tenth round of the second review cycle: the binary fetcher rejected only
+// statuses of 400 and above, so an unresolved redirect at the final allowed hop fell through and
+// its body was returned as archive bytes - and the redirects-exceeded error below it could never
+// be reached. The JSON fetcher had always checked this; the two had drifted apart.
+test(
+  "リダイレクトが上限を超えた場合、その本文をアーカイブとして返さない",
+  async () => {
+    mockAgent
+      .get(FIRST_ORIGIN)
+      .intercept({ path: "/dl/loop.zip", method: "GET" })
+      .reply(302, "not an archive", { headers: { location: `${FIRST_ORIGIN}/dl/loop.zip` } })
+      .persist();
+
+    await assert.rejects(
+      () => fetchBufferWithRedirects(`${FIRST_ORIGIN}/dl/loop.zip`, {}, 2),
+      /zip_download_failed:302/,
+      "an unfollowed redirect is not a download"
+    );
+  }
+);
+
+// A body that fails midway - headers sent, then the connection drops - is wrapped as an upstream
+// failure too, but has no test here: MockAgent raises a throwing reply at dispatch time, which
+// the request wrapper already covered, so a test written against it passed with the body
+// wrapper removed. Rather than keep a case that proves nothing, it is left out and said so.
+//
+// And a document that cannot be parsed is the upstream's failure too, not a 500 from here.
+test(
+  "解析できないJSONは上流の失敗として扱われる",
+  async () => {
+    mockAgent
+      .get(FIRST_ORIGIN)
+      .intercept({ path: "/broken.json", method: "GET" })
+      .reply(200, '{"packages": {', { headers: { "content-type": "application/json" } });
+
+    await assert.rejects(
+      () => fetchJsonWithRedirects(`${FIRST_ORIGIN}/broken.json`, {}, "test_fetch_failed"),
+      (err: unknown) => err instanceof UpstreamError,
+      "a truncated document is not something this proxy got wrong"
     );
   }
 );

@@ -71,14 +71,28 @@ export async function readBodyWithLimit(
   }
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of res.body) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > limit) {
-      res.body.destroy();
-      throw new UpstreamError(`${errorPrefix}:${total}`, "limit");
+  // The iteration itself can fail: an upstream that sent its headers and then disconnected throws
+  // here, not at the request. Wrapping only the request left that as an ordinary error, so a
+  // disconnect mid-body was reported as this proxy's own failure.
+  const iterate = async () => {
+    for await (const chunk of res.body) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > limit) {
+        res.body.destroy();
+        throw new UpstreamError(`${errorPrefix}:${total}`, "limit");
+      }
+      chunks.push(buf);
     }
-    chunks.push(buf);
+  };
+  try {
+    await iterate();
+  } catch (err) {
+    if (err instanceof UpstreamError) throw err;
+    const detail = err instanceof Error ? err.message : String(err);
+    const wrapped = new UpstreamError(`upstream_body_failed:${detail}`, "transport");
+    (wrapped as any).cause = err;
+    throw wrapped;
   }
   return Buffer.concat(chunks, total);
 }
@@ -109,7 +123,16 @@ export async function readUpstreamJson<T>(res: {
   body: any;
 }): Promise<T> {
   const buffer = await readUpstreamBody(res);
-  return JSON.parse(buffer.toString("utf-8")) as T;
+  try {
+    return JSON.parse(buffer.toString("utf-8")) as T;
+  } catch (err) {
+    // A document this proxy cannot parse is one the upstream did not send correctly - the same
+    // class as a malformed index shape, and not a failure of ours.
+    const detail = err instanceof Error ? err.message : String(err);
+    const wrapped = new UpstreamError(`upstream_json_invalid:${detail}`, "status");
+    (wrapped as any).cause = err;
+    throw wrapped;
+  }
 }
 
 /**
@@ -255,7 +278,12 @@ export async function fetchBufferWithRedirects(
       current = next;
       continue;
     }
-    if (status >= 400) {
+    if (status < 200 || status >= 300) {
+      // Anything that is not a plain successful response carries no archive - an unfollowed
+      // redirect included, which is what a chain longer than maxRedirects ends on. Accepting it
+      // meant the redirect's own body was returned as the archive bytes, and the
+      // redirects-exceeded error below was unreachable. The JSON fetcher has always checked this;
+      // this one only rejected 400 and above.
       await res.body.dump();
       throw new UpstreamError(`zip_download_failed:${status}`, "status", status);
     }
