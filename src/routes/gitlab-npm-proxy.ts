@@ -1352,7 +1352,9 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
     const res = await request(u.toString(), { method: "GET", headers });
 
     if (res.statusCode >= 400) {
-      const body = await res.body.text();
+      // Bounded like every other upstream read: an error body is still a body the upstream
+      // chooses the size of, and this one is copied into the response the client receives.
+      const body = (await readUpstreamBody(res as any)).toString("utf-8");
       reply.code(res.statusCode).type("application/json").send({
         error: "gitlab_packages_api_failed",
         status: res.statusCode,
@@ -1827,7 +1829,14 @@ async function proxyGroupNpm(
 
   const res = await request(upstreamUrl, {
     method,
-    headers: buildUpstreamHeadersFor(upstream, req.headers as any),
+    // A tarball is relayed byte for byte, so the caller's validators describe the same
+    // representation the upstream holds and belong on that request. Metadata does not: the proxy
+    // rewrites tarball URLs and re-serializes it, so an upstream 304 would say nothing about
+    // whether the document this proxy renders has changed. Asking unconditionally is the only
+    // answer that is actually true.
+    headers: isTarball
+      ? buildUpstreamHeadersFor(upstream, req.headers as any)
+      : withoutResponseNarrowing(buildUpstreamHeadersFor(upstream, req.headers as any)),
     body: body as any
   });
   const contentType = String(res.headers["content-type"] ?? "");
@@ -1844,7 +1853,7 @@ async function proxyGroupNpm(
   if (method === "HEAD" || isBodylessStatus(res.statusCode)) {
     await res.body.dump();
     reply.code(res.statusCode);
-    applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
+    applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, true);
     reply.send();
     return;
   }
@@ -2100,7 +2109,13 @@ const routes: FastifyPluginAsync = async (app) => {
           }
         }
 
-        const res = await request(upstreamUrl, { method, headers, body: body as any });
+        // Same split as the group route: conditionals belong on a byte-for-byte tarball relay,
+        // not on metadata the proxy re-renders.
+        const res = await request(upstreamUrl, {
+          method,
+          headers: isTarball ? headers : withoutResponseNarrowing(headers),
+          body: body as any
+        });
         const contentType = String(res.headers["content-type"] ?? "");
 
         // Same as the group route: a HEAD, and any status defined to carry no body, arrive
@@ -2109,7 +2124,7 @@ const routes: FastifyPluginAsync = async (app) => {
         if (method === "HEAD" || isBodylessStatus(res.statusCode)) {
           await res.body.dump();
           reply.code(res.statusCode);
-          applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
+          applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, true);
           reply.send();
           return;
         }

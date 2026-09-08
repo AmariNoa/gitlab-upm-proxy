@@ -1340,3 +1340,75 @@ test("書き換えたメタデータ応答から、接続ヘッダとバイト�
   assert.equal(res.headers["x-hop-only"], undefined, "nominated by Connection, so hop-by-hop too");
   assert.equal(res.headers["cache-control"], "max-age=60", "end-to-end headers still travel");
 });
+
+// Regression for the eighth round of the second review cycle: the previous round dropped the
+// upstream's byte-dependent validators from rewritten metadata but left both HEAD paths passing
+// them through, and left the caller's conditional headers going upstream on a metadata request.
+// Both matter for the same reason: GET renders the proxy's own bytes, so the upstream's ETag and
+// length describe something the client will never receive, and an upstream 304 says nothing about
+// whether the proxy's rendering changed.
+test("メタデータのHEADは上流の検証ヘッダを公開せず、条件付きヘッダも上流へ送らない", async (t: TestContext) => {
+  mockValidUser();
+  const withoutNarrowing = (headers: unknown) => {
+    const h = normalizeHeaders(headers);
+    return !h["if-none-match"] && !h["if-modified-since"];
+  };
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: "/api/v4/groups/my-group/-/packages/npm/headmeta",
+      method: "HEAD",
+      headers: withoutNarrowing
+    })
+    .reply(200, "", {
+      headers: {
+        "content-type": "application/json",
+        etag: 'W/"upstream-etag"',
+        "content-length": "12345"
+      }
+    });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "HEAD",
+    url: "/api/v4/groups/my-group/headmeta",
+    headers: { "private-token": "valid-token", "if-none-match": 'W/"upstream-etag"' }
+  });
+
+  assert.equal(res.statusCode, 200, "the conditional must not reach the upstream as-is");
+  assert.equal(res.headers.etag, undefined, "the upstream ETag describes bytes GET will not send");
+  assert.equal(res.headers["content-length"], undefined, "same for its length");
+});
+
+// Regression for the same round: the search error path read the upstream's body with no ceiling
+// and copied it into the response, while every successful read was bounded.
+test("検索のエラー応答本文も上限を超えると読み込まれない", async (t: TestContext) => {
+  process.env.MAX_UPSTREAM_BODY_BYTES = "1024";
+  try {
+    mockValidUser();
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({
+        path: (path) => path.startsWith("/api/v4/groups/my-group/packages"),
+        method: "GET"
+      })
+      .reply(503, "e".repeat(8192), { headers: { "content-type": "text/plain" } });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v4/groups/my-group/-/v1/search?text=e",
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.notEqual(
+      res.statusCode,
+      503,
+      "an oversized error body must not be read and echoed back verbatim"
+    );
+    assert.ok(!res.body.includes("e".repeat(2048)), "and its content must not reach the client");
+  } finally {
+    delete process.env.MAX_UPSTREAM_BODY_BYTES;
+  }
+});
