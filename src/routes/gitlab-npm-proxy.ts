@@ -1600,6 +1600,20 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
 }
 
 /**
+ * Re-encodes a decoded rest path segment by segment, for the case where the raw path could not be
+ * recovered. Interpolating the decoded value itself is what the recovery exists to avoid: a "#" or
+ * "?" in it silently truncates the upstream path. Segment boundaries are preserved, so a scoped
+ * name stays two segments and every other character is escaped.
+ */
+function encodeRestSegments(decodedRest: string): string {
+  return decodedRest
+    .replace(/^\/+/, "")
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+/**
  * The still-encoded portion of the request path after its first `skip` segments.
  *
  * Route parameters arrive decoded, and interpolating a decoded path back into an upstream URL
@@ -1611,9 +1625,13 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
 function rawRestFromRequest(req: any, decodedRest: string): string | null {
   const raw =
     typeof req?.raw?.url === "string" ? req.raw.url : typeof req?.url === "string" ? req.url : "";
-  const rawSegments = pathWithoutQuery(raw).replace(/^\/+/, "").split("/").filter(Boolean);
+  // Empty segments are kept: a trailing or doubled slash is part of the path the router
+  // matched, and dropping it made the comparison below fail for every such request - which
+  // sent the caller to the fallback, and the fallback is the decoded path this whole helper
+  // exists to avoid forwarding.
+  const rawSegments = pathWithoutQuery(raw).replace(/^\/+/, "").split("/");
   const target = decodedRest.replace(/^\/+/, "");
-  if (!target) return null;
+  if (target === "") return null;
   // Found by decoding, not by counting. Neither a fixed number of leading segments (which assumes
   // the routes are mounted exactly where they are today) nor a matching count of trailing ones
   // works: an encoded slash makes one raw segment decode into two, so "%40scope%2Fpkg" is one
@@ -1749,7 +1767,7 @@ async function proxyGroupNpm(
   const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
   // The same rest path, in the encoding the caller sent rather than the decoded copy used for
   // routing above.
-  const rawRest = rawRestFromRequest(req, normalizedRest) ?? normalizedRest;
+  const rawRest = rawRestFromRequest(req, normalizedRest) ?? encodeRestSegments(normalizedRest);
   const upstreamUrl = appendRawQuery(
     getUpstreamBaseForGroup(upstream, groupEnc, rawRest),
     req
@@ -2155,7 +2173,7 @@ const routes: FastifyPluginAsync = async (app) => {
         }
 
         // Forwarded in the encoding the caller sent, for the same reason as the group route.
-        const rawRest = rawRestFromRequest(req, restPath) ?? restPath;
+        const rawRest = rawRestFromRequest(req, restPath) ?? encodeRestSegments(restPath);
         const upstreamUrl = appendRawQuery(
           `${defaultUpstream.baseUrl}/api/v4/projects/${asSinglePathSegment(projectId)}/packages/npm/${rawRest}`,
           req

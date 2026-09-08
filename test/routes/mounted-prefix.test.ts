@@ -152,3 +152,41 @@ test(
     }
   }
 );
+
+// Regression for the tenth round of the second review cycle: recovering the raw path dropped empty
+// segments, so a trailing slash made the comparison fail for every such request. Recovery then
+// returned nothing and the caller fell back to interpolating the DECODED path - which is exactly
+// what the recovery exists to avoid, so an encoded "#" truncated the upstream path again.
+test(
+  "末尾スラッシュを伴う要求でも、エンコードされた#が上流へ届く",
+  async () => {
+    const packageName = "trailing#pkg";
+
+    // Only the fully encoded path, trailing slash included, is answered.
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({
+        path: `/api/v4/groups/my-group/-/packages/npm/${encodeURIComponent(packageName)}/`,
+        method: "GET"
+      })
+      .reply(200, { name: packageName, "dist-tags": { latest: "1.0.0" }, versions: {} }, {
+        headers: { "content-type": "application/json" }
+      });
+
+    const server = Fastify({ logger: false });
+    void server.register(routes);
+    await server.ready();
+    try {
+      const res = await server.inject({
+        method: "GET",
+        url: `/api/v4/groups/my-group/${encodeURIComponent(packageName)}/`,
+        headers: { "private-token": "valid-token" }
+      });
+
+      assert.equal(res.statusCode, 200, "a trailing slash must not send the decoded path upstream");
+      assert.equal(res.json().name, packageName);
+    } finally {
+      await server.close();
+    }
+  }
+);
