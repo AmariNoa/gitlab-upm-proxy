@@ -180,9 +180,16 @@ function buildNpmMetadataFromVpm(
         /<(\d+\.\d+\.\d+)-[A-Za-z][^ ]*/g,
         "<$1-0"
       );
-      const min = semver.minVersion(normalizedRange);
-      if (min) {
-        normalizedDeps[depName] = min.version;
+      // See the same loop in src/routes/gitlab-npm-proxy.ts: minVersion throws on a range it
+      // cannot parse. Here the exception escaped the package loop as well, so one bad
+      // dependency stopped the pass from processing every package after it.
+      try {
+        const min = semver.minVersion(normalizedRange);
+        if (min) {
+          normalizedDeps[depName] = min.version;
+        }
+      } catch {
+        // unparseable range: leave this dependency out rather than fail the version
       }
     }
     out.versions[version] = {
