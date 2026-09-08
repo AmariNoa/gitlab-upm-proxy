@@ -15,6 +15,7 @@ Fastify 5 + TypeScript 製の Unity Package Manager 向け GitLab npm レジス�
 | src/lib/npm-signatures.ts | 署名鍵の生成・読込、tarball 署名、上流 npm の /-/npm/v1/keys 取得とマージ |
 | src/lib/tgz.ts | zip から tgz への変換、展開、パッケージ root の判定、一時ディレクトリのロック、sha1 計算 |
 | src/lib/env.ts | 必須環境変数の読み出し（未設定なら即座に失敗する mustEnv） |
+| src/lib/http.ts | 上流へ送るヘッダの選別（資格情報・応答を狭めるヘッダの除去）と、リダイレクトを上限付きで追従する JSON 取得 |
 | test/helper.ts | fastify-cli の helper.build で src/app.ts を起動するテストヘルパ |
 | test/lib/ | ライブラリ単体テスト（*.test.ts）と test 専用の補助モジュール |
 | test/routes/ | ルート統合テスト（*.test.ts）。helper.build でアプリを起動し、上流は MockAgent で差し替える。ログ出力を観測する test/routes/request-log.test.ts だけは、helper.build がロガーを無効化するため Fastify を直接起動する |
@@ -49,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 80 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 85 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル

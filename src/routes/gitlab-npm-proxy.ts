@@ -5,6 +5,12 @@ import * as semver from "semver";
 import * as tar from "tar";
 import { request } from "undici";
 import {
+  fetchJsonWithRedirects,
+  isSameOrigin,
+  withoutCredentials,
+  withoutResponseNarrowing
+} from "../lib/http";
+import {
   deleteMetadataCache,
   getPackageCacheDir,
   getTarballCachePath,
@@ -93,58 +99,12 @@ function buildUpstreamHeadersFor(
   return headers;
 }
 
-// Credentials belong to the upstream the caller authenticated against, and to nobody
-// else. A VPM package's dist.original points at whatever host the VPM index names (a
-// release asset host, a CDN, an arbitrary third party), so the caller's PAT must not ride
-// along on that download - nor on a redirect that leaves the origin we started from.
-function withoutCredentials(headers: Record<string, string>): Record<string, string> {
-  const stripped = { ...headers };
-  delete stripped["Authorization"];
-  delete stripped["PRIVATE-TOKEN"];
-  // buildUpstreamHeaders copies the request's headers verbatim, so a session cookie rides
-  // along unless it is removed here too. It identifies the caller just as much as the PAT
-  // does, and has no business reaching a host outside the upstream we authenticated to.
-  for (const name of Object.keys(stripped)) {
-    if (name.toLowerCase() === "cookie") delete stripped[name];
-  }
-  return stripped;
-}
-
-function isSameOrigin(a: string, b: string): boolean {
-  try {
-    return new URL(a).origin === new URL(b).origin;
-  } catch {
-    return false;
-  }
-}
-
 function headersForDownload(
   targetUrl: string,
   upstream: UpstreamEntry,
   headers: Record<string, string>
 ): Record<string, string> {
   return isSameOrigin(targetUrl, upstream.baseUrl) ? headers : withoutCredentials(headers);
-}
-
-// The proxy's own downloads are built from the caller's headers, which is convenient for
-// auth but wrong for anything that narrows the response. A caller's Range or conditional
-// headers would make the upstream answer with a fragment or a 304, and that is not what we
-// are asking for here: we always want the whole archive.
-const RESPONSE_NARROWING_HEADERS = [
-  "range",
-  "if-range",
-  "if-none-match",
-  "if-modified-since",
-  "if-match",
-  "if-unmodified-since"
-];
-
-function withoutResponseNarrowing(headers: Record<string, string>): Record<string, string> {
-  const out = { ...headers };
-  for (const name of Object.keys(out)) {
-    if (RESPONSE_NARROWING_HEADERS.includes(name.toLowerCase())) delete out[name];
-  }
-  return out;
 }
 
 function extractPat(reqHeaders: Record<string, unknown>): string | null {
@@ -259,16 +219,18 @@ function getVpmIndexUrl(upstream: UpstreamEntry): string {
     : `${upstream.baseUrl.replace(/\/+$/, "")}/index.json`;
 }
 
+// The index is not the resource the caller asked for: they asked for one package document (or a
+// search), and this is the whole catalogue the proxy derives it from. So their conditional
+// headers and Range must not reach it - an `If-None-Match: *` would otherwise turn the index
+// into a 304 with no body, and a Range into a fragment of JSON. Redirects are followed here
+// because undici does not, and an unfollowed 301 used to be parsed as the index itself.
+// fetchJsonWithRedirects handles both, and drops the caller's credentials if the chain leaves
+// the origin the index URL named.
 async function fetchVpmIndex(
   upstream: UpstreamEntry,
   headers: Record<string, string>
 ): Promise<VpmIndex> {
-  const res = await request(getVpmIndexUrl(upstream), { method: "GET", headers });
-  if (res.statusCode >= 400) {
-    await res.body.dump();
-    throw new Error(`vpm_index_failed:${res.statusCode}`);
-  }
-  return (await res.body.json()) as VpmIndex;
+  return fetchJsonWithRedirects<VpmIndex>(getVpmIndexUrl(upstream), headers, "vpm_index_failed");
 }
 
 function pickLatestVpmVersion(versions: Record<string, any> | undefined): string | null {
