@@ -368,6 +368,58 @@ sudo journalctl -u gitlab-upm-proxy -n 30 --no-pager | grep -n 'vpm_metadata_fai
 
 ---
 
+## M-10 npm 中継 tarball のストリーム配信とキャッシュ
+
+**前提条件**: M-2 の (3) が 200 であること。GitLab 側に npm パッケージ（VPM 由来ではないもの）が 1 つあること。
+
+npm 中継の tarball は、応答全体をメモリへ読み込まずにクライアントへ流しながら、同時にキャッシュへ書く。
+確認したいのは 3 点ある。アーカイブが欠けずに届くこと、キャッシュへ公開されること、そして
+**キャッシュの公開が応答の完了より後になりうる**こと。1 つのストリームを分岐させているためで、
+取得直後にキャッシュを見て「無い」と判断しないための注意点である。
+
+`MAX_UPSTREAM_BODY_BYTES` を超えるアーカイブは、中継はされるがキャッシュされない
+（この上限は保存してよい大きさを決めるもので、取得の可否を決めるものではない）。
+
+**操作手順**
+
+```bash
+# 対象パッケージとバージョンは自分の環境の値へ読み替える
+PKG=com.example.npmpkg
+VER=1.0.0
+
+# (1) キャッシュを消してから取得する
+sudo rm -rf "/var/lib/gitlab-upm-proxy/cache/gitlab.example.com/${PKG}"
+curl -s -H "PRIVATE-TOKEN: ${GITLAB_PAT}" \
+  -o /tmp/npm-pkg.tgz -w '%{http_code} %{size_download}\n' \
+  "https://upm.example.com/api/v4/groups/my-group/${PKG}/-/${PKG}-${VER}.tgz"
+
+# (2) アーカイブとして展開できることを確認する（内容が欠けていないこと）
+tar -tzf /tmp/npm-pkg.tgz | head -5
+
+# (3) キャッシュの出現を待つ（応答完了より後になりうるため、即座に見ない）
+for i in $(seq 1 20); do
+  [ -f "/var/lib/gitlab-upm-proxy/cache/gitlab.example.com/${PKG}/${PKG}-${VER}.tgz" ] && break
+  sleep 1
+done
+sudo ls -l "/var/lib/gitlab-upm-proxy/cache/gitlab.example.com/${PKG}/"
+
+# (4) 2 回目の取得（キャッシュから返ることの確認。上流には認可確認の HEAD だけが飛ぶ）
+curl -s -H "PRIVATE-TOKEN: ${GITLAB_PAT}" \
+  -o /tmp/npm-pkg-2.tgz -w '%{http_code}\n' \
+  "https://upm.example.com/api/v4/groups/my-group/${PKG}/-/${PKG}-${VER}.tgz"
+cmp /tmp/npm-pkg.tgz /tmp/npm-pkg-2.tgz && echo "IDENTICAL"
+```
+
+**期待される結果**
+
+- (1) が `200` を返し、`size_download` が上流のアーカイブサイズと一致する。
+- (2) `tar -tzf` がエントリを列挙する（切り詰められていない）。
+- (3) キャッシュに `<パッケージ名>-<バージョン>.tgz` が現れ、`.tmp` で終わるファイルが残っていない。
+- (4) `200` が返り、`cmp` が `IDENTICAL` を表示する。
+- プロキシのログに `tarball_cache_write_failed` が出ていない。
+
+---
+
 ## 結果記録表
 
 実施のたびに行を追加する。**エージェントはこの表を代筆しない**（実機確認は実施者本人の観察に基づく記録とするため）。
@@ -383,5 +435,6 @@ sudo journalctl -u gitlab-upm-proxy -n 30 --no-pager | grep -n 'vpm_metadata_fai
 | M-7 Unity からの取得 | | | | | |
 | M-8 ログに署名付きクエリが残らない | | | | | |
 | M-9 上流障害が不在として報告されない | | | | | |
+| M-10 npm 中継のストリーム配信とキャッシュ | | | | | |
 
 不合格だったケースは、対象コミット・実行したコマンド・出力（秘密情報を除く）・ログの該当箇所を控えたうえで報告する。

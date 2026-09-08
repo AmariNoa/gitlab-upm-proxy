@@ -116,5 +116,5 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 ## ドキュメント
 
 - README.md: 概要、対応エンドポイント、設定、VPM の挙動、認証、Ubuntu Server へのインストール・更新手順
-- docs/manual-verification.md: 自動テストで確認できない範囲（実サーバー・実レジストリ・実クライアント）の人手確認手順。M-1 から M-9 のケースと結果記録表
+- docs/manual-verification.md: 自動テストで確認できない範囲（実サーバー・実レジストリ・実クライアント）の人手確認手順。M-1 から M-10 のケースと結果記録表
 - docs/orchestration.md、docs/checkpoint.md: エージェント運用の共有コーディネーションファイル（Git 管理外）
