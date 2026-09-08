@@ -8,6 +8,7 @@ import { applyPackageSignature, hasProxySignature } from "./npm-signatures";
 import { getUpstreamConfig, matchScope, UpstreamEntry } from "./upstreams";
 import { mustEnv } from "./env";
 import { computeSha1, convertZipBufferToTgzUnlocked, runTempLocked } from "./tgz";
+import { fetchJsonWithRedirects } from "./http";
 
 type VpmIndex = {
   author?: unknown;
@@ -43,13 +44,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Redirects are followed here for the same reason as on the request path: undici does not
+// follow them, so an index URL answered with a 301 had its redirect body parsed as the index.
+// The prefetch carries no caller headers, so there is nothing to strip - the shared helper still
+// drops credentials on a cross-origin hop if that ever changes.
 async function fetchVpmIndex(upstream: UpstreamEntry): Promise<VpmIndex> {
-  const res = await request(getVpmIndexUrl(upstream), { method: "GET" });
-  if (res.statusCode >= 400) {
-    await res.body.dump();
-    throw new Error(`vpm_index_failed:${res.statusCode}`);
-  }
-  return (await res.body.json()) as VpmIndex;
+  return fetchJsonWithRedirects<VpmIndex>(getVpmIndexUrl(upstream), {}, "vpm_index_failed");
 }
 
 async function readAuthorFromTgz(tgzPath: string): Promise<unknown> {
