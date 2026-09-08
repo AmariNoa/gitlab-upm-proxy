@@ -718,10 +718,69 @@ test("検索の2ページ目以降もupstreamの結果を返す", async (t: Test
 
   assert.equal(res.statusCode, 200);
   const body = res.json() as { objects: Array<{ package: { name: string } }>; total: number };
-  assert.equal(requestedSize, "30", "the upstream must be asked for enough rows to build this page");
+  assert.equal(requestedSize, "250", "the same window is fetched for every page of one search");
   assert.equal(body.objects.length, 10, "the second page must not be empty");
   assert.equal(body.objects[0].package.name, "com.example.other.p20");
   assert.equal(body.total, 30);
+});
+
+// Regression for cycle 2 round 2: asking each upstream for `from + size` rows made the fetched
+// prefix a different length on every page. The merged list is sorted by name and then sliced,
+// so pages built from different prefixes of the upstream's own ordering overlapped and skipped
+// entries, and `total` moved as the caller paged.
+test("検索のページ分割は、ページ間で重複や欠落を生じない", async (t: TestContext) => {
+  // Deliberately returned in an order that is not the sorted one.
+  const objects = [
+    { package: { name: "com.example.other.zz", version: "1.0.0", description: "z" } },
+    { package: { name: "com.example.other.aa", version: "1.0.0", description: "a" } }
+  ];
+
+  const pageOf = async (from: number) => {
+    mockValidUser();
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({ path: (path) => path.startsWith("/api/v4/groups/my-group/packages"), method: "GET" })
+      .reply(200, []);
+    // Honours `size` the way a real registry does: that is what makes the fetched prefix
+    // depend on the page, which is the whole point of this test.
+    let requestedSize = 0;
+    mockAgent
+      .get(SCOPED_ORIGIN)
+      .intercept({
+        path: (path) => {
+          if (!path.startsWith("/-/v1/search")) return false;
+          requestedSize = Number(new URL(path, SCOPED_ORIGIN).searchParams.get("size") ?? "0");
+          return true;
+        },
+        method: "GET"
+      })
+      .reply(() => ({
+        statusCode: 200,
+        data: { objects: objects.slice(0, requestedSize), total: objects.length },
+        responseOptions: { headers: { "content-type": "application/json" } }
+      }));
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/-/v1/search?text=&from=${from}&size=1`,
+      headers: { "private-token": "valid-token" }
+    });
+    assert.equal(res.statusCode, 200);
+    return res.json() as { objects: Array<{ package: { name: string } }>; total: number };
+  };
+
+  const first = await pageOf(0);
+  const second = await pageOf(1);
+
+  assert.equal(first.total, 2, "total must describe the whole result set");
+  assert.equal(second.total, 2, "and must not change between pages");
+  assert.equal(first.objects[0].package.name, "com.example.other.aa");
+  assert.equal(
+    second.objects[0].package.name,
+    "com.example.other.zz",
+    "the second page must continue where the first ended, not repeat it"
+  );
 });
 
 // Regression for cycle 2 round 2: the wholesale cache substitution was removed last round,
