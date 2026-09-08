@@ -14,6 +14,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import * as tar from "tar";
@@ -721,4 +722,120 @@ test("検索の2ページ目以降もupstreamの結果を返す", async (t: Test
   assert.equal(body.objects.length, 10, "the second page must not be empty");
   assert.equal(body.objects[0].package.name, "com.example.other.p20");
   assert.equal(body.total, 30);
+});
+
+// Regression for cycle 2 round 2: the wholesale cache substitution was removed last round,
+// but enrichment still read the archive cache blind. That cache is keyed on host, package name
+// and filename with no group in it, so one group's archive supplied the author and displayName
+// for another group's response.
+test("メタデータ補完は、shasumが一致しないキャッシュ済みアーカイブを使わない", async (t: TestContext) => {
+  const packageName = "cross-group-enrich";
+  const version = "1.0.0";
+  const filename = `${packageName}-${version}.tgz`;
+
+  // Group A's archive, carrying A's author, already in the cache.
+  const sourceDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-crossgroup-"));
+  mkdirSync(join(sourceDir, "package"), { recursive: true });
+  writeFileSync(
+    join(sourceDir, "package", "package.json"),
+    JSON.stringify({ name: packageName, version, author: { name: "Group A Author" } }),
+    "utf-8"
+  );
+  const tgzPath = join(sourceDir, "a.tgz");
+  await tar.c({ gzip: true, file: tgzPath, cwd: sourceDir }, ["package"]);
+  const groupABytes = readFileSync(tgzPath);
+  enrichTempDirs.push(sourceDir);
+
+  const cacheDir = join(tarballCacheDir, DEFAULT_HOST, packageName);
+  mkdirSync(cacheDir, { recursive: true });
+  writeFileSync(join(cacheDir, filename), groupABytes);
+
+  // Group B's own archive, with a different author, served from its own upstream path.
+  const sourceDirB = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-crossgroup-b-"));
+  mkdirSync(join(sourceDirB, "package"), { recursive: true });
+  writeFileSync(
+    join(sourceDirB, "package", "package.json"),
+    JSON.stringify({ name: packageName, version, author: { name: "Group B Author" } }),
+    "utf-8"
+  );
+  const tgzPathB = join(sourceDirB, "b.tgz");
+  await tar.c({ gzip: true, file: tgzPathB, cwd: sourceDirB }, ["package"]);
+  const groupBBytes = readFileSync(tgzPathB);
+  enrichTempDirs.push(sourceDirB);
+
+  const shasumB = createHash("sha1").update(groupBBytes).digest("hex");
+  const tarballUrl = `${DEFAULT_ORIGIN}/api/v4/groups/group-b/-/packages/npm/${packageName}/-/${filename}`;
+
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: `/api/v4/groups/group-b/-/packages/npm/${packageName}`, method: "GET" })
+    .reply(
+      200,
+      {
+        name: packageName,
+        "dist-tags": { latest: version },
+        // No author and no displayName: enrichment has to go and read an archive.
+        versions: {
+          [version]: { name: packageName, version, dist: { tarball: tarballUrl, shasum: shasumB } }
+        }
+      },
+      { headers: { "content-type": "application/json" } }
+    );
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: `/api/v4/groups/group-b/-/packages/npm/${packageName}/-/${filename}`, method: "GET" })
+    .reply(200, groupBBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/group-b/${packageName}`,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = res.json() as { author?: string };
+  assert.equal(body.author, "Group B Author", "the author must come from this group's own archive");
+});
+
+// Regression for cycle 2 round 2: the ownership check added last round covered only the
+// non-default npm results. GitLab's own results were merged last and therefore won every
+// shared name, including names routed to a configured registry.
+test("検索でGitLabの結果も、スコープ上の担当upstreamでなければ採用されない", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: (path) => path.startsWith("/api/v4/groups/my-group/packages"), method: "GET" })
+    .reply(200, [
+      // Routed to the scoped registry by com.example.other.*, not to GitLab.
+      { package_type: "npm", name: "com.example.other.thing", version: "9.0.0", created_at: "2024-01-01T00:00:00Z" },
+      { package_type: "npm", name: "gitlab-owned", version: "1.0.0", created_at: "2024-01-01T00:00:00Z" }
+    ]);
+
+  mockAgent
+    .get(SCOPED_ORIGIN)
+    .intercept({ path: (path) => path.startsWith("/-/v1/search"), method: "GET" })
+    .reply(
+      200,
+      { objects: [{ package: { name: "com.example.other.thing", version: "1.0.0", description: "from the registry" } }] },
+      { headers: { "content-type": "application/json" } }
+    );
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/v1/search?text=&from=0&size=20",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  const body = res.json() as { objects: Array<{ package: { name: string; version: string } }> };
+  const byName = new Map(body.objects.map((o) => [o.package.name, o.package.version]));
+  assert.equal(
+    byName.get("com.example.other.thing"),
+    "1.0.0",
+    "the registry that owns the scope must win, not GitLab"
+  );
+  assert.equal(byName.get("gitlab-owned"), "1.0.0", "names GitLab does own are still listed");
 });
