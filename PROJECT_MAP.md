@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 140 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 144 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -83,6 +83,12 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 - TypeScript: tsconfig.json（fastify-tsconfig を extends。module NodeNext、outDir dist、sourceMap）。test/tsconfig.json は noEmit で src と test を含む
 - 環境変数ファイル: .env（Git 管理外。sample.env が雛形）、test/.env.test（テスト用。DOTENV_CONFIG_PATH で指定）
 - Git 管理外（.gitignore）: dist/、node_modules/、coverage/、.env、data/*、config/upstreams.yml、AGENTS.md、CLAUDE.md、docs/orchestration.md、docs/checkpoint.md
+
+## キャッシュ済み tarball の認可
+
+- 既定 GitLab 上流の tarball をキャッシュから返す前に、呼び出し元の資格情報で上流のパッケージメタデータへ HEAD を投げ、成功した場合だけ配信する。PAT 検証（/api/v4/user）はトークンが有効であることしか示さず、キャッシュキーはホストとパッケージ名だけでグループも利用者も含まないため、これが無いと「一度誰かが取得したパッケージは、有効な PAT を持つ誰にでも返る」状態になる。
+- 上流が拒否した場合はその状態とヘッダをそのまま返し、上流へ到達できない場合は 502 を返す。いずれの場合もキャッシュへフォールバックしない（フォールバックは認可の素通しになるため）。
+- 非既定の npm レジストリと VPM レジストリは対象外。これらへは呼び出し元の資格情報を送っていない（プロキシ自身として到達する）ため、利用者ごとの認可を問い合わせる先が無い。
 
 ## 応答ステータスの方針
 

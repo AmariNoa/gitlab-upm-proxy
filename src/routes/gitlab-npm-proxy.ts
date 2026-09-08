@@ -10,6 +10,7 @@ import {
   isSameOrigin,
   readUpstreamBody,
   readUpstreamJson,
+  requestUpstream,
   UpstreamError,
   withoutCredentials,
   withoutResponseNarrowing
@@ -1167,6 +1168,59 @@ function isBodylessStatus(statusCode: number): boolean {
  * asking, and lets an intermediary cache that answer.
  */
 /**
+ * Asks the upstream whether this caller may have this package, before an archive is served from
+ * cache.
+ *
+ * The PAT check on every request only establishes that the token is a valid GitLab token. It says
+ * nothing about which packages that user can see. The tarball cache is keyed on the upstream host
+ * and the package name - no group, no user - so once anyone fetches a package, a cache hit used to
+ * hand it to any caller with any valid token, including one who could not have fetched it
+ * themselves. Only the upstream knows who may see what, so the upstream is asked.
+ *
+ * The question is only meaningful for the default GitLab upstream. Requests to other registries go
+ * out with the caller's credentials stripped, so there is no per-caller authorisation there to
+ * consult - the proxy reaches them as itself.
+ *
+ * Returns true when the archive may be served. On a refusal it has already answered the caller
+ * with the upstream's own status. A failure to reach the upstream is thrown rather than swallowed:
+ * falling back to the cache there would be exactly the silent bypass this exists to close.
+ */
+async function callerMayReadCachedPackage(
+  req: any,
+  reply: any,
+  upstream: UpstreamEntry,
+  metadataUrl: string
+): Promise<boolean> {
+  if (upstream.baseUrl !== defaultUpstream.baseUrl) return true;
+
+  let res;
+  try {
+    res = await requestUpstream(metadataUrl, {
+      method: "HEAD",
+      headers: withoutResponseNarrowing(buildUpstreamHeadersFor(upstream, req.headers as any))
+    });
+    await res.body.dump();
+  } catch (err) {
+    // Classified here rather than left to bubble: the npm relay this sits in has no failure
+    // mapping of its own, so an unreachable authority would surface as a 500 - and, more to the
+    // point, must never fall through to serving the cache.
+    req.log.info({ err, path: pathWithoutQuery(req.url) }, "cached_tarball_authz_failed");
+    reply.code(failureStatus(err)).send();
+    return false;
+  }
+  if (res.statusCode >= 200 && res.statusCode < 300) return true;
+
+  req.log.info(
+    { status: res.statusCode, path: pathWithoutQuery(req.url) },
+    "cached_tarball_denied"
+  );
+  reply.code(res.statusCode);
+  applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, true);
+  reply.send();
+  return false;
+}
+
+/**
  * 404 only when an upstream actually said the thing is not there, 502 when it failed to answer,
  * 500 when the failure was ours. Everything used to collapse into 404, which told clients and
  * caches that a package was gone whenever a registry was merely unwell.
@@ -1910,6 +1964,15 @@ async function proxyGroupNpm(
   if (isTarball && packageName && tarballFilename) {
     const cachedBuffer = await readTarballCache(upstream.host, packageName, tarballFilename);
     if (cachedBuffer) {
+      // Asked before a byte is served: a valid token is not the same as permission to see this
+      // package, and the cache is keyed on neither the group nor the caller.
+      const allowed = await callerMayReadCachedPackage(
+        req,
+        reply,
+        upstream,
+        getUpstreamBaseForGroup(upstream, groupEnc, encodeRestSegments(packageName))
+      );
+      if (!allowed) return;
       reply.code(200);
       reply.header("content-type", "application/octet-stream");
       reply.header("content-length", String(cachedBuffer.length));
@@ -2198,6 +2261,15 @@ const routes: FastifyPluginAsync = async (app) => {
             tarballFilename
           );
           if (cachedBuffer) {
+            // Same question as the group route: this cache entry is not evidence that this caller
+            // is allowed to have it.
+            const allowed = await callerMayReadCachedPackage(
+              req,
+              reply,
+              defaultUpstream,
+              `${defaultUpstream.baseUrl}/api/v4/projects/${asSinglePathSegment(projectId)}/packages/npm/${encodeRestSegments(packageName)}`
+            );
+            if (!allowed) return;
             reply.code(200);
             reply.header("content-type", "application/octet-stream");
             reply.header("content-length", String(cachedBuffer.length));
