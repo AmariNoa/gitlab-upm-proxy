@@ -1,0 +1,9 @@
+# A scopes list holding something that is not a string. Loading this must fail rather than
+# reach matchScope, where it would throw on a per-request path instead.
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  - baseUrl: https://npm.example.org
+    scopes:
+      - com.example.*
+      - 42

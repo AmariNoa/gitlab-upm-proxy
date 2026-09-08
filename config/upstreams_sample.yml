@@ -1,3 +1,5 @@
+# scopes must be a list of strings. A scalar value (scopes: jp.hoge.*) is rejected at startup:
+# it would be read one character at a time, and the * among them matches every package.
 default:
   - baseUrl: https://gitlab.example.com
 upstreams:
