@@ -898,10 +898,29 @@ function rewriteTarballUrl(
 
   try {
     const parsed = new URL(tarballUrl);
-    const tarPath = `${parsed.pathname}${parsed.search}`.replace(/^\/+/, "");
+    // The rewritten URL is served back to us on the group route, where its first path
+    // segment is read as the package name. Keeping the registry's own base path in it makes
+    // that segment the base path - "registry" instead of "com.example.pkg" - so the request
+    // is routed to the default upstream and 404s, or has the base path applied twice.
+    // Whatever getUpstreamBaseForGroup will put back in front has to come off here.
+    let path = parsed.pathname;
+    const basePath = upstreamBasePath(upstream);
+    if (basePath && (path === basePath || path.startsWith(`${basePath}/`))) {
+      path = path.slice(basePath.length);
+    }
+    const tarPath = `${path}${parsed.search}`.replace(/^\/+/, "");
     return `${PUBLIC_BASE_URL}/api/v4/groups/${groupEnc}/${tarPath}`;
   } catch {
     return tarballUrl;
+  }
+}
+
+/** The path portion of an upstream's baseUrl, without a trailing slash ("" when there is none). */
+function upstreamBasePath(upstream: UpstreamEntry): string {
+  try {
+    return new URL(upstream.baseUrl).pathname.replace(/\/+$/, "");
+  } catch {
+    return "";
   }
 }
 
