@@ -23,6 +23,7 @@ process.env.PUBLIC_BASE_URL = "https://proxy.merge-shasum.example.net";
 import {
   mergeShasumFromCache,
   pathWithoutQuery,
+  reconcileAgainstDisk,
   refreshCachedVpmMetadata
 } from "../../src/routes/gitlab-npm-proxy";
 import { getProxySigningKey } from "../../src/lib/npm-signatures";
@@ -320,4 +321,57 @@ test("pathWithoutQueryはログへ出すパスからクエリ文字列を落と�
   assert.equal(pathWithoutQuery("/?a=b"), "/");
   // A non-string url (never expected from Fastify, but the logger must not throw).
   assert.equal(pathWithoutQuery(undefined), "");
+});
+
+// Regression for the tenth round of the second review cycle: search wrote VPM metadata with only
+// two of the three reconciliation rules the metadata route applies, so a snapshot taken before a
+// failed prefetch rolled a version back would write its shasum, integrity and signatures straight
+// back over the cleanup - leaving metadata advertising an archive that is not on disk, and a
+// shasum that stops the next prefetch from repairing it.
+//
+// The rules are one shared function now, which is what actually prevents the two writers drifting
+// again; this pins what that function does.
+test("reconcileAgainstDiskは、ディスク側で消された可用性フィールドを復活させない", () => {
+  const rolledBack = {
+    versions: {
+      "1.0.0": { dist: { tarball: "" } }
+    }
+  };
+  const staleSnapshot = {
+    versions: {
+      "1.0.0": {
+        dist: {
+          tarball: "",
+          shasum: "9".repeat(40),
+          integrity: "sha512-STALE",
+          signatures: [{ keyid: proxyKeyid, sig: "STALE-SIGNATURE" }]
+        }
+      }
+    }
+  };
+
+  reconcileAgainstDisk(staleSnapshot, rolledBack);
+
+  const dist = staleSnapshot.versions["1.0.0"].dist as Record<string, unknown>;
+  assert.equal(dist.shasum, undefined, "a rolled-back version must not regain its shasum");
+  assert.equal(dist.integrity, undefined, "nor its integrity");
+  assert.equal(dist.signatures, undefined, "nor its signatures");
+});
+
+test("reconcileAgainstDiskは、ディスク側にしかない版とshasumを保つ", () => {
+  const onDisk = {
+    versions: {
+      "1.0.0": { dist: { shasum: "1".repeat(40) } },
+      "2.0.0": { name: "x", version: "2.0.0", dist: { shasum: "2".repeat(40) } }
+    }
+  };
+  const snapshot = { versions: { "1.0.0": { dist: { tarball: "" } as Record<string, unknown> } } };
+
+  reconcileAgainstDisk(snapshot, onDisk);
+
+  assert.equal(snapshot.versions["1.0.0"].dist.shasum, "1".repeat(40), "cached shasums are kept");
+  assert.ok(
+    (snapshot.versions as Record<string, any>)["2.0.0"],
+    "a version only on disk survives the write"
+  );
 });
