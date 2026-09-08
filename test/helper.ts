@@ -27,9 +27,11 @@ async function build (t: TestContext) {
   // different from the production setup
   const app = await helper.build(argv, config())
 
-  // Tear down our app after we are done
-  // eslint-disable-next-line no-void
-  t.after(() => void app.close())
+  // Tear down our app after we are done. The promise is returned, not discarded: closing runs
+  // asynchronous work now (the prefetch shutdown waits for whatever pass is in flight), and a
+  // discarded promise lets the next test start, or this one's dispatcher and cache directory be
+  // torn down, while the previous application is still stopping.
+  t.after(() => app.close())
 
   return app
 }

@@ -16,8 +16,8 @@ import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import { MockAgent, setGlobalDispatcher, getGlobalDispatcher, type Dispatcher } from "undici";
 
-import { convertZipBufferToTgz, runTempLocked } from "../../src/lib/tgz";
-import { fetchBufferWithRedirects } from "../../src/lib/http";
+import { convertZipBufferToTgz, runTempLocked, validateExtractLimits } from "../../src/lib/tgz";
+import { fetchBufferWithRedirects, validateDownloadLimits } from "../../src/lib/http";
 import { buildStoredZip } from "./zip-fixture";
 
 const workDir = mkdtempSync(join(tmpdir(), "gitlab-upm-proxy-zip-limits-test-"));
@@ -160,5 +160,29 @@ test(
 
     const body = await fetchBufferWithRedirects(`${ORIGIN}/dl/small.zip`);
     assert.equal(body.length, 256);
+  }
+);
+
+// Regression for the fifth round of the second review cycle: README promised that a malformed
+// limit stops the proxy at startup, but the limits were only read when an archive was actually
+// downloaded or expanded. A typo therefore surfaced hours later as a failed download, and a
+// successful start said nothing about whether the setting had been understood.
+test(
+  "壊れた上限値は起動時の検証で検出される",
+  () => {
+    process.env.VPM_MAX_DOWNLOAD_BYTES = "not-a-number";
+    assert.throws(() => validateDownloadLimits(), /VPM_MAX_DOWNLOAD_BYTES/);
+    process.env.VPM_MAX_DOWNLOAD_BYTES = "0";
+    assert.throws(() => validateDownloadLimits(), /VPM_MAX_DOWNLOAD_BYTES/);
+    delete process.env.VPM_MAX_DOWNLOAD_BYTES;
+    assert.doesNotThrow(() => validateDownloadLimits(), "an unset limit falls back to its default");
+
+    process.env.VPM_MAX_EXTRACT_ENTRIES = "-1";
+    assert.throws(() => validateExtractLimits(), /VPM_MAX_EXTRACT_ENTRIES/);
+    delete process.env.VPM_MAX_EXTRACT_ENTRIES;
+    process.env.VPM_MAX_EXTRACT_BYTES = "1.5";
+    assert.throws(() => validateExtractLimits(), /VPM_MAX_EXTRACT_BYTES/);
+    delete process.env.VPM_MAX_EXTRACT_BYTES;
+    assert.doesNotThrow(() => validateExtractLimits(), "unset limits fall back to their defaults");
   }
 );

@@ -3,6 +3,8 @@ import AutoLoad, { AutoloadPluginOptions } from '@fastify/autoload'
 import { FastifyPluginAsync, FastifyServerOptions } from 'fastify'
 import "dotenv/config";
 import { createPrefetchLifecycle, startVpmPrefetch, stopVpmPrefetch } from "./lib/vpm-prefetch";
+import { validateDownloadLimits } from "./lib/http";
+import { validateExtractLimits } from "./lib/tgz";
 
 
 export interface AppOptions extends FastifyServerOptions, Partial<AutoloadPluginOptions> {
@@ -34,6 +36,13 @@ const app: FastifyPluginAsync<AppOptions> = async (
   opts
 ): Promise<void> => {
   // Place here your custom code!
+  //
+  // The archive limits are otherwise only read when an archive is downloaded or expanded, so a
+  // typo in one of them stayed invisible until then. Reading them here makes a malformed value
+  // stop the server, which is what an operator expects a configuration error to do.
+  validateDownloadLimits();
+  validateExtractLimits();
+
   //
   // One lifecycle per server, decorated onto the instance so the routes can hand it to the
   // request-triggered prefetch. Keeping it in the module instead meant closing one server

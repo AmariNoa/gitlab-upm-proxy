@@ -12,6 +12,16 @@ function maxDownloadBytes(): number {
 }
 
 /**
+ * Reads the limit once so a malformed value stops the process at startup. The limit is otherwise
+ * only read when an archive is actually downloaded, which meant a typo surfaced as a failed
+ * download hours later - and an operator could not read a successful start as evidence that the
+ * setting was understood.
+ */
+export function validateDownloadLimits(): void {
+  maxDownloadBytes();
+}
+
+/**
  * Request headers that narrow what the upstream sends back. The proxy forwards the caller's
  * headers so a conditional GET or a Range request works end to end on the resource the caller
  * actually asked for - but when the proxy fetches something else on their behalf (an archive it

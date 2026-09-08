@@ -23,6 +23,12 @@ function maxExtractEntries(): number {
   return positiveIntEnv("VPM_MAX_EXTRACT_ENTRIES", 20000);
 }
 
+/** Reads the limits once at startup, for the reason given on validateDownloadLimits. */
+export function validateExtractLimits(): void {
+  maxExtractBytes();
+  maxExtractEntries();
+}
+
 /**
  * Resolves an archive entry's path inside targetDir, refusing anything that would land outside
  * it. Absolute paths and `..` segments are a property of the archive, so they are attacker
