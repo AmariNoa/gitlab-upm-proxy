@@ -25,6 +25,7 @@ import { build, TestContext } from "../helper";
 
 const DEFAULT_ORIGIN = "https://gitlab.example.com";
 const SCOPED_ORIGIN = "https://npm.example.org";
+const ROOTED_ORIGIN = "https://npm2.example.org";
 const PUBLIC_BASE_URL = "https://proxy.basepath.example.net";
 
 let mockAgent: MockAgent;
@@ -122,6 +123,57 @@ test(
       downloadedFrom,
       `/registry/${packageName}/-/${packageName}-${version}.tgz`,
       "and it must reach the registry that owns the package"
+    );
+  }
+);
+
+// Regression for cycle 2 round 2: the rewrite discarded the tarball URL's origin
+// unconditionally. A registry whose downloads live on a CDN therefore had them republished
+// under the registry's own base URL - a different resource - so the metadata looked fine and
+// every download failed. The proxy cannot route those, so it must not claim to.
+test(
+  "upstream外のホストにあるtarball URLは書き換えずにそのまま返す",
+  async (t: TestContext) => {
+    // Against the root-hosted registry on purpose: its base path is empty, so the origin
+    // check is the only thing that can stop the rewrite.
+    const packageName = "com.example.rooted.cdn";
+    const version = "1.0.0";
+    const cdnTarball = `https://cdn.example.org/${packageName}/-/${packageName}-${version}.tgz`;
+
+    mockAgent
+      .get(ROOTED_ORIGIN)
+      .intercept({ path: `/${packageName}`, method: "GET" })
+      .reply(
+        200,
+        {
+          name: packageName,
+          "dist-tags": { latest: version },
+          versions: {
+            [version]: {
+              name: packageName,
+              version,
+              author: { name: "Test Author" },
+              displayName: "CDN Package",
+              dist: { tarball: cdnTarball, shasum: "1".repeat(40) }
+            }
+          }
+        },
+        { headers: { "content-type": "application/json" } }
+      );
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { versions: Record<string, { dist: { tarball: string } }> };
+    assert.equal(
+      body.versions[version].dist.tarball,
+      cdnTarball,
+      "a download the proxy cannot route must keep the upstream's own URL"
     );
   }
 );

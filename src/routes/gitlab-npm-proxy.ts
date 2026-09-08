@@ -906,14 +906,28 @@ function rewriteTarballUrl(
 
   try {
     const parsed = new URL(tarballUrl);
+    // Only what this proxy can actually route back. getUpstreamBaseForGroup rebuilds the
+    // upstream URL as `${upstream.baseUrl}/${rest}`, so a tarball hosted anywhere else - a
+    // CDN the registry points at, typically - cannot be reconstructed from the rewritten
+    // path: the proxy URL would resolve to a different resource on the registry itself, and
+    // the download fails after metadata that looked fine. Those URLs are published as they
+    // are, and the client fetches them directly.
+    const base = new URL(upstream.baseUrl);
+    if (parsed.origin !== base.origin) {
+      return tarballUrl;
+    }
     // The rewritten URL is served back to us on the group route, where its first path
     // segment is read as the package name. Keeping the registry's own base path in it makes
     // that segment the base path - "registry" instead of "com.example.pkg" - so the request
     // is routed to the default upstream and 404s, or has the base path applied twice.
     // Whatever getUpstreamBaseForGroup will put back in front has to come off here.
-    let path = parsed.pathname;
     const basePath = upstreamBasePath(upstream);
-    if (basePath && (path === basePath || path.startsWith(`${basePath}/`))) {
+    let path = parsed.pathname;
+    if (basePath) {
+      if (path !== basePath && !path.startsWith(`${basePath}/`)) {
+        // Same origin but outside the registry's own path: not ours to route either.
+        return tarballUrl;
+      }
       path = path.slice(basePath.length);
     }
     const tarPath = `${path}${parsed.search}`.replace(/^\/+/, "");

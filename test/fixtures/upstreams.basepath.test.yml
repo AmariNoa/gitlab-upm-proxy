@@ -7,3 +7,8 @@ upstreams:
   - baseUrl: https://npm.example.org/registry
     scopes:
       - com.example.based.*
+  # A registry at an origin root, so its base path is empty. Only the origin check can stop a
+  # tarball hosted elsewhere from being rewritten under this one.
+  - baseUrl: https://npm2.example.org
+    scopes:
+      - com.example.rooted.*
