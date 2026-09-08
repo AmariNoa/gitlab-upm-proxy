@@ -516,3 +516,122 @@ test("プロジェクトスコープのtarball中継はレスポンスをその�
   assert.ok(existsSync(cachedPath), `cache file was not written: ${cachedPath}`);
   assert.deepEqual(readFileSync(cachedPath), tarballBytes);
 });
+
+// Regression for the second cycle: the npm passthrough used to discard the response GitLab
+// had just authorized and serve the cached document in its place whenever the latest version
+// matched. The cache is keyed on the upstream host and the package name with no group in it,
+// so two groups holding a package of the same name at the same latest version share one
+// entry - and the caller authorized for one group was shown the other group's metadata.
+test("npm中継はグループごとに認可された上流応答を返し、キャッシュで差し替えない", async (t: TestContext) => {
+  const packageName = "shared-name";
+  const version = "1.0.0";
+
+  const metadataFor = (group: string) => ({
+    name: packageName,
+    "dist-tags": { latest: version },
+    versions: {
+      [version]: {
+        name: packageName,
+        version,
+        // author and displayName present so the enrichment step has nothing to fetch.
+        author: { name: "Test Author" },
+        displayName: "Shared Name",
+        // The give-away: whose package this actually is.
+        repository: { url: `https://gitlab.example.com/${group}/${packageName}` },
+        dist: { tarball: `${DEFAULT_ORIGIN}/api/v4/groups/${group}/npm/${packageName}/-/${packageName}-${version}.tgz` }
+      }
+    }
+  });
+
+  // Group A asks first and populates the cache.
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: `/api/v4/groups/group-a/-/packages/npm/${packageName}`, method: "GET" })
+    .reply(200, metadataFor("group-a"), { headers: { "content-type": "application/json" } });
+
+  const app = await build(t);
+  const resA = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/group-a/${packageName}`,
+    headers: { "private-token": "valid-token" }
+  });
+  assert.equal(resA.statusCode, 200);
+  const bodyA = resA.json() as { versions: Record<string, { repository: { url: string } }> };
+  assert.match(bodyA.versions[version].repository.url, /group-a/);
+
+  // Group B asks next. GitLab authorizes and returns B's package, at the same latest version.
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: `/api/v4/groups/group-b/-/packages/npm/${packageName}`, method: "GET" })
+    .reply(200, metadataFor("group-b"), { headers: { "content-type": "application/json" } });
+
+  const resB = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/group-b/${packageName}`,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(resB.statusCode, 200);
+  const bodyB = resB.json() as { versions: Record<string, { repository: { url: string } }> };
+  assert.match(
+    bodyB.versions[version].repository.url,
+    /group-b/,
+    "the caller must get the metadata GitLab authorized for their own group"
+  );
+});
+
+// Regression for the second cycle: HEAD was forwarded upstream and then, because the response
+// carries the JSON content type, parsed as JSON. A HEAD response has no body, so parsing threw
+// and the caller got a 500 for a request the upstream had answered.
+test("JSONリソースへのHEADは上流の状態をそのまま返す", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: "/api/v4/groups/my-group/-/packages/npm/widget", method: "HEAD" })
+    .reply(200, "", { headers: { "content-type": "application/json" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "HEAD",
+    url: "/api/v4/groups/my-group/widget",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200, "a HEAD must not be turned into a server error");
+});
+
+// Regression for the second cycle: the upstream URL is rebuilt from route parameters, which
+// dropped the query string. The tarball URLs this proxy publishes keep whatever query the
+// upstream put on them - a signed download parameter, typically - so the download that comes
+// back has to carry it upstream too.
+test("上流への中継でクエリ文字列が保持される", async (t: TestContext) => {
+  mockValidUser();
+  const tarballBytes = Buffer.from("signed-download-bytes");
+  let seenPath = "";
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: (path) => {
+        if (!path.startsWith("/api/v4/groups/my-group/-/packages/npm/signed/-/signed-1.0.0.tgz")) {
+          return false;
+        }
+        seenPath = path;
+        return true;
+      },
+      method: "GET"
+    })
+    .reply(200, tarballBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/signed/-/signed-1.0.0.tgz?signature=abc&expires=1",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.match(seenPath, /signature=abc/, "the signed parameter must reach the upstream verbatim");
+  assert.match(seenPath, /expires=1/);
+});

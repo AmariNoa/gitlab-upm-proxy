@@ -857,6 +857,19 @@ function extractAuthor(value: unknown): string | undefined {
   return undefined;
 }
 
+// The published tarball URLs keep whatever query the upstream put on them (a signed
+// download parameter, typically), so the request that comes back carries it - but the
+// upstream URL is rebuilt from route parameters alone and used to drop it. The raw string
+// is appended verbatim: re-encoding a signature invalidates it.
+function appendRawQuery(url: string, req: any): string {
+  const raw = String(req?.raw?.url ?? "");
+  const queryStart = raw.indexOf("?");
+  if (queryStart < 0) return url;
+  const query = raw.slice(queryStart + 1);
+  if (!query) return url;
+  return url.includes("?") ? `${url}&${query}` : `${url}?${query}`;
+}
+
 function getUpstreamBaseForGroup(
   upstream: UpstreamEntry,
   groupEnc: string,
@@ -1472,7 +1485,10 @@ async function proxyGroupNpm(
     return;
   }
   const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
-  const upstreamUrl = getUpstreamBaseForGroup(upstream, groupEnc, normalizedRest);
+  const upstreamUrl = appendRawQuery(
+    getUpstreamBaseForGroup(upstream, groupEnc, normalizedRest),
+    req
+  );
 
   if (upstream.type === "vpm") {
     if (!packageName) {
@@ -1623,20 +1639,34 @@ async function proxyGroupNpm(
     await deletePackageCache(upstream, packageName);
   }
 
+  // A HEAD response carries the JSON content type but no body, so parsing it throws and the
+  // caller gets a 500 for a request the upstream answered perfectly well. Status and headers
+  // are all a HEAD can return anyway.
+  if (method === "HEAD") {
+    await res.body.dump();
+    reply.code(res.statusCode);
+    applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
+    reply.send();
+    return;
+  }
+
   if (contentType.includes("application/json")) {
     const json = (await res.body.json()) as any;
 
     if (json && typeof json === "object" && json.versions && typeof json.versions === "object") {
       if (packageName) {
         const latestVersion = getLatestVersionFromMetadata(json);
+        // The response GitLab just authorized for THIS caller is the only thing that may be
+        // served. Returning the cached document instead - which is what a matching latest
+        // version used to trigger - crosses group boundaries: the cache is keyed on the
+        // upstream host and the package name, with no group in it, so two groups holding a
+        // package of the same name at the same latest version share one entry, and whoever
+        // populated it first decided what everyone else sees. It also hid every change that
+        // left `latest` alone, a new prerelease or a removed version among them. Only the
+        // dist fields the proxy itself computed are carried over, below.
         const cached = await readMetadataCache(upstream.host, packageName);
-        if (cached && latestVersion && cached.latestVersion === latestVersion) {
-          const cachedMetadata = JSON.parse(JSON.stringify(cached.metadata));
-          rewriteTarballUrlsInMetadata(cachedMetadata, upstream, groupEnc);
-          reply.code(res.statusCode);
-          applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, true);
-          reply.type("application/json").send(cachedMetadata);
-          return;
+        if (cached?.metadata) {
+          mergeShasumFromCache(json, cached.metadata);
         }
 
         // Enrichment only fills in author and displayName from inside the tarball, so a
@@ -1836,7 +1866,10 @@ const routes: FastifyPluginAsync = async (app) => {
           return;
         }
 
-        const upstreamUrl = `${defaultUpstream.baseUrl}/api/v4/projects/${projectId}/packages/npm/${restPath}`;
+        const upstreamUrl = appendRawQuery(
+          `${defaultUpstream.baseUrl}/api/v4/projects/${projectId}/packages/npm/${restPath}`,
+          req
+        );
         const headers = buildUpstreamHeaders(req.headers as any);
 
         const method = req.method.toUpperCase();
@@ -1865,6 +1898,16 @@ const routes: FastifyPluginAsync = async (app) => {
 
         const res = await request(upstreamUrl, { method, headers, body: body as any });
         const contentType = String(res.headers["content-type"] ?? "");
+
+        // Same as the group route: a HEAD carries the JSON content type with no body, and
+        // parsing that turns a perfectly good upstream answer into a 500.
+        if (method === "HEAD") {
+          await res.body.dump();
+          reply.code(res.statusCode);
+          applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
+          reply.send();
+          return;
+        }
 
         if (contentType.includes("application/json")) {
           const json = (await res.body.json()) as any;
