@@ -90,6 +90,14 @@ VPM_MAX_EXTRACT_BYTES=1073741824
 VPM_MAX_EXTRACT_ENTRIES=20000
 ````
 
+The same applies to the npm passthrough, which relays a tarball by buffering it whole, and to
+the metadata enrichment download. Their ceiling is separate because the two kinds of traffic
+are configured independently:
+
+````
+MAX_UPSTREAM_BODY_BYTES=536870912
+````
+
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 

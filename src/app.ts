@@ -4,7 +4,7 @@ import AutoLoad, { AutoloadPluginOptions } from '@fastify/autoload'
 import { FastifyPluginAsync, FastifyServerOptions } from 'fastify'
 import "dotenv/config";
 import { createPrefetchLifecycle, startVpmPrefetch, stopVpmPrefetch } from "./lib/vpm-prefetch";
-import { validateDownloadLimits } from "./lib/http";
+import { validateDownloadLimits, validateUpstreamBodyLimit } from "./lib/http";
 import { validateExtractLimits } from "./lib/tgz";
 
 
@@ -42,6 +42,7 @@ const app: FastifyPluginAsync<AppOptions> = async (
   // typo in one of them stayed invisible until then. Reading them here makes a malformed value
   // stop the server, which is what an operator expects a configuration error to do.
   validateDownloadLimits();
+  validateUpstreamBodyLimit();
   validateExtractLimits();
 
   //

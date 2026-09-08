@@ -8,6 +8,7 @@ import {
   fetchBufferWithRedirects,
   fetchJsonWithRedirects,
   isSameOrigin,
+  readUpstreamBody,
   withoutCredentials,
   withoutResponseNarrowing
 } from "../lib/http";
@@ -1138,9 +1139,12 @@ async function downloadTarballToCache(
     await res.body.dump();
     throw new Error(`Tarball download failed: ${res.statusCode}`);
   }
-  const buffer = Buffer.from(await res.body.arrayBuffer());
+  const buffer = await readUpstreamBody(res as any);
   return await writeTarballCache(upstream.host, packageName, filename, buffer);
 }
+
+/** No hand-written package.json approaches this; anything larger is not a manifest. */
+const MAX_PACKAGE_JSON_BYTES = 8 * 1024 * 1024;
 
 async function readPackageInfoFromTarballPath(
   tarballPath: string
@@ -1151,7 +1155,12 @@ async function readPackageInfoFromTarballPath(
     await tar.x({
       file: tarballPath,
       cwd: tempDir,
-      filter: (p) => p === "package/package.json"
+      // Size-bounded as well as name-bounded: the archive comes from whoever publishes the
+      // package, and a package.json larger than this is not a manifest anyone wrote. Enrichment
+      // is best effort, so an archive that exceeds it simply yields nothing rather than being
+      // expanded onto the cache volume.
+      filter: (p, entry) =>
+        p === "package/package.json" && Number((entry as any)?.size ?? 0) <= MAX_PACKAGE_JSON_BYTES
     });
 
     const packageJsonPath = join(tempDir, "package", "package.json");
@@ -1850,7 +1859,7 @@ async function proxyGroupNpm(
 
   reply.code(res.statusCode);
   applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
-  const buffer = Buffer.from(await res.body.arrayBuffer());
+  const buffer = await readUpstreamBody(res as any);
   if (
     isTarball &&
     method === "GET" &&
@@ -1922,7 +1931,7 @@ async function proxyDefaultGitlabApi(req: any, reply: any): Promise<void> {
     reply.send();
     return;
   }
-  const buffer = Buffer.from(await res.body.arrayBuffer());
+  const buffer = await readUpstreamBody(res as any);
   reply.send(buffer);
 }
 
@@ -2053,7 +2062,7 @@ const routes: FastifyPluginAsync = async (app) => {
 
         reply.code(res.statusCode);
         applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
-        const buffer = Buffer.from(await res.body.arrayBuffer());
+        const buffer = await readUpstreamBody(res as any);
         if (
           isTarball &&
           method === "GET" &&
