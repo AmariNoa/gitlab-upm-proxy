@@ -746,8 +746,11 @@ async function serveVpmTarball(
       reply.send(tgzBuffer);
     }
     return true;
-  } catch {
-    reply.code(404).send();
+  } catch (err) {
+    // Same reasoning as the metadata path: a download, conversion or publication failure is not
+    // evidence that the archive does not exist.
+    req.log.info({ err, packageName: decodedName, version: decodedVersion }, "vpm_tarball_failed");
+    reply.code(failureStatus(err)).send();
     return true;
   }
 }
@@ -1139,6 +1142,43 @@ export function pathWithoutQuery(url: unknown): string {
 /** Statuses HTTP defines as carrying no message body, whatever Content-Type accompanies them. */
 function isBodylessStatus(statusCode: number): boolean {
   return statusCode === 204 || statusCode === 205 || statusCode === 304;
+}
+
+/**
+ * Errors raised by the upstream side of a request rather than by this proxy's own work.
+ *
+ * The distinction matters because a 404 is a statement about the package: it says the upstream
+ * confirmed the thing does not exist. A registry answering 503, a connection that failed, or a
+ * body over the ceiling say nothing of the sort - reporting them as absence tells a client to stop
+ * asking, and lets an intermediary cache that answer.
+ */
+/** Trailing HTTP status in an upstream failure message. */
+const UPSTREAM_STATUS_PATTERN = /:\s*(\d{3})$/;
+
+function isUpstreamFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return (
+    /^(vpm_index_failed|zip_download_failed|zip_download_too_large|upstream_body_too_large):/.test(
+      message
+    ) ||
+    message.endsWith("_redirects_exceeded") ||
+    message.startsWith("Tarball download failed:")
+  );
+}
+
+/**
+ * 404 only when an upstream actually said the thing is not there, 502 when it failed to answer,
+ * 500 when the failure was ours. Everything used to collapse into 404, which told clients and
+ * caches that a package was gone whenever a registry was merely unwell.
+ */
+function failureStatus(err: unknown): number {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  if (!isUpstreamFailure(err)) return 500;
+  // The upstream's own status, when the error carries one: "...failed:404" or "...failed: 404".
+  const matched = message.match(UPSTREAM_STATUS_PATTERN);
+  const status = matched ? Number(matched[1]) : NaN;
+  if (status === 404 || status === 410) return 404;
+  return 502;
 }
 
 function isCompleteTarballResponse(statusCode: number, headers: Record<string, unknown>): boolean {
@@ -1818,8 +1858,12 @@ async function proxyGroupNpm(
       reply.header("cache-control", "no-cache");
       reply.type("application/json").send(stripVpmOriginal(filterMetadataByShasum(metadata)));
       return;
-    } catch {
-      reply.code(404).send();
+    } catch (err) {
+      // Not 404: nothing here established that the package is absent. The index fetch failing, a
+      // body over the ceiling or a conversion error are all failures to answer, and saying "not
+      // found" invites the client - and any cache between - to believe the package is gone.
+      req.log.info({ err, packageName }, "vpm_metadata_failed");
+      reply.code(failureStatus(err)).send();
       return;
     }
   }

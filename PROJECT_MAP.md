@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 126 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-09 時点で 128 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -84,7 +84,13 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 - 環境変数ファイル: .env（Git 管理外。sample.env が雛形）、test/.env.test（テスト用。DOTENV_CONFIG_PATH で指定）
 - Git 管理外（.gitignore）: dist/、node_modules/、coverage/、.env、data/*、config/upstreams.yml、AGENTS.md、CLAUDE.md、docs/orchestration.md、docs/checkpoint.md
 
-### 並行性の前提（単一プロセス）
+## 応答ステータスの方針
+
+- 404 は上流が不在を確認した場合に限る（インデックスが正常に応答してそのパッケージを載せていない、上流が 404/410 を返した等）。
+- 上流が応答できなかった場合（インデックスの 5xx、接続失敗、本文の上限超過など）は 502、プロキシ自身の処理が失敗した場合は 500 を返す。
+- いずれの失敗も `vpm_metadata_failed` / `vpm_tarball_failed` としてログに残す。
+
+## 並行性の前提（単一プロセス）
 
 - キャッシュディレクトリ（TARBALL_CACHE_DIR）を書き換えるのは 1 プロセスだけ、という前提で実装している。metadata の read-modify-write（src/lib/cache.ts の updateMetadataCache）と zip から tgz への変換（src/lib/tgz.ts の runTempLocked）は Promise ベースのロック表で直列化しているが、このロックはプロセス内でしか効かない。
 - したがって、同一の TARBALL_CACHE_DIR を複数プロセス（多重起動、複数インスタンス、クラスタ構成）で共有する構成は想定していない。共有が必要になった場合は、ファイルロック等のプロセス間排他を別途導入する必要がある。
