@@ -1131,6 +1131,11 @@ function extractTarballFilenameFromUrl(url: string): string | null {
  * complete archive to every later request - and now that publication is atomic, it would do
  * so reliably.
  */
+/** Statuses HTTP defines as carrying no message body, whatever Content-Type accompanies them. */
+function isBodylessStatus(statusCode: number): boolean {
+  return statusCode === 204 || statusCode === 205 || statusCode === 304;
+}
+
 function isCompleteTarballResponse(statusCode: number, headers: Record<string, unknown>): boolean {
   if (statusCode !== 200) return false;
   return headers["content-range"] === undefined;
@@ -1767,8 +1772,10 @@ async function proxyGroupNpm(
 
   // A HEAD response carries the JSON content type but no body, so parsing it throws and the
   // caller gets a 500 for a request the upstream answered perfectly well. Status and headers
-  // are all a HEAD can return anyway.
-  if (method === "HEAD") {
+  // are all a HEAD can return anyway - and the same holds for any status defined to carry no
+  // body: a client's If-None-Match is forwarded, so a successful revalidation comes back as
+  // a bodyless 304 with the JSON content type still on it.
+  if (method === "HEAD" || isBodylessStatus(res.statusCode)) {
     await res.body.dump();
     reply.code(res.statusCode);
     applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
@@ -1930,7 +1937,7 @@ async function proxyDefaultGitlabApi(req: any, reply: any): Promise<void> {
 
   reply.code(res.statusCode);
   applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
-  if (method === "HEAD") {
+  if (method === "HEAD" || isBodylessStatus(res.statusCode)) {
     reply.send();
     return;
   }
@@ -2031,9 +2038,10 @@ const routes: FastifyPluginAsync = async (app) => {
         const res = await request(upstreamUrl, { method, headers, body: body as any });
         const contentType = String(res.headers["content-type"] ?? "");
 
-        // Same as the group route: a HEAD carries the JSON content type with no body, and
-        // parsing that turns a perfectly good upstream answer into a 500.
-        if (method === "HEAD") {
+        // Same as the group route: a HEAD, and any status defined to carry no body, arrive
+        // with the JSON content type and nothing to parse - turning a perfectly good
+        // upstream answer into a 500.
+        if (method === "HEAD" || isBodylessStatus(res.statusCode)) {
           await res.body.dump();
           reply.code(res.statusCode);
           applyUpstreamHeaders(reply, res.headers as Record<string, unknown>, false);
