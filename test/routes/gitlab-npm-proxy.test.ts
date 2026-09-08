@@ -1412,3 +1412,40 @@ test("検索のエラー応答本文も上限を超えると読み込まれな�
     delete process.env.MAX_UPSTREAM_BODY_BYTES;
   }
 });
+
+// Regression for the eighth round of the second review cycle: README claimed /-/whoami and /-/all
+// were handled by transparent passthrough. Under a group they are - like any other registry path.
+// At the root they are not: that route serves converted VPM tarballs and rejects anything else.
+// The documentation now says both things, and this pins them.
+test("グループ配下の /-/whoami は上流へ中継される", async (t: TestContext) => {
+  mockValidUser();
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: "/api/v4/groups/my-group/-/packages/npm/-/whoami",
+      method: "GET"
+    })
+    .reply(200, { username: "tester" }, { headers: { "content-type": "application/json" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/-/whoami",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().username, "tester");
+});
+
+test("ルートの /-/whoami は中継されず404になる", async (t: TestContext) => {
+  mockValidUser();
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/-/whoami",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 404, "the root /-/* route serves tarballs only");
+});
