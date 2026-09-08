@@ -69,6 +69,12 @@ test(
     await poller;
 
     // Whenever the final path existed at all, it already held the complete archive.
+    //
+    // The poller has to have seen it at least once, or this proves nothing: an empty
+    // observation list satisfies the loop below trivially, and the assertions after it hold
+    // for a direct write too. Catching the partial state itself remains best effort - the
+    // guarantee is that no partial size is ever observed, not that the window is always hit.
+    assert.ok(observedSizes.length > 0, "the poller must have observed the published file");
     for (const size of observedSizes) {
       assert.equal(size, payload.length, "the final path must never expose a partial tarball");
     }
