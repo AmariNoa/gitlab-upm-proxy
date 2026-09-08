@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import AutoLoad, { AutoloadPluginOptions } from '@fastify/autoload'
 import { FastifyPluginAsync, FastifyServerOptions } from 'fastify'
 import "dotenv/config";
-import { startVpmPrefetch } from "./lib/vpm-prefetch";
+import { startVpmPrefetch, stopVpmPrefetch } from "./lib/vpm-prefetch";
 
 
 export interface AppOptions extends FastifyServerOptions, Partial<AutoloadPluginOptions> {
@@ -35,6 +35,13 @@ const app: FastifyPluginAsync<AppOptions> = async (
 ): Promise<void> => {
   // Place here your custom code!
   startVpmPrefetch(fastify.log);
+
+  // Nothing awaits the prefetch, so without this a closed server kept downloading archives and
+  // writing them into a cache directory the process was finished with. Closing now stops it and
+  // waits for whatever critical section it is inside, so publication is never abandoned midway.
+  fastify.addHook("onClose", async () => {
+    await stopVpmPrefetch();
+  });
 
   // Do not touch the following lines
 

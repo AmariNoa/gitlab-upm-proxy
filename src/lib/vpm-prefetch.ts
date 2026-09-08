@@ -40,8 +40,61 @@ function parseFloatEnv(name: string): number {
   return parsed;
 }
 
+// Prefetch runs in the background, outside any request, so nothing awaits it and nothing used
+// to stop it: closing the server left it downloading archives and writing them into a cache
+// directory the process was done with, and its pacing timer kept the process alive on its own.
+// The flag below is the shutdown signal; every loop checks it between items, and a pass in its
+// pacing sleep is woken immediately rather than waited out.
+let prefetchStopping = false;
+const pendingSleeps = new Set<{ cancel: () => void }>();
+const runningPasses = new Set<Promise<unknown>>();
+
+/** True once shutdown started, so a loop can stop between items instead of mid-write. */
+function stopRequested(): boolean {
+  return prefetchStopping;
+}
+
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  if (prefetchStopping) return Promise.resolve();
+  return new Promise((resolve) => {
+    const entry = { cancel: () => {} };
+    const done = () => {
+      pendingSleeps.delete(entry);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    // Pacing between downloads is not a reason to hold the process open.
+    if (typeof (timer as any).unref === "function") (timer as any).unref();
+    entry.cancel = () => {
+      clearTimeout(timer);
+      done();
+    };
+    pendingSleeps.add(entry);
+  });
+}
+
+/** Tracks a background pass so shutdown can wait for the critical section it is inside. */
+function track<T>(pass: Promise<T>): Promise<T> {
+  runningPasses.add(pass);
+  void pass.catch(() => {}).finally(() => runningPasses.delete(pass));
+  return pass;
+}
+
+/**
+ * Stops the background prefetch and waits for whatever it is in the middle of. Called from the
+ * application's onClose hook, so a closed server leaves nothing writing behind it. Publication
+ * is already atomic and holds a per-package lock, so waiting here is what keeps a half-finished
+ * conversion from being abandoned rather than completed.
+ *
+ * The wait is bounded: passes only shrink the set (no new one starts while stopping), so a
+ * couple of rounds settle it, and the cap keeps a wedged pass from blocking shutdown forever.
+ */
+export async function stopVpmPrefetch(): Promise<void> {
+  prefetchStopping = true;
+  for (const entry of Array.from(pendingSleeps)) entry.cancel();
+  for (let round = 0; round < 5 && runningPasses.size > 0; round++) {
+    await Promise.allSettled(Array.from(runningPasses));
+  }
 }
 
 // Redirects are followed here for the same reason as on the request path: undici does not
@@ -321,6 +374,7 @@ export async function prefetchForUpstream(
   };
 
   for (const [name, pkg] of Object.entries(packages)) {
+    if (stopRequested()) return;
     if (!shouldIncludePackage(name, upstream.scopes)) continue;
     const versions = pkg?.versions;
     if (!versions) continue;
@@ -349,6 +403,7 @@ export async function prefetchForUpstream(
     });
 
     for (const [version, node] of versionEntries) {
+      if (stopRequested()) return;
       const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
       if (!sourceUrl) continue;
       node.dist = node.dist ?? {};
@@ -480,6 +535,7 @@ export async function prefetchForPackage(
   });
 
   for (const [version, node] of versionEntries) {
+    if (stopRequested()) return;
     const sourceUrl = typeof node?.dist?.original === "string" ? node.dist.original : "";
     if (!sourceUrl) continue;
     node.dist = node.dist ?? {};
@@ -580,6 +636,7 @@ async function prefetchVpmShasums(
   const intervalMs = Math.max(0, intervalSec * 1000);
 
   for (const upstream of upstreams) {
+    if (stopRequested()) return;
     log.info({ host: upstream.host }, "vpm_prefetch_start");
     await prefetchForUpstream(upstream, intervalMs, log);
     log.info({ host: upstream.host }, "vpm_prefetch_complete");
@@ -589,13 +646,19 @@ async function prefetchVpmShasums(
 export function startVpmPrefetch(
   log: { info: (obj: any, msg?: string) => void }
 ): void {
-  void (async () => {
-    try {
-      await prefetchVpmShasums(log);
-    } catch (err) {
-      log.info({ err }, "vpm_prefetch_failed");
-    }
-  })();
+  // A start is the beginning of a lifecycle, so it clears a stop left by a previous one: the
+  // same process can build a second server after closing the first, and that server's prefetch
+  // must run.
+  prefetchStopping = false;
+  track(
+    (async () => {
+      try {
+        await prefetchVpmShasums(log);
+      } catch (err) {
+        log.info({ err }, "vpm_prefetch_failed");
+      }
+    })()
+  );
 }
 
 export function startVpmPrefetchForPackage(
@@ -605,18 +668,23 @@ export function startVpmPrefetchForPackage(
   versions: Record<string, any>,
   vpmAuthor: unknown
 ): void {
+  // Unlike startVpmPrefetch this is triggered by a request, not by startup, so it must not
+  // revive a prefetch the shutdown just stopped.
+  if (stopRequested()) return;
   const key = `${upstream.host}|${packageName}`;
   if (runningPrefetch.has(key)) return;
   runningPrefetch.add(key);
-  void (async () => {
-    try {
-      const intervalSec = parseFloatEnv("VPM_PREFETCH_INTERVAL_SEC");
-      const intervalMs = Math.max(0, intervalSec * 1000);
-      await prefetchForPackage(upstream, packageName, versions, vpmAuthor, intervalMs, log);
-    } catch (err) {
-      log.info({ err, packageName }, "vpm_prefetch_failed");
-    } finally {
-      runningPrefetch.delete(key);
-    }
-  })();
+  track(
+    (async () => {
+      try {
+        const intervalSec = parseFloatEnv("VPM_PREFETCH_INTERVAL_SEC");
+        const intervalMs = Math.max(0, intervalSec * 1000);
+        await prefetchForPackage(upstream, packageName, versions, vpmAuthor, intervalMs, log);
+      } catch (err) {
+        log.info({ err, packageName }, "vpm_prefetch_failed");
+      } finally {
+        runningPrefetch.delete(key);
+      }
+    })()
+  );
 }
