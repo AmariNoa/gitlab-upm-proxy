@@ -34,7 +34,7 @@ export function validateExtractLimits(): void {
  * it. Absolute paths and `..` segments are a property of the archive, so they are attacker
  * controlled in exactly the same way its size is.
  */
-function resolveEntryPath(targetDir: string, entryPath: string): string {
+function resolveEntryPath(targetDir: string, entryPath: string, allowRoot = false): string {
   const normalized = entryPath.replace(/\\/g, "/");
   if (isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
     throw new Error(`zip_entry_outside_target:${entryPath}`);
@@ -45,7 +45,14 @@ function resolveEntryPath(targetDir: string, entryPath: string): string {
   // Only a path that actually climbs out is rejected. A leading ".." is not enough on its own:
   // "..notes" and "..assets/file.txt" are ordinary names that resolve inside the target, and
   // refusing them failed the whole conversion for a package that did nothing wrong.
-  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || rel.split(sep).includes("..")) {
+  //
+  // `rel === ""` is the extraction root itself. For a file entry that is nonsense and stays an
+  // error; for a directory record it is the "./" marker a perfectly ordinary zip carries, and
+  // rejecting it failed the conversion of a package that did nothing wrong either.
+  if (rel === "" && !allowRoot) {
+    throw new Error(`zip_entry_outside_target:${entryPath}`);
+  }
+  if (rel === ".." || rel.startsWith(`..${sep}`) || rel.split(sep).includes("..")) {
     throw new Error(`zip_entry_outside_target:${entryPath}`);
   }
   return full;
@@ -72,8 +79,12 @@ export async function unzipToDirectory(zipPath: string, targetDir: string): Prom
   const directory = await unzipper.Open.file(zipPath);
   const directories = directory.files.filter((file) => file.type === "Directory");
   const files = directory.files.filter((file) => file.type !== "Directory");
-  if (files.length > entryLimit) {
-    throw new Error(`zip_too_many_entries:${files.length}`);
+  // Directories count too. They hold no bytes, so an archive of nothing but empty directories
+  // weighs nothing against the byte ceiling - but each one is still a real directory to create,
+  // costing an inode and the time to make it, and counting only files let hundreds of thousands
+  // of them through.
+  if (directories.length + files.length > entryLimit) {
+    throw new Error(`zip_too_many_entries:${directories.length + files.length}`);
   }
   let declared = 0;
   for (const file of files) {
@@ -85,9 +96,11 @@ export async function unzipToDirectory(zipPath: string, targetDir: string): Prom
   }
 
   // Before the files, so an entry that only exists as a directory record survives even when the
-  // archive lists nothing inside it. Their paths go through the same containment check.
+  // archive lists nothing inside it. Their paths go through the same containment check, which
+  // permits the extraction root because "./" is an ordinary record to find in a zip.
   for (const entry of directories) {
-    await mkdir(resolveEntryPath(targetDir, entry.path.replace(/\/+$/, "")), { recursive: true });
+    const trimmed = entry.path.replace(/\/+$/, "");
+    await mkdir(resolveEntryPath(targetDir, trimmed, true), { recursive: true });
   }
 
   let written = 0;

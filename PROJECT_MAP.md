@@ -50,7 +50,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 |------|---------|------|
 | ビルド | `npm run build:ts` | tsc で src/ を dist/ へコンパイル |
 | 型チェック（テスト含む） | `npx tsc -p test/tsconfig.json` | noEmit。src と test を対象 |
-| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 105 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
+| テスト | `npm test` | 型チェック（test/tsconfig.json）の後に node:test を実行。2026-09-08 時点で 107 ケース（test/routes 8 ファイル、test/lib 5 ファイル）。対象ファイルは package.json の test スクリプトに列挙しており、テストを追加したらここへも追記する。ts-node/register で動かすため tsx は不要 |
 | lint / formatter | 設定なし | ESLint・Prettier の設定ファイルは無い |
 
 ## テストファイル
@@ -73,7 +73,7 @@ Node.js: README の想定は 20 系（開発機では 24 系でも動作）。
 | NPM_SIGNATURE_PRIVATE_KEY_PEM | 任意 | 署名鍵 PEM を直接注入（KEY_PATH より優先） |
 | VPM_MAX_DOWNLOAD_BYTES | 任意 | 上流アーカイブ 1 件をメモリへ読み込む上限バイト数（既定: 536870912 = 512 MiB）。Content-Length が上限超過なら本文を読まずに拒否し、実受信量も監視する |
 | VPM_MAX_EXTRACT_BYTES | 任意 | zip 展開後の合計バイト数の上限（既定: 1073741824 = 1 GiB）。中央ディレクトリの申告値で事前に拒否し、実書き込み量も監視する |
-| VPM_MAX_EXTRACT_ENTRIES | 任意 | zip 内のファイルエントリ数の上限（既定: 20000） |
+| VPM_MAX_EXTRACT_ENTRIES | 任意 | zip 内のエントリ数の上限（ファイルとディレクトリの合計。既定: 20000） |
 | （上記 3 つの上限の検証） | - | src/app.ts が起動時に 1 度読み出すため、正の整数でない値は起動を止める。未設定なら既定値 |
 
 ### 設定ファイル
