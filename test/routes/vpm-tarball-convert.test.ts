@@ -707,3 +707,78 @@ test(
     assert.deepEqual(cachedTgz, res.rawPayload);
   }
 );
+
+// Regression for the eighth round of the second review cycle. The previous round taught both
+// aliases that a scoped package NAME spans two segments, and stopped there: the filename of a
+// scoped package carries the scope too, so it spans two segments as well once the router decodes
+// the slash. Taking one segment left "@vpmscope" as the whole filename, the ".tgz" check failed,
+// and the request fell through to the ordinary npm upstream.
+test(
+  "旧形式 /npm/<package>/-/<file> はスコープ付きファイル名も解決する",
+  async (t: TestContext) => {
+    const packageName = "@vpmscope/filename";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = "/dl/vpmscope-filename-1.0.0.zip";
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/npm/${encodeURIComponent(packageName)}/-/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "the scope must survive in the filename as well as the name");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+  }
+);
+
+test(
+  "旧形式 /vpm/<package>/<file> のファイル名形式でもスコープが保たれる",
+  async (t: TestContext) => {
+    const packageName = "@vpmscope/vpmfile";
+    const version = "1.0.0";
+    const cacheKey = `${packageName}-${version}.tgz`;
+    const zipPath = "/dl/vpmscope-vpmfile-1.0.0.zip";
+    const zipUrl = `${VPM_ORIGIN}${zipPath}`;
+
+    const zipBuffer = buildStoredZip([
+      {
+        name: "package.json",
+        data: Buffer.from(
+          JSON.stringify({ name: packageName, version, author: { name: "Zip Author" } }, null, 2),
+          "utf-8"
+        )
+      }
+    ]);
+
+    mockZipDownload(zipPath, zipBuffer);
+    await seedVpmTarballMetadata(packageName, version, zipUrl);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/vpm/${encodeURIComponent(packageName)}/${encodeURIComponent(cacheKey)}`,
+      headers: { "private-token": "valid-token" }
+    });
+
+    assert.equal(res.statusCode, 200, "the filename form must resolve the scope too");
+    const cachedTgz = await readFile(getTarballCachePath(VPM_HOST, packageName, cacheKey));
+    assert.deepEqual(cachedTgz, res.rawPayload);
+  }
+);

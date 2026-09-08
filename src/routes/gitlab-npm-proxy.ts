@@ -1597,7 +1597,11 @@ async function proxyGroupNpm(
     const dashIndex = rest.indexOf("-");
     if ((dashIndex === 1 || (dashIndex === 2 && (rest[0] ?? "").startsWith("@"))) && rest.length > dashIndex + 1) {
       const decodedName = rest.slice(0, dashIndex).join("/");
-      const decodedFile = rest[dashIndex + 1] ?? "";
+      // Everything after the separator, not just the next segment: the filename of a scoped
+      // package carries the scope too, so it spans two segments once the router has decoded the
+      // slash. Taking one segment left "@scope" as the whole filename and the request fell
+      // through to the ordinary npm upstream.
+      const decodedFile = rest.slice(dashIndex + 1).join("/");
       const prefix = `${decodedName}-`;
       if (decodedName && decodedFile.startsWith(prefix) && decodedFile.endsWith(".tgz")) {
         const decodedVersion = decodedFile.slice(prefix.length, -4);
@@ -1629,7 +1633,9 @@ async function proxyGroupNpm(
     const rest = parts.slice(1);
     const scoped = (rest[0] ?? "").startsWith("@") && rest.length >= 3;
     const decodedName = scoped ? `${rest[0]}/${rest[1]}` : (rest[0] ?? "");
-    const decodedFile = (scoped ? rest[2] : rest[1]) ?? "";
+    // Same reason as the npm/ branch: this form also accepts a full filename in place of a bare
+    // version, and a scoped one spans two segments.
+    const decodedFile = rest.slice(scoped ? 2 : 1).join("/");
     let decodedVersion = "";
     if (decodedFile.endsWith(".tgz")) {
       const base = decodedFile.slice(0, -4);
