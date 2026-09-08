@@ -488,6 +488,26 @@ async function fillAuthorFromTgzIfNeeded(
   }
 }
 
+// VPM only, and deliberately not part of mergeShasumFromCache, which the npm passthrough
+// also uses: there the upstream registry's fields are authoritative. Here the proxy owns
+// them, and a version that is on disk WITHOUT a shasum has had its availability cleared -
+// the prefetch does that when it deletes an archive whose metadata it could not publish.
+// mergeShasumFromCache skips such an entry (it has nothing to copy), so a snapshot taken
+// before the rollback would otherwise write its own shasum and signature back and undo the
+// cleanup permanently. A snapshot can never hold a NEWER shasum than disk on this path: the
+// metadata route only ever reuses shasums, it does not compute them.
+function clearAvailabilityDroppedOnDisk(target: any, cached: any): void {
+  if (!isPlainObject(target?.versions) || !isPlainObject(cached?.versions)) return;
+  for (const [version, node] of Object.entries<any>(target.versions)) {
+    const cachedDist = cached.versions[version]?.dist;
+    if (!cachedDist || cachedDist.shasum) continue;
+    if (!node?.dist) continue;
+    delete node.dist.shasum;
+    delete node.dist.integrity;
+    delete node.dist.signatures;
+  }
+}
+
 // Exported for tests, like mergeShasumFromCache: the interleaving it has to survive (a
 // prefetch publishing a version between this request's snapshot and its write) cannot be
 // driven deterministically through the HTTP routes.
@@ -509,6 +529,7 @@ export async function refreshCachedVpmMetadata(
   await updateMetadataCache(upstream.host, packageName, (current) => {
     if (current?.metadata) {
       mergeShasumFromCache(metadata, current.metadata);
+      clearAvailabilityDroppedOnDisk(metadata, current.metadata);
       insertVersionsAddedSinceBaseline(metadata, current.metadata, baseline);
     }
     // Chosen after the merge, so a version added by a concurrent writer can still be the
@@ -883,6 +904,62 @@ function rewriteTarballUrlsInMetadata(
     if (typeof tar === "string") {
       v.dist.tarball = rewriteTarballUrl(tar, upstream, groupEnc);
     }
+  }
+}
+
+// `typeof null` and `typeof []` are both "object", and an index whose `packages` is either
+// of those is malformed rather than empty. Nothing destructive may be derived from it.
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Applies a package-level withdrawal. Deleting the whole package would take versions the
+ * request never saw - published by another writer from a newer index while this one was in
+ * flight - so only the versions the baseline knew about are removed, together with their
+ * archives. The package itself goes only when that leaves nothing behind.
+ */
+async function removeWithdrawnPackage(
+  upstream: UpstreamEntry,
+  packageName: string,
+  baselineMetadata: any
+): Promise<void> {
+  const baselineVersions = isPlainObject(baselineMetadata?.versions)
+    ? baselineMetadata.versions
+    : {};
+  const removed: string[] = [];
+  let nothingLeft = false;
+
+  await updateMetadataCache(upstream.host, packageName, (current) => {
+    const target = current?.metadata;
+    if (!isPlainObject(target?.versions)) {
+      nothingLeft = true;
+      return null;
+    }
+    for (const version of Object.keys(target.versions)) {
+      if (baselineVersions[version] === undefined) continue;
+      delete target.versions[version];
+      removed.push(version);
+    }
+    if (Object.keys(target.versions).length === 0) {
+      nothingLeft = true;
+      return null;
+    }
+    return {
+      latestVersion: pickLatestVpmVersion(target.versions) ?? "",
+      author: current?.author,
+      displayName: current?.displayName,
+      metadata: target
+    };
+  });
+
+  if (nothingLeft) {
+    await deletePackageCache(upstream, packageName);
+    return;
+  }
+  for (const version of removed) {
+    const path = getTarballCachePath(upstream.host, packageName, `${packageName}-${version}.tgz`);
+    await rm(path, { force: true }).catch(() => {});
   }
 }
 
@@ -1414,18 +1491,28 @@ async function proxyGroupNpm(
       // still publishes - it is a malformed or truncated document, and fetchVpmIndex only
       // checks the status code and content type. Treating it as "everything is withdrawn"
       // would delete the whole package, archives included, on a 200 carrying `{}`.
-      if (!index.packages || typeof index.packages !== "object") {
+      if (!isPlainObject(index.packages)) {
         reply.code(404).send();
         return;
       }
-      const versions = index.packages[packageName]?.versions;
+      const listed = Object.prototype.hasOwnProperty.call(index.packages, packageName);
+      const listedVersions = listed ? (index.packages as any)[packageName]?.versions : undefined;
+      if (listed && !isPlainObject(listedVersions)) {
+        // The index does name this package but the entry is unusable. That says the
+        // document is malformed, not that the package was withdrawn, so nothing is
+        // removed.
+        reply.code(404).send();
+        return;
+      }
+      const versions = listedVersions as Record<string, any> | undefined;
       if (!versions) {
         // Same rule as for individual versions: only what the baseline knew about may be
-        // treated as withdrawn. A package that appeared on disk after this request read
-        // the cache was published by another writer, whose index is at least as fresh as
-        // the one read here - deleting it would destroy that writer's work.
+        // treated as withdrawn. Versions that appeared on disk after this request read the
+        // cache were published by another writer, whose index is at least as fresh as the
+        // one read here, so they survive - and the package as a whole is only removed once
+        // nothing is left.
         if (baselineCache) {
-          await deletePackageCache(upstream, packageName);
+          await removeWithdrawnPackage(upstream, packageName, baselineCache.metadata);
         }
         reply.code(404).send();
         return;
@@ -1484,11 +1571,14 @@ async function proxyGroupNpm(
       // tgz yet, the dist.original that tarball requests resolve from, and the _vpmAuthor used to
       // fill in a missing author.
       await applyVpmSignaturesFromCache(upstream, packageName, metadata);
-      if (latestVersion) {
-        // baselineCache, not cachedForMerge: the baseline has to predate the index fetch,
-        // or a version published while that request was in flight looks like a withdrawal.
-        await refreshCachedVpmMetadata(upstream, packageName, metadata, baselineCache?.metadata);
-      }
+      // Unconditional on purpose. An index that lists the package with an empty versions map
+      // is a valid statement - everything was withdrawn - and pickLatestVpmVersion returns
+      // null for it. Skipping the refresh there left every cached version on disk, so the
+      // withdrawal was reported to the caller but never reconciled, for good.
+      //
+      // baselineCache, not cachedForMerge: the baseline has to predate the index fetch, or a
+      // version published while that request was in flight looks like a withdrawal.
+      await refreshCachedVpmMetadata(upstream, packageName, metadata, baselineCache?.metadata);
 
       reply.code(200);
       reply.header("cache-control", "no-cache");

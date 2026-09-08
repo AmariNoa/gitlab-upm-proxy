@@ -529,3 +529,185 @@ test(
     assert.equal(disk!.metadata.versions[version].dist.integrity, "sha512-CONCURRENT");
   }
 );
+
+// Regression for the tenth review round: an index entry that names the package but carries no
+// usable versions map is a malformed document, not a withdrawal, and must not delete anything.
+test(
+  "パッケージを列挙しつつversionsが不正なインデックスでは、キャッシュを削除しない",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.badentry";
+    const version = "1.0.0";
+    const marker = "bad-entry";
+
+    await writeMetadataCache(VPM_HOST, packageName, {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: { tarball: "", shasum: "f".repeat(40), integrity: "sha512-KEEP-ENTRY", signatures: [] }
+          }
+        }
+      }
+    });
+
+    mockVpmIndex(marker, { packages: { [packageName]: {} } });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 404);
+    const disk = await readMetadataCache(VPM_HOST, packageName);
+    assert.ok(disk, "a malformed entry must not delete the cache");
+    assert.equal(disk!.metadata.versions[version].dist.integrity, "sha512-KEEP-ENTRY");
+  }
+);
+
+// And a withdrawal of the whole package removes only what the baseline knew about: a version
+// another writer published while the index request was in flight has to survive.
+test(
+  "パッケージ全体の削除でも、基準以後に公開された版は残る",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.partialwithdraw";
+    const known = "1.0.0";
+    const concurrent = "2.0.0";
+    const marker = "partial-withdraw";
+
+    const distFor = (sig: string) => ({
+      tarball: "",
+      shasum: "9".repeat(40),
+      integrity: `sha512-${sig}`,
+      signatures: []
+    });
+
+    // The baseline: only 1.0.0 is cached when the request starts.
+    await writeMetadataCache(VPM_HOST, packageName, {
+      latestVersion: known,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: known },
+        versions: {
+          [known]: { name: packageName, version: known, author: { name: "A" }, dist: distFor("KNOWN") }
+        }
+      }
+    });
+
+    // 2.0.0 is published from inside the index reply: after the baseline, before the answer.
+    mockAgent
+      .get(VPM_ORIGIN)
+      .intercept({
+        path: "/index.json",
+        method: "GET",
+        headers(headers) {
+          return normalizeHeaders(headers)["x-vpm-test-route"] === marker;
+        }
+      })
+      .reply(() => {
+        const metadataPath = getMetadataCachePath(VPM_HOST, packageName);
+        mkdirSync(dirname(metadataPath), { recursive: true });
+        writeFileSync(
+          metadataPath,
+          JSON.stringify(
+            {
+              latestVersion: concurrent,
+              metadata: {
+                name: packageName,
+                "dist-tags": { latest: concurrent },
+                versions: {
+                  [known]: { name: packageName, version: known, author: { name: "A" }, dist: distFor("KNOWN") },
+                  [concurrent]: {
+                    name: packageName,
+                    version: concurrent,
+                    author: { name: "A" },
+                    dist: distFor("CONCURRENT")
+                  }
+                }
+              }
+            },
+            null,
+            2
+          ),
+          "utf-8"
+        );
+        // The package itself is gone from this (older) index.
+        return {
+          statusCode: 200,
+          data: { packages: {} },
+          responseOptions: { headers: { "content-type": "application/json" } }
+        };
+      })
+      .persist();
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 404);
+    const disk = await readMetadataCache(VPM_HOST, packageName);
+    assert.ok(disk, "the package must survive because a version was published concurrently");
+    assert.equal(disk!.metadata.versions[known], undefined, "the withdrawn version goes");
+    assert.ok(disk!.metadata.versions[concurrent], "the concurrent publication stays");
+    assert.equal(disk!.latestVersion, concurrent);
+  }
+);
+
+// Regression for the tenth review round: an index listing the package with an empty versions
+// map is a valid statement that everything was withdrawn, but pickLatestVpmVersion returns
+// null for it and the refresh was skipped on that condition - so the response reported the
+// withdrawal while the cache kept every version for good.
+test(
+  "versionsが空のインデックスでも、キャッシュ側の版が反映される",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.emptyversions";
+    const version = "1.0.0";
+    const marker = "empty-versions";
+
+    await writeMetadataCache(VPM_HOST, packageName, {
+      latestVersion: version,
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: version },
+        versions: {
+          [version]: {
+            name: packageName,
+            version,
+            author: { name: "Test Author" },
+            dist: { tarball: "", shasum: "8".repeat(40), integrity: "sha512-GONE", signatures: [] }
+          }
+        }
+      }
+    });
+
+    mockVpmIndex(marker, { packages: { [packageName]: { versions: {} } } });
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as { versions: Record<string, unknown> };
+    assert.deepEqual(Object.keys(body.versions), [], "nothing is advertised any more");
+
+    const disk = await readMetadataCache(VPM_HOST, packageName);
+    assert.ok(disk, "the cache entry itself may stay");
+    assert.equal(
+      disk!.metadata.versions[version],
+      undefined,
+      "but the withdrawn version must be reconciled away, not kept forever"
+    );
+  }
+);
