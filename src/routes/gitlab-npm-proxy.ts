@@ -190,6 +190,20 @@ const HOP_BY_HOP_HEADERS = [
 const BODY_DEPENDENT_HEADERS = ["content-length", "etag", "content-md5", "digest", "content-digest", "repr-digest"];
 
 /**
+ * Reconciles a snapshot about to be written against what is on disk right now.
+ *
+ * Exported and shared because two writers persist VPM metadata - the metadata route and search -
+ * and every time one of them gained a rule the other kept the old behaviour until a later review
+ * round found it. There is one rule set now, and both call it.
+ */
+export function reconcileAgainstDisk(metadata: any, cached: any, baseline?: any): void {
+  if (!cached) return;
+  mergeShasumFromCache(metadata, cached);
+  clearAvailabilityDroppedOnDisk(metadata, cached);
+  insertVersionsAddedSinceBaseline(metadata, cached, baseline);
+}
+
+/**
  * Copies an upstream response's headers onto the reply.
  *
  * `bodyRewritten` says the body being sent is the proxy's own rendering rather than the upstream's
@@ -550,11 +564,7 @@ export async function refreshCachedVpmMetadata(
   // signed/hashed by a concurrent request or prefetch pass between that earlier read and
   // this write would have its dist fields silently discarded.
   await updateMetadataCache(upstream.host, packageName, (current) => {
-    if (current?.metadata) {
-      mergeShasumFromCache(metadata, current.metadata);
-      clearAvailabilityDroppedOnDisk(metadata, current.metadata);
-      insertVersionsAddedSinceBaseline(metadata, current.metadata, baseline);
-    }
+    reconcileAgainstDisk(metadata, current?.metadata, baseline);
     // Chosen after the merge, so a version added by a concurrent writer can still be the
     // latest one rather than being rolled back to whatever this snapshot knew.
     const latestVersion = pickLatestVpmVersion(metadata?.versions);
@@ -1490,16 +1500,12 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
           // on disk that `metadata` (rebuilt fresh from the VPM index) is missing, so a
           // concurrent writer's update is not discarded by this write.
           await updateMetadataCache(upstream.host, name, (current) => {
-            if (current?.metadata) {
-              mergeShasumFromCache(metadata, current.metadata);
-              // No baseline here on purpose. Search walks packages out of an index it has
-              // already fetched, so any per-package cache read happens after that fetch and
-              // cannot tell a concurrent publication from a withdrawal - using it would
-              // delete versions another writer had just published. Everything on disk is
-              // kept instead, and withdrawals are reconciled by the metadata route, which
-              // does read its baseline before fetching the index.
-              insertVersionsAddedSinceBaseline(metadata, current.metadata, undefined);
-            }
+            // No baseline on purpose. Search walks packages out of an index it has already
+            // fetched, so any per-package cache read happens after that fetch and cannot tell a
+            // concurrent publication from a withdrawal - using one would delete versions another
+            // writer had just published. Everything on disk is kept instead, and withdrawals are
+            // reconciled by the metadata route, which does read its baseline before the fetch.
+            reconcileAgainstDisk(metadata, current?.metadata, undefined);
             return {
               latestVersion: pickLatestVpmVersion(metadata?.versions) ?? latestVersion,
               author: extractAuthor(metadata?.author),
