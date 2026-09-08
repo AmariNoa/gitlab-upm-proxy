@@ -1618,13 +1618,26 @@ function rawRestFromRequest(req: any, decodedRest: string): string | null {
   const raw =
     typeof req?.raw?.url === "string" ? req.raw.url : typeof req?.url === "string" ? req.url : "";
   const rawSegments = pathWithoutQuery(raw).replace(/^\/+/, "").split("/").filter(Boolean);
-  const decodedSegments = decodedRest.replace(/^\/+/, "").split("/").filter(Boolean);
-  // Counted from the end, not the start: the rest path is whatever the wildcard matched, and
-  // taking a fixed number of leading segments assumed the routes are mounted exactly where they
-  // are today. Under a prefix the count would silently include part of the prefix instead.
-  if (decodedSegments.length === 0) return null;
-  if (rawSegments.length < decodedSegments.length) return null;
-  return rawSegments.slice(rawSegments.length - decodedSegments.length).join("/");
+  const target = decodedRest.replace(/^\/+/, "");
+  if (!target) return null;
+  // Found by decoding, not by counting. Neither a fixed number of leading segments (which assumes
+  // the routes are mounted exactly where they are today) nor a matching count of trailing ones
+  // works: an encoded slash makes one raw segment decode into two, so "%40scope%2Fpkg" is one
+  // segment in the URL and two in the value the router hands over. The shortest trailing run whose
+  // decoding is the rest path is the rest path, wherever the routes are mounted and whatever the
+  // caller encoded.
+  for (let take = 1; take <= rawSegments.length; take++) {
+    const candidate = rawSegments.slice(rawSegments.length - take);
+    let decoded: string;
+    try {
+      decoded = candidate.map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      // Not valid percent-encoding, so it cannot be the decoded value the router produced.
+      continue;
+    }
+    if (decoded === target) return candidate.join("/");
+  }
+  return null;
 }
 
 /**
@@ -2054,9 +2067,16 @@ async function proxyGlobalTarball(req: any, reply: any, restPath: string): Promi
   }
 }
 
+/** The endpoint this route stands for, whatever path the application is mounted under. */
+const PERSONAL_ACCESS_TOKEN_SELF_PATH = "/api/v4/personal_access_tokens/self";
+
 async function proxyDefaultGitlabApi(req: any, reply: any): Promise<void> {
-  const rawUrl = typeof req.raw?.url === "string" ? req.raw.url : req.url;
-  const upstreamUrl = `${defaultUpstream.baseUrl}${rawUrl}`;
+  // Built from the endpoint, not from the incoming URL: concatenating the raw URL sent GitLab the
+  // application's own mount prefix as part of its API path, so the request went nowhere real.
+  const upstreamUrl = appendRawQuery(
+    `${defaultUpstream.baseUrl}${PERSONAL_ACCESS_TOKEN_SELF_PATH}`,
+    req
+  );
   const method = req.method.toUpperCase();
   const body = method === "GET" || method === "HEAD" ? undefined : (req.body as any);
 

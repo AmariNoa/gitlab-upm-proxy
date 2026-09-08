@@ -85,3 +85,70 @@ test(
     }
   }
 );
+
+// Regression for the ninth round of the second review cycle. Locating the raw rest path by
+// counting trailing segments looked equivalent to counting leading ones, and is not: an encoded
+// slash makes one raw segment decode into two, so a scoped name is one segment in the URL and two
+// in the value the router hands over. Counting from the end then took one segment too many and
+// swept the group in with it. The previous round's test used an unscoped name and never saw it.
+test(
+  "スコープ付き名前でも、上流へは正しいrestパスが送られる",
+  async () => {
+    const packageName = "@scope/mounted";
+
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({
+        path: `/api/v4/groups/my-group/-/packages/npm/${encodeURIComponent(packageName)}`,
+        method: "GET"
+      })
+      .reply(200, { name: packageName, "dist-tags": { latest: "1.0.0" }, versions: {} }, {
+        headers: { "content-type": "application/json" }
+      });
+
+    const server = Fastify({ logger: false });
+    void server.register(routes);
+    await server.ready();
+    try {
+      const res = await server.inject({
+        method: "GET",
+        url: `/api/v4/groups/my-group/${encodeURIComponent(packageName)}`,
+        headers: { "private-token": "valid-token" }
+      });
+
+      assert.equal(res.statusCode, 200, "the group must not be swept into the rest path");
+      assert.equal(res.json().name, packageName);
+    } finally {
+      await server.close();
+    }
+  }
+);
+
+// Regression for the same round: the /self route concatenated the incoming raw URL onto the
+// upstream base, so under a mount prefix GitLab was asked for "/proxy/api/v4/..." - a path that
+// does not exist there. The endpoint is fixed, so it is built from the endpoint.
+test(
+  "プレフィックス付きでも /self はGitLabの正しいAPIパスへ中継される",
+  async () => {
+    mockAgent
+      .get(DEFAULT_ORIGIN)
+      .intercept({ path: "/api/v4/personal_access_tokens/self", method: "GET" })
+      .reply(200, { id: 7, scopes: ["api"] }, { headers: { "content-type": "application/json" } });
+
+    const server = Fastify({ logger: false });
+    void server.register(routes, { prefix: "/proxy" });
+    await server.ready();
+    try {
+      const res = await server.inject({
+        method: "GET",
+        url: "/proxy/api/v4/personal_access_tokens/self",
+        headers: { "private-token": "valid-token" }
+      });
+
+      assert.equal(res.statusCode, 200, "the mount prefix must not become part of the API path");
+      assert.equal(res.json().id, 7);
+    } finally {
+      await server.close();
+    }
+  }
+);
