@@ -36,7 +36,10 @@ function resolveEntryPath(targetDir: string, entryPath: string): string {
   const base = resolvePath(targetDir);
   const full = resolvePath(base, normalized);
   const rel = relative(base, full);
-  if (rel === "" || rel.startsWith("..") || rel.split(sep).includes("..")) {
+  // Only a path that actually climbs out is rejected. A leading ".." is not enough on its own:
+  // "..notes" and "..assets/file.txt" are ordinary names that resolve inside the target, and
+  // refusing them failed the whole conversion for a package that did nothing wrong.
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || rel.split(sep).includes("..")) {
     throw new Error(`zip_entry_outside_target:${entryPath}`);
   }
   return full;
@@ -51,12 +54,17 @@ function resolveEntryPath(targetDir: string, entryPath: string): string {
  * actually written are counted as well and the extraction is abandoned the moment they exceed the
  * ceiling. Callers already remove the temp directory on failure, so a partial extraction does not
  * survive the throw.
+ *
+ * Directory entries are created even when empty. Dropping them would be a silent difference from
+ * what the archive holds: a Unity package's empty folder still has a sibling .meta file, so the
+ * converted tarball would describe a folder it does not contain.
  */
 export async function unzipToDirectory(zipPath: string, targetDir: string): Promise<void> {
   const byteLimit = maxExtractBytes();
   const entryLimit = maxExtractEntries();
 
   const directory = await unzipper.Open.file(zipPath);
+  const directories = directory.files.filter((file) => file.type === "Directory");
   const files = directory.files.filter((file) => file.type !== "Directory");
   if (files.length > entryLimit) {
     throw new Error(`zip_too_many_entries:${files.length}`);
@@ -68,6 +76,12 @@ export async function unzipToDirectory(zipPath: string, targetDir: string): Prom
   }
   if (declared > byteLimit) {
     throw new Error(`zip_expanded_too_large:${declared}`);
+  }
+
+  // Before the files, so an entry that only exists as a directory record survives even when the
+  // archive lists nothing inside it. Their paths go through the same containment check.
+  for (const entry of directories) {
+    await mkdir(resolveEntryPath(targetDir, entry.path.replace(/\/+$/, "")), { recursive: true });
   }
 
   let written = 0;
