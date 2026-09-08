@@ -225,7 +225,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/gitlab-upm-proxy
-ExecStart=/usr/local/bin/fastify start -l info -a 0.0.0.0 -p 3000 /opt/gitlab-upm-proxy/dist/app.js
+ExecStart=/usr/local/bin/fastify start --options -l info -a 0.0.0.0 -p 3000 /opt/gitlab-upm-proxy/dist/app.js
 Environment=PUBLIC_BASE_URL=https://upm.example.com
 Environment=TARBALL_CACHE_DIR=/var/lib/gitlab-upm-proxy/cache
 Environment=UPSTREAM_CONFIG_PATH=/opt/gitlab-upm-proxy/config/upstreams.yml
