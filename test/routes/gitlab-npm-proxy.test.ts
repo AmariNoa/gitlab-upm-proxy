@@ -1086,14 +1086,13 @@ test("パーセント記号を含むtarballファイル名でも中継が500に�
   const filename = `${packageName}-1.0.0.tgz`;
   const tarballBytes = Buffer.from("percent-in-the-filename");
 
-  // The rest path is forwarded as the router handed it over, so the upstream sees the decoded
-  // name. Re-encoding it on the way out is deliberately not done here: it would also change the
-  // URL of every scoped package, which is not something this change set can verify against a
-  // real GitLab.
+  // The upstream sees the path exactly as the caller encoded it: the request is rebuilt from the
+  // raw URL, not from the decoded route parameters. Forwarding the decoded form sent "%" through
+  // as a literal, and a decoded "#" or "?" would have truncated the upstream path outright.
   mockAgent
     .get(DEFAULT_ORIGIN)
     .intercept({
-      path: `/api/v4/groups/my-group/-/packages/npm/${packageName}/-/${filename}`,
+      path: `/api/v4/groups/my-group/-/packages/npm/${encodeURIComponent(packageName)}/-/${encodeURIComponent(filename)}`,
       method: "GET"
     })
     .reply(200, tarballBytes, { headers: { "content-type": "application/octet-stream" } });
@@ -1259,4 +1258,35 @@ test("Content-Lengthが上限を超えるJSON応答は本文を読まずに拒�
   } finally {
     delete process.env.MAX_UPSTREAM_BODY_BYTES;
   }
+});
+
+// Regression for the seventh round of the second review cycle. Forwarding the decoded rest path
+// did not merely change the spelling of the upstream URL: a name holding "%23" came back as "#",
+// so URL parsing cut the path there and treated the rest as a fragment - the upstream was asked
+// for a different, shorter resource. The request is now rebuilt from the raw URL.
+test("エンコードされた#を含む名前でも、上流へは同じパスが送られる", async (t: TestContext) => {
+  mockValidUser();
+  const packageName = "hash#pkg";
+  const filename = `${packageName}-1.0.0.tgz`;
+  const tarballBytes = Buffer.from("hash-in-the-name");
+
+  // Only the fully encoded path is answered. Forwarding the decoded form would request
+  // "/api/v4/groups/my-group/-/packages/npm/hash" with the rest as a fragment.
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({
+      path: `/api/v4/groups/my-group/-/packages/npm/${encodeURIComponent(packageName)}/-/${encodeURIComponent(filename)}`,
+      method: "GET"
+    })
+    .reply(200, tarballBytes, { headers: { "content-type": "application/octet-stream" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: `/api/v4/groups/my-group/${encodeURIComponent(packageName)}/-/${encodeURIComponent(filename)}`,
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200, "the upstream must be asked for the path the caller sent");
+  assert.deepEqual(res.rawPayload, tarballBytes);
 });
