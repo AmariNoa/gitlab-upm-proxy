@@ -81,11 +81,33 @@ test(
     // under it the two are serialized whichever order they arrive in - and the new version
     // survives. With the deletion outside the lock, the publication lands in the gap and is
     // deleted by a decision taken before it existed.
+    // An explicit barrier rather than a timing guess. The withdrawal has to be inside its
+    // critical section before the publication asks for the lock, or the interleaving under test
+    // never happens - and a macrotask tick only makes that likely, not certain. Taking the
+    // metadata lock here first, and releasing it once the withdrawal is demonstrably queued behind
+    // it, pins the order: the withdrawal enters its critical section, and the publication asks for
+    // the lock while it is in there.
+    let releaseBarrier: () => void = () => {};
+    const barrierHeld = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    let barrierEntered: () => void = () => {};
+    const barrierIsHeld = new Promise<void>((resolve) => {
+      barrierEntered = resolve;
+    });
+    const barrier = updateMetadataCache(upstream.host, packageName, async (current) => {
+      barrierEntered();
+      await barrierHeld;
+      // Unchanged: this writer exists only to order the two below.
+      return current;
+    });
+    await barrierIsHeld;
+
     const withdrawal = removeWithdrawnPackage(upstream, packageName, baseline.metadata);
-    // One macrotask, so the withdrawal is demonstrably inside its critical section before the
-    // publication asks for the lock. Without this the two can arrive in either order, and the
-    // order where the publication goes first never exercises the window at all.
-    await new Promise((resolve) => setImmediate(resolve));
+    // Queued behind the barrier now. Releasing it lets the withdrawal in; the publication is
+    // started immediately after, so it queues behind the withdrawal rather than ahead of it.
+    releaseBarrier();
+    await barrier;
     const publication = (async () => {
       await updateMetadataCache(upstream.host, packageName, (current) => {
         const metadata = current?.metadata ?? {
