@@ -479,8 +479,16 @@ function filterMetadataByShasum(metadata: any): any {
   if (versions.length === 0) {
     delete metadata["dist-tags"];
   } else {
-    const latest = versions.sort(semver.rcompare)[0];
-    metadata["dist-tags"] = { latest };
+    // The same rule pickLatestVpmVersion applies: semver among the versions that are semver, and
+    // a lexical fallback only when none are. Sorting every key with semver.rcompare threw on the
+    // first key it could not parse - a VPM index may legitimately publish "nightly" - and the
+    // caller turned that into a 404 for the whole package, archives and all.
+    const latest = pickLatestVpmVersion(filtered);
+    if (latest) {
+      metadata["dist-tags"] = { latest };
+    } else {
+      delete metadata["dist-tags"];
+    }
   }
   return metadata;
 }

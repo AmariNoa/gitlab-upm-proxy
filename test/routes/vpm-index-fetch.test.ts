@@ -33,6 +33,7 @@ process.env.PUBLIC_BASE_URL = "https://proxy.vpm-index.example.net";
 process.env.VPM_PREFETCH_INTERVAL_SEC = "0";
 
 import { build, TestContext } from "../helper";
+import { writeMetadataCache, type MetadataCache } from "../../src/lib/cache";
 
 const DEFAULT_ORIGIN = "https://gitlab.example.com";
 const VPM_ORIGIN = "https://vpm.example.com";
@@ -201,6 +202,83 @@ test(
       res.json().name,
       packageName,
       "the package document must come from the redirect target, not the redirect body"
+    );
+  }
+);
+
+// Regression for the eighth round of the second review cycle: the response filter picked its
+// dist-tags.latest by sorting every retained key with semver.rcompare, which throws on the first
+// key it cannot parse. A VPM index may legitimately publish a version like "nightly" - every other
+// part of the code tolerates one - and that single key turned the whole package into a 404, with
+// its perfectly usable archives along with it.
+test(
+  "semverでないバージョンが混ざっていてもパッケージ全体が404にならない",
+  async (t: TestContext) => {
+    const packageName = "com.example.vpm.nonsemver";
+    const marker = "case-nonsemver";
+
+    mockAgent
+      .get(VPM_ORIGIN)
+      .intercept({
+        path: "/index.json",
+        method: "GET",
+        headers: (headers) => normalizeHeaders(headers)["x-vpm-test-route"] === marker
+      })
+      .reply(
+        200,
+        {
+          packages: {
+            [packageName]: {
+              versions: {
+                "1.0.0": { name: packageName, version: "1.0.0", author: { name: "A" } },
+                nightly: { name: packageName, version: "nightly", author: { name: "A" } }
+              }
+            }
+          }
+        },
+        { headers: { "content-type": "application/json" } }
+      )
+      .persist();
+
+    // Both versions already have an archive, so both survive the response filter and the sort has
+    // a non-semver key to trip over.
+    const seeded: MetadataCache = {
+      latestVersion: "1.0.0",
+      metadata: {
+        name: packageName,
+        "dist-tags": { latest: "1.0.0" },
+        versions: {
+          "1.0.0": {
+            name: packageName,
+            version: "1.0.0",
+            author: { name: "A" },
+            dist: { tarball: "", shasum: "a".repeat(40) }
+          },
+          nightly: {
+            name: packageName,
+            version: "nightly",
+            author: { name: "A" },
+            dist: { tarball: "", shasum: "b".repeat(40) }
+          }
+        }
+      }
+    };
+    await writeMetadataCache("vpm.example.com", packageName, seeded);
+
+    const app = await build(t);
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v4/groups/my-group/${packageName}`,
+      headers: { "private-token": "valid-token", "x-vpm-test-route": marker }
+    });
+
+    assert.equal(res.statusCode, 200, "one unparsable version must not hide the whole package");
+    const body = res.json();
+    assert.ok(body.versions["1.0.0"], "the semver version must still be published");
+    assert.equal(
+      body["dist-tags"].latest,
+      "1.0.0",
+      "latest is chosen among the versions that are semver"
     );
   }
 );
