@@ -1,0 +1,9 @@
+default:
+  - baseUrl: https://gitlab.example.com
+upstreams:
+  # A registry served under a path, not at the origin root. The rewritten tarball URL must
+  # not carry that path back into the proxy's own route, where the first segment is read as
+  # the package name.
+  - baseUrl: https://npm.example.org/registry
+    scopes:
+      - com.example.based.*
