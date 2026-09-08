@@ -22,7 +22,7 @@ export class UpstreamError extends Error {
 }
 
 /** Issues an upstream request, reporting a connection-level failure as an upstream failure. */
-async function requestUpstream(url: string, options: any): Promise<any> {
+export async function requestUpstream(url: string, options: any): Promise<any> {
   try {
     return await request(url, options);
   } catch (err) {
