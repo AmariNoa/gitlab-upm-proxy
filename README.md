@@ -47,7 +47,10 @@ Only the endpoints required for Unity Package Manager operation are supported.
 ### Notes
 
 - No standalone implementation is provided for `/-/whoami` or `/-/all`
-  - These endpoints are handled via transparent passthrough if requested
+  - Under a group (`/api/v4/groups/:groupEnc/-/whoami`) they are passed through to GitLab like any
+    other registry path
+  - At the root (`/-/whoami`) they are not: the root `/-/*` route serves converted VPM tarballs
+    only and answers 404 to anything that does not end in `.tgz`
 - The proxy caches metadata and tarballs under `TARBALL_CACHE_DIR`
 - All authorization and permission checks are enforced by GitLab
 
