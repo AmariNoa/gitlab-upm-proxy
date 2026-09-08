@@ -2,6 +2,38 @@ import { request } from "undici";
 import { positiveIntEnv } from "./env";
 
 /**
+ * A failure that came from the upstream rather than from this proxy's own work, carrying what kind
+ * of failure it was in a field rather than in its message.
+ *
+ * The message text is unchanged from what these paths always threw, because callers log it and
+ * tests match on it. What the text cannot be trusted for is classification: a body-limit error
+ * ends in a byte count, and "zip_download_too_large:404" is 404 bytes, not an upstream saying the
+ * archive is absent. `kind` and `status` say which is which.
+ */
+export class UpstreamError extends Error {
+  constructor(
+    message: string,
+    readonly kind: "status" | "transport" | "limit",
+    readonly status?: number
+  ) {
+    super(message);
+    this.name = "UpstreamError";
+  }
+}
+
+/** Issues an upstream request, reporting a connection-level failure as an upstream failure. */
+async function requestUpstream(url: string, options: any): Promise<any> {
+  try {
+    return await request(url, options);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    const wrapped = new UpstreamError(`upstream_request_failed:${detail}`, "transport");
+    (wrapped as any).cause = err;
+    throw wrapped;
+  }
+}
+
+/**
  * Ceiling on how many bytes one upstream archive download may produce. The archive is buffered
  * in memory before conversion, and its size is chosen by whoever published the package, not by
  * this proxy - without a ceiling a single entry can exhaust the process. 512 MiB is far above
@@ -35,7 +67,7 @@ export async function readBodyWithLimit(
   const declared = Number(res.headers["content-length"]);
   if (Number.isFinite(declared) && declared > limit) {
     await res.body.dump();
-    throw new Error(`${errorPrefix}:${declared}`);
+    throw new UpstreamError(`${errorPrefix}:${declared}`, "limit");
   }
   const chunks: Buffer[] = [];
   let total = 0;
@@ -44,7 +76,7 @@ export async function readBodyWithLimit(
     total += buf.length;
     if (total > limit) {
       res.body.destroy();
-      throw new Error(`${errorPrefix}:${total}`);
+      throw new UpstreamError(`${errorPrefix}:${total}`, "limit");
     }
     chunks.push(buf);
   }
@@ -162,7 +194,7 @@ export async function fetchJsonWithRedirects<T>(
   let current = url;
   let currentHeaders = withoutResponseNarrowing(headers);
   for (let i = 0; i <= maxRedirects; i++) {
-    const res = await request(current, { method: "GET", headers: currentHeaders });
+    const res = await requestUpstream(current, { method: "GET", headers: currentHeaders });
     const status = res.statusCode;
     if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
       // Released before the Location is parsed: a malformed one makes the URL constructor
@@ -180,11 +212,11 @@ export async function fetchJsonWithRedirects<T>(
       // Anything that is not a plain successful response carries no document to parse - an
       // unfollowed redirect included, which is what a chain longer than maxRedirects ends on.
       await res.body.dump();
-      throw new Error(`${errorPrefix}:${status}`);
+      throw new UpstreamError(`${errorPrefix}:${status}`, "status", status);
     }
     return readUpstreamJson<T>(res as any);
   }
-  throw new Error(`${errorPrefix}_redirects_exceeded`);
+  throw new UpstreamError(`${errorPrefix}_redirects_exceeded`, "status");
 }
 
 /**
@@ -207,7 +239,7 @@ export async function fetchBufferWithRedirects(
   let current = url;
   let currentHeaders = headers;
   for (let i = 0; i <= maxRedirects; i++) {
-    const res = await request(current, { method: "GET", headers: currentHeaders });
+    const res = await requestUpstream(current, { method: "GET", headers: currentHeaders });
     const status = res.statusCode;
     if (status >= 300 && status < 400 && res.headers.location && i < maxRedirects) {
       // Released before the Location is parsed: a malformed one makes the URL constructor
@@ -225,9 +257,9 @@ export async function fetchBufferWithRedirects(
     }
     if (status >= 400) {
       await res.body.dump();
-      throw new Error(`zip_download_failed:${status}`);
+      throw new UpstreamError(`zip_download_failed:${status}`, "status", status);
     }
     return readBodyWithLimit(res as any, limit, "zip_download_too_large");
   }
-  throw new Error("zip_download_redirects_exceeded");
+  throw new UpstreamError("zip_download_redirects_exceeded", "status");
 }
