@@ -1566,12 +1566,17 @@ async function handleSearch(req: any, reply: any, groupEnc: string): Promise<voi
  * delimiter the same way. Forwarding the bytes the caller actually sent avoids having to decide
  * how to re-encode anything - the decoded values stay in use for routing and cache lookup.
  */
-function rawRestFromRequest(req: any, skip: number): string | null {
+function rawRestFromRequest(req: any, decodedRest: string): string | null {
   const raw =
     typeof req?.raw?.url === "string" ? req.raw.url : typeof req?.url === "string" ? req.url : "";
-  const segments = pathWithoutQuery(raw).replace(/^\/+/, "").split("/");
-  if (segments.length <= skip) return null;
-  return segments.slice(skip).join("/");
+  const rawSegments = pathWithoutQuery(raw).replace(/^\/+/, "").split("/").filter(Boolean);
+  const decodedSegments = decodedRest.replace(/^\/+/, "").split("/").filter(Boolean);
+  // Counted from the end, not the start: the rest path is whatever the wildcard matched, and
+  // taking a fixed number of leading segments assumed the routes are mounted exactly where they
+  // are today. Under a prefix the count would silently include part of the prefix instead.
+  if (decodedSegments.length === 0) return null;
+  if (rawSegments.length < decodedSegments.length) return null;
+  return rawSegments.slice(rawSegments.length - decodedSegments.length).join("/");
 }
 
 /**
@@ -1687,9 +1692,9 @@ async function proxyGroupNpm(
     return;
   }
   const upstream = packageName ? selectUpstream(packageName) : defaultUpstream;
-  // "/api/v4/groups/<group>/" is four segments; everything after them is the rest path, taken
-  // here in the encoding the caller sent rather than the decoded copy used for routing above.
-  const rawRest = rawRestFromRequest(req, 4) ?? normalizedRest;
+  // The same rest path, in the encoding the caller sent rather than the decoded copy used for
+  // routing above.
+  const rawRest = rawRestFromRequest(req, normalizedRest) ?? normalizedRest;
   const upstreamUrl = appendRawQuery(
     getUpstreamBaseForGroup(upstream, groupEnc, rawRest),
     req
@@ -2082,9 +2087,8 @@ const routes: FastifyPluginAsync = async (app) => {
           return;
         }
 
-        // "/api/v4/projects/<id>/packages/npm/" is six segments; the rest is forwarded in the
-        // encoding the caller sent, for the same reason as the group route.
-        const rawRest = rawRestFromRequest(req, 6) ?? restPath;
+        // Forwarded in the encoding the caller sent, for the same reason as the group route.
+        const rawRest = rawRestFromRequest(req, restPath) ?? restPath;
         const upstreamUrl = appendRawQuery(
           `${defaultUpstream.baseUrl}/api/v4/projects/${asSinglePathSegment(projectId)}/packages/npm/${rawRest}`,
           req
