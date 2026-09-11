@@ -159,3 +159,35 @@ test(
     );
   }
 );
+
+// Regression for the real-machine report on 2026-09-11. Bounding the JSON reads replaced undici's
+// body.json() with a buffer read and JSON.parse. body.json() decodes through the WHATWG UTF-8
+// decode, which drops one leading BOM; Buffer.toString keeps it as U+FEFF and JSON.parse then
+// rejects the document. Every upstream JSON - metadata, search, the signing key document, the VPM
+// index - came back as a 502 if the registry served a BOM.
+test(
+  "BOM付きのJSONは、上流が壊れた応答を返したものとして扱われない",
+  async () => {
+    const withBom = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from('{"packages":{"com.example.pkg":{}}}', "utf-8")
+    ]);
+
+    mockAgent
+      .get(FIRST_ORIGIN)
+      .intercept({ path: "/bom.json", method: "GET" })
+      .reply(200, withBom, { headers: { "content-type": "application/json" } });
+
+    const parsed = await fetchJsonWithRedirects<{ packages: Record<string, unknown> }>(
+      `${FIRST_ORIGIN}/bom.json`,
+      {},
+      "test_fetch_failed"
+    );
+
+    assert.deepEqual(
+      Object.keys(parsed.packages),
+      ["com.example.pkg"],
+      "a byte order mark is not a parse error"
+    );
+  }
+);
