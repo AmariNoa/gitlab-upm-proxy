@@ -1639,3 +1639,49 @@ test("中継中に上流が切断された場合、不完全なアーカイブ�
   const entries = existsSync(packageDir) ? readdirSync(packageDir) : [];
   assert.deepEqual(entries, [], "neither the archive nor a temp file may survive");
 });
+
+// Regression for the real-machine report on 2026-09-11. Bounding the JSON reads swapped undici's
+// body.json() - which decodes through the WHATWG UTF-8 decode and drops one leading BOM - for a
+// buffer read and JSON.parse, which does not. A registry that serves its metadata with a byte
+// order mark turned into a 502 on every package. The unit test in test/lib/http.test.ts pins the
+// helper; this pins that the metadata route reaches the caller through it.
+test("BOM付きで配信される上流メタデータも、そのまま中継される", async (t: TestContext) => {
+  mockValidUser();
+  const withBom = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(
+      JSON.stringify({
+        name: "widget",
+        "dist-tags": { latest: "1.0.0" },
+        versions: {
+          "1.0.0": {
+            name: "widget",
+            version: "1.0.0",
+            dist: {
+              tarball: `${DEFAULT_ORIGIN}/api/v4/groups/my-group/-/packages/npm/widget/-/widget-1.0.0.tgz`,
+              shasum: "deadbeef"
+            }
+          }
+        }
+      }),
+      "utf-8"
+    )
+  ]);
+
+  mockAgent
+    .get(DEFAULT_ORIGIN)
+    .intercept({ path: "/api/v4/groups/my-group/-/packages/npm/widget", method: "GET" })
+    .reply(200, withBom, { headers: { "content-type": "application/json" } });
+
+  const app = await build(t);
+  const res = await app.inject({
+    method: "GET",
+    url: "/api/v4/groups/my-group/widget",
+    headers: { "private-token": "valid-token" }
+  });
+
+  assert.equal(res.statusCode, 200, "a byte order mark is not an upstream failure");
+  const body = res.json() as { name: string; versions: Record<string, unknown> };
+  assert.equal(body.name, "widget");
+  assert.ok(body.versions["1.0.0"]);
+});

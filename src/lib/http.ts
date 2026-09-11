@@ -111,6 +111,19 @@ export function validateUpstreamBodyLimit(): void {
 }
 
 /**
+ * Decodes an upstream body as UTF-8 text, dropping a leading byte order mark.
+ *
+ * undici's body.json() decodes through the WHATWG UTF-8 decode, which removes one leading BOM.
+ * Buffer.toString does not: it keeps the mark as U+FEFF, and JSON.parse rejects it. Reading the
+ * body ourselves to bound it therefore has to do the removal that came for free before, or a
+ * document served with a BOM - which some registries do - stops parsing.
+ */
+function decodeUtf8Text(buffer: Buffer): string {
+  const text = buffer.toString("utf-8");
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
  * Parses an upstream JSON body under the shared ceiling.
  *
  * undici's body.json() reads to the end with no bound, which left every JSON response - package
@@ -124,7 +137,7 @@ export async function readUpstreamJson<T>(res: {
 }): Promise<T> {
   const buffer = await readUpstreamBody(res);
   try {
-    return JSON.parse(buffer.toString("utf-8")) as T;
+    return JSON.parse(decodeUtf8Text(buffer)) as T;
   } catch (err) {
     // A document this proxy cannot parse is one the upstream did not send correctly - the same
     // class as a malformed index shape, and not a failure of ours.
