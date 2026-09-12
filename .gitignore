@@ -74,6 +74,10 @@ config/upstreams.yml
 AGENTS.md
 CLAUDE.md
 
+# test environment file of unknown provenance (kept on disk, never published)
+test/.env.test
+.test-cache/
+
 # documentation (local only, treated as confidential)
 docs/
 PROJECT_MAP.md
