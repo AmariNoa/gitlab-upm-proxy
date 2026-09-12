@@ -74,6 +74,6 @@ config/upstreams.yml
 AGENTS.md
 CLAUDE.md
 
-# shared coordination files (local only)
-docs/orchestration.md
-docs/checkpoint.md
+# documentation (local only, treated as confidential)
+docs/
+PROJECT_MAP.md
