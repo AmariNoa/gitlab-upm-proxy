@@ -106,6 +106,43 @@ MAX_UPSTREAM_BODY_BYTES=536870912
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 
+### Behind a reverse proxy
+
+`TRUST_PROXY` is optional and unset by default, which leaves `req.ip` as the address of whoever
+opened the connection. Behind a reverse proxy that address is the front end rather than the caller,
+so every user of the deployment looks like one client - and the OAuth token endpoint's per-caller
+rate limit then applies to all of them together. Naming the front ends fixes that:
+
+````
+TRUST_PROXY=127.0.0.1
+````
+
+Accepted values are a comma-separated list of addresses or CIDR ranges (also the shorthands
+`loopback`, `linklocal` and `uniquelocal`), a hop count, or `true` / `false`. A value that is none
+of these stops the server at startup rather than trusting more or less than intended.
+
+**Prefer a list of addresses.** `true` trusts every address, which makes `req.ip` the leftmost
+`X-Forwarded-For` entry - a value the caller writes. It is only safe where the front end overwrites
+that header and the application port cannot be reached directly. The same applies to a hop count.
+
+Which hop does what matters when there is more than one. The **outermost** front end - the one
+clients reach - must replace `X-Forwarded-For` with the address it sees rather than append to
+whatever arrived, since anything the client wrote is unverified. Every hop **inside** that boundary
+must append instead, preserving the chain: a second front end that also replaces the header throws
+away the caller and leaves `req.ip` pointing at the hop in front of it, which puts every user back
+in one bucket. List all of those inner hops in `TRUST_PROXY` so Fastify walks past them to the
+caller.
+
+Setting this also makes Fastify honour the other forwarded headers, so the boundary should
+overwrite or remove `X-Forwarded-Host` and `X-Forwarded-Proto` as well. URL rewriting is unaffected
+either way: the proxy builds public URLs from `PUBLIC_BASE_URL`, never from the request host.
+
+`nginx`'s `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` appends, which is what an
+inner hop wants; at the boundary use `$remote_addr` instead.
+
+Like the other server options, this is read from the `options` the application exports, which
+`fastify start` only applies with `--options`. The `start` and `dev:start` scripts pass it.
+
 Upstream registries are configured in a YAML (or JSON) file. The default upstream is GitLab.  
 If a package scope matches an upstream entry, metadata and tarball requests for that package are
 sent to that registry. Search is different: it queries GitLab and every configured upstream, then

@@ -599,3 +599,118 @@ test("どの失敗経路でも、code・verifier・トークンがログへ出�
     assert.deepEqual(leaked, [], `秘密がログへ出ない: ${secret.slice(0, 12)}`);
   }
 });
+
+/** Ten refusals, which are counted, then one more that reports the budget is spent. */
+async function spendBudget(server: any, forwardedFor: string | undefined): Promise<number[]> {
+  const codes: number[] = [];
+  for (let i = 0; i < 11; i += 1) {
+    const res = await server.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: forwardedFor ? { ...FORM, "x-forwarded-for": forwardedFor } : FORM,
+      payload: tokenBody({ grant_type: "refresh_token" })
+    });
+    codes.push(res.statusCode);
+  }
+  return codes;
+}
+
+// Behind a reverse proxy every request arrives from the front end, so keying the budget on the
+// socket address alone puts every user of the deployment in one bucket - ten bad requests from
+// anyone would lock out everybody else's login and refresh. Fastify resolves the real caller only
+// when it has been told which addresses may speak for someone else.
+test("信頼済みの前段配下では、利用者ごとに独立した回数枠になる", async () => {
+  const server = Fastify({ trustProxy: "127.0.0.1" });
+  void server.register(application);
+  await server.ready();
+  try {
+    const first = await spendBudget(server, "203.0.113.1");
+    assert.deepEqual(first.slice(0, 10), new Array(10).fill(400), "10 回目までは入力検査へ進む");
+    assert.equal(first[10], 429, "11 回目で枠を使い切る");
+
+    const second = await spendBudget(server, "203.0.113.2");
+    assert.equal(second[0], 400, "別の利用者は自分の枠を持つ");
+    assert.equal(second[10], 429, "その利用者も自分の枠だけを使い切る");
+  } finally {
+    await server.close();
+  }
+});
+
+// The other half of the same setting. Without it the header is just something the caller wrote,
+// and honouring it would let one caller appear as thousands.
+test("信頼設定が無ければ、偽装したヘッダで枠を分割できない", async () => {
+  const server = Fastify();
+  void server.register(application);
+  await server.ready();
+  try {
+    const first = await spendBudget(server, "203.0.113.1");
+    assert.equal(first[10], 429);
+
+    const res = await server.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: { ...FORM, "x-forwarded-for": "203.0.113.2" },
+      payload: tokenBody({ grant_type: "refresh_token" })
+    });
+    assert.equal(res.statusCode, 429, "別の値を名乗っても同じ枠のまま");
+  } finally {
+    await server.close();
+  }
+});
+
+// proxy-addr walks the header from the socket end and stops at the first address it does not
+// trust. The entries further left are whatever the caller chose to put there, so they must not
+// decide whose budget is spent.
+test("多段の転送では、信頼できない最も右の値が利用者として使われる", async () => {
+  const server = Fastify({ trustProxy: "127.0.0.1" });
+  void server.register(application);
+  await server.ready();
+  try {
+    const first = await spendBudget(server, "1.2.3.4, 203.0.113.9");
+    assert.equal(first[10], 429);
+
+    // A different leftmost value, the same untrusted hop: the same caller, so the same budget.
+    const forged = await server.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: { ...FORM, "x-forwarded-for": "5.6.7.8, 203.0.113.9" },
+      payload: tokenBody({ grant_type: "refresh_token" })
+    });
+    assert.equal(forged.statusCode, 429, "左端を書き換えても枠は分かれない");
+
+    // A different untrusted hop is a different caller.
+    const other = await server.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: { ...FORM, "x-forwarded-for": "1.2.3.4, 203.0.113.10" },
+      payload: tokenBody({ grant_type: "refresh_token" })
+    });
+    assert.equal(other.statusCode, 400, "別の前段からの利用者は別の枠");
+  } finally {
+    await server.close();
+  }
+});
+
+// Two trusted hops, which is the shape the README now distinguishes: the boundary replaces the
+// header and every hop inside it appends. Naming both in TRUST_PROXY is what lets Fastify walk
+// past them to the caller - miss one and every user collapses onto that hop's address again.
+test("信頼済みの前段が2段でも、利用者ごとの枠が保たれる", async () => {
+  const server = Fastify({ trustProxy: "127.0.0.1, 10.10.0.5" });
+  void server.register(application);
+  await server.ready();
+  try {
+    // The boundary saw 203.0.113.1 and wrote it; the inner hop appended its own address.
+    const first = await spendBudget(server, "203.0.113.1, 10.10.0.5");
+    assert.equal(first[10], 429, "一人目が自分の枠を使い切る");
+
+    const second = await server.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: { ...FORM, "x-forwarded-for": "203.0.113.2, 10.10.0.5" },
+      payload: tokenBody({ grant_type: "refresh_token" })
+    });
+    assert.equal(second.statusCode, 400, "二人目は同じ経路でも別の枠を持つ");
+  } finally {
+    await server.close();
+  }
+});

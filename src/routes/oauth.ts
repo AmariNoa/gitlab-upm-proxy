@@ -267,12 +267,14 @@ function createRateLimiter() {
 /**
  * Identifies the caller for rate limiting.
  *
- * The socket address, not a forwarded header. A header is written by whoever is talking to us and
- * is only meaningful when a trusted front end put it there; treating it as identity by default
- * lets one caller appear as thousands.
+ * req.ip, which is the socket address until TRUST_PROXY names the front ends that may speak for
+ * someone else. Reading the forwarded header directly would let one caller appear as thousands;
+ * reading the socket address alone, as this did at first, does the opposite behind a reverse proxy
+ * - every user arrives as the front end and shares one budget, so ten bad requests lock everyone
+ * else out. Fastify resolves both cases from that one setting.
  */
 function rateKey(req: FastifyRequest): string {
-  return (req.raw.socket && (req.raw.socket as any).remoteAddress) || "unknown";
+  return req.ip || "unknown";
 }
 
 /** Runs one upstream exchange under a single deadline covering both the request and the read. */

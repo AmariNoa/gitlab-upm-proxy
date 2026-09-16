@@ -6,13 +6,21 @@ import "dotenv/config";
 import { createPrefetchLifecycle, startVpmPrefetch, stopVpmPrefetch } from "./lib/vpm-prefetch";
 import { validateDownloadLimits, validateUpstreamBodyLimit } from "./lib/http";
 import { validateExtractLimits } from "./lib/tgz";
+import { resolveTrustProxy } from "./lib/env";
 
 
 export interface AppOptions extends FastifyServerOptions, Partial<AutoloadPluginOptions> {
 
 }
+
+// Only applied when TRUST_PROXY is set, so a deployment that says nothing keeps Fastify's default
+// and req.ip stays the socket address. Behind a reverse proxy that address is the front end rather
+// than the caller, which matters wherever one caller must not spend another's budget.
+const trustProxy = resolveTrustProxy(process.env.TRUST_PROXY);
+
 // Pass --options via CLI arguments in command to enable these options.
 const options: AppOptions = {
+  ...(trustProxy === undefined ? {} : { trustProxy }),
   logger: {
     serializers: {
       // Fastify's own request log prints req.url, and tarball URLs carry the query the
