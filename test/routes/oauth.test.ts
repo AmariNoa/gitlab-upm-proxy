@@ -46,12 +46,14 @@ function enableOAuth(): void {
   process.env.OAUTH_CLIENT_ID = "client-id-for-tests";
   process.env.OAUTH_REDIRECT_URIS = `${REDIRECT},${OTHER_REDIRECT}`;
   process.env.OAUTH_SCOPES = "read_api";
+  delete process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS;
 }
 
 function disableOAuth(): void {
   delete process.env.OAUTH_CLIENT_ID;
   delete process.env.OAUTH_REDIRECT_URIS;
   delete process.env.OAUTH_SCOPES;
+  delete process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS;
 }
 
 before(() => {
@@ -74,6 +76,215 @@ function tokenBody(params: Record<string, string>): string {
 }
 
 const FORM = { "content-type": "application/x-www-form-urlencoded" };
+
+function authorizeUrl(uri: string): string {
+  return `/auth/authorize?${new URLSearchParams({ redirect_uri: uri, state: STATE, code_challenge: CHALLENGE })}`;
+}
+
+test("動的設定が未設定または空なら旧config形式と固定ポート照合を維持する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const app = await build(t);
+  const baseline = (await app.inject({ url: "/auth/config" })).json();
+  assert.equal(baseline.protocolVersion, 1);
+  assert.equal(Object.hasOwn(baseline.oauth, "loopbackDynamicPortRedirectUris"), false);
+  for (const setting of [undefined, "", " , , "]) {
+    if (setting === undefined) delete process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS;
+    else process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = setting;
+    assert.deepEqual((await app.inject({ url: "/auth/config" })).json(), baseline);
+    assert.equal((await app.inject({ url: authorizeUrl(REDIRECT) })).statusCode, 302);
+    assert.equal((await app.inject({ url: authorizeUrl(REDIRECT.replace(":8765", ":54321")) })).statusCode, 400);
+  }
+});
+
+test("動的能力は対象URIだけを重複除去・初出順で通知する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const second = "http://127.0.0.1:9876/other?source=unity";
+  process.env.OAUTH_REDIRECT_URIS += `,${second}`;
+  process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = ` , ${second},${REDIRECT},${second}, , `;
+  const app = await build(t);
+  const body = (await app.inject({ url: "/auth/config" })).json();
+  assert.equal(body.protocolVersion, 1);
+  assert.deepEqual(body.oauth.redirectUris, [REDIRECT, OTHER_REDIRECT, second]);
+  assert.deepEqual(body.oauth.loopbackDynamicPortRedirectUris, [second, REDIRECT]);
+  assert.equal((await app.inject({ url: authorizeUrl(second.replace(":9876", ":54321")) })).statusCode, 302);
+  assert.equal((await app.inject({ url: authorizeUrl(OTHER_REDIRECT) })).statusCode, 302);
+});
+
+const invalidDynamicUris = [
+  "https://127.0.0.1:8765/callback",
+  "http://localhost:8765/callback",
+  "http://127.1:8765/callback",
+  "http://2130706433:8765/callback",
+  "http://0177.0.0.1:8765/callback",
+  "http://[::1]:8765/callback",
+  "HTTP://127.0.0.1:8765/callback",
+  "http://127.0.0.1/callback",
+  "http://127.0.0.1:/callback",
+  "http://127.0.0.1:0/callback",
+  "http://127.0.0.1:08765/callback",
+  "http://127.0.0.1:+8765/callback",
+  "http://127.0.0.1:65536/callback",
+  "http://127.0.0.1:8765",
+  "http://127.0.0.1:8765?source=unity",
+  "http://user@127.0.0.1:8765/callback",
+  "http://127.0.0.1:8765/callback#",
+  "http://127.0.0.1:8765/callback\\other",
+  "http://127.0.0.1:8765/a/../callback",
+  "http://127.0.0.1:8765/a/%2e%2e/callback",
+  "http://127.0.0.1:8765/call back",
+  "http://127.0.0.1:8765/call\tback",
+  "http://127.0.0.1:8765/コールバック",
+  "http://127.0.0.1:8765/callback%",
+  "http://127.0.0.1:8765/callback%2G",
+  "http://127.0.0.1:8765/callback?x=%",
+  "http://127.0.0.1:8765/callback?x=bad\\value"
+];
+
+test("動的リストの不正要素または部分集合違反は固定分を含めOAuthだけを無効にする", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const app = await build(t);
+  for (const uri of invalidDynamicUris) {
+    process.env.OAUTH_REDIRECT_URIS = `${REDIRECT},${uri}`;
+    process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = `${REDIRECT},${uri}`;
+    assert.deepEqual((await app.inject({ url: "/auth/config" })).json(), { protocolVersion: 1, oauth: { enabled: false } }, uri);
+    assert.equal((await app.inject({ url: authorizeUrl(REDIRECT) })).statusCode, 404, uri);
+  }
+  process.env.OAUTH_REDIRECT_URIS = REDIRECT;
+  process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = "http://127.0.0.1:9876/callback";
+  assert.deepEqual((await app.inject({ url: "/auth/config" })).json(), { protocolVersion: 1, oauth: { enabled: false } });
+  assert.equal((await app.inject({ method: "POST", url: "/auth/token", headers: FORM,
+    payload: tokenBody({ grant_type: "refresh_token", refresh_token: "test-refresh" }) })).statusCode, 404);
+  assert.equal((await app.inject({ url: "/auth/user", headers: { authorization: "Bearer test-access" } })).statusCode, 404);
+  const packageResponse = await app.inject({ url: "/api/v4/groups/test/-/v1/search?text=example" });
+  assert.equal(packageResponse.statusCode, 401);
+});
+
+test("動的設定が有効でも対象外の登録URIは完全一致のみを許可する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const fixedUris = ["http://127.0.0.1:9876/fixed", "http://[::1]:8765/callback", "http://127.0.0.1/callback", "http://127.0.0.1:08765/legacy"];
+  process.env.OAUTH_REDIRECT_URIS = [REDIRECT, ...fixedUris].join(",");
+  process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = REDIRECT;
+  const app = await build(t);
+  for (const uri of fixedUris) {
+    const res = await app.inject({ url: authorizeUrl(uri) });
+    assert.equal(res.statusCode, 302, uri);
+    assert.equal(new URL(String(res.headers.location)).searchParams.get("redirect_uri"), uri);
+  }
+  assert.equal((await app.inject({ url: authorizeUrl("http://127.0.0.1:54321/fixed") })).statusCode, 400);
+});
+
+test("動的設定のポート境界を受け付けrefreshのURI省略を維持する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const app = await build(t);
+  for (const port of [1, 80, 65535]) {
+    const baseline = `http://127.0.0.1:${port}/callback`;
+    process.env.OAUTH_REDIRECT_URIS = baseline;
+    process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = baseline;
+    assert.deepEqual((await app.inject({ url: "/auth/config" })).json().oauth.loopbackDynamicPortRedirectUris, [baseline]);
+    assert.equal((await app.inject({ url: authorizeUrl("http://127.0.0.1:54321/callback") })).statusCode, 302);
+  }
+  let received: URLSearchParams | undefined;
+  mockAgent.get(GITLAB_ORIGIN).intercept({ path: "/oauth/token", method: "POST" }).reply(200, (opts) => {
+    received = new URLSearchParams(String(opts.body));
+    return { access_token: "test-access", refresh_token: "test-refresh", token_type: "bearer", expires_in: 7200 };
+  });
+  const result = await app.inject({ method: "POST", url: "/auth/token", headers: FORM,
+    payload: tokenBody({ grant_type: "refresh_token", refresh_token: "test-refresh" }) });
+  assert.equal(result.statusCode, 200);
+  assert.ok(received);
+  assert.equal(received.has("redirect_uri"), false);
+  mockAgent.assertNoPendingInterceptors();
+});
+
+test("動的設定が不正でも認証済みのパッケージ要求を中継する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = OTHER_REDIRECT;
+  mockAgent.get(GITLAB_ORIGIN).intercept({ path: "/api/v4/user", method: "GET" })
+    .reply(200, { id: 7, username: "tester" });
+  mockAgent.get(GITLAB_ORIGIN).intercept({ path: "/api/v4/groups/test/-/packages/npm/-/whoami", method: "GET" })
+    .reply(200, { username: "tester" }, { headers: { "content-type": "application/json" } });
+  const app = await build(t);
+  assert.equal((await app.inject({ url: "/auth/config" })).json().oauth.enabled, false);
+  const res = await app.inject({ url: "/api/v4/groups/test/-/whoami", headers: { authorization: "Bearer test-access" } });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.json(), { username: "tester" });
+  mockAgent.assertNoPendingInterceptors();
+});
+
+test("動的ポートの境界とURI表現を認可・code交換・refreshで無改変転送する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const target = "/call%62ack?source=a%2Fb&x=1&x=2";
+  const baseline = `http://127.0.0.1:8765${target}`;
+  process.env.OAUTH_REDIRECT_URIS = baseline;
+  process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = baseline;
+  const app = await build(t);
+  for (const port of [1, 80, 54321, 65535]) {
+    const uri = `http://127.0.0.1:${port}${target}`;
+    const start = await app.inject({ url: authorizeUrl(uri) });
+    assert.equal(start.statusCode, 302);
+    assert.equal(new URL(String(start.headers.location)).searchParams.get("redirect_uri"), uri);
+    for (const grant of ["authorization_code", "refresh_token"]) {
+      let receivedUri: string | null = null;
+      mockAgent.get(GITLAB_ORIGIN).intercept({ path: "/oauth/token", method: "POST" }).reply(200, (opts) => {
+        receivedUri = new URLSearchParams(String(opts.body)).get("redirect_uri");
+        return { access_token: "test-access", refresh_token: "test-refresh", token_type: "bearer", expires_in: 7200 };
+      });
+      const fields: Record<string, string> = grant === "authorization_code"
+        ? { grant_type: grant, code: "test-code", code_verifier: VERIFIER, redirect_uri: uri }
+        : { grant_type: grant, refresh_token: "test-refresh", redirect_uri: uri };
+      const result = await app.inject({ method: "POST", url: "/auth/token", headers: FORM,
+        payload: tokenBody(fields) });
+      assert.equal(result.statusCode, 200, `${grant} ${port}`);
+      assert.equal(receivedUri, uri);
+    }
+  }
+  mockAgent.assertNoPendingInterceptors();
+});
+
+test("動的URIの拒否を認可・code交換・URI付きrefreshで統一する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = REDIRECT;
+  const invalidRequests = [...invalidDynamicUris,
+    "http://127.0.0.1:54321/Callback", "http://127.0.0.1:54321/callback/",
+    "http://127.0.0.1:54321/callback?", "http://127.0.0.1:54321/call%62ack",
+    "http://127.0.0.2:54321/callback", "http://127.0.0.1:54321/callback?source=unity",
+    "http://127.0.0.1:54321/callback\n", "http://127.0.0.1:54321/callback\u007f"
+  ];
+  for (const uri of invalidRequests) {
+    const app = await build(t);
+    const start = await app.inject({ url: authorizeUrl(uri) });
+    assert.equal(start.statusCode, 400, uri);
+    assert.deepEqual(start.json(), { error: "invalid_request" });
+    const requests: Array<Record<string, string>> = [
+      { grant_type: "authorization_code", code: "test-code", code_verifier: VERIFIER, redirect_uri: uri },
+      { grant_type: "refresh_token", refresh_token: "test-refresh", redirect_uri: uri }
+    ];
+    for (const fields of requests) {
+      const result = await app.inject({ method: "POST", url: "/auth/token", headers: FORM,
+        payload: tokenBody(fields) });
+      assert.equal(result.statusCode, 400, `${fields.grant_type}: ${uri}`);
+      assert.deepEqual(result.json(), { error: "invalid_request" });
+    }
+    await app.close();
+  }
+});
+
+test("動的照合は空クエリ・percent表記・クエリ順序を区別する", async (t: TestContext) => {
+  t.after(() => enableOAuth());
+  const app = await build(t);
+  for (const [suffix, other] of [["/callback?", "/callback"],
+    ["/callback?x=%2F&y=1", "/callback?x=%2f&y=1"],
+    ["/callback?x=1&y=2", "/callback?y=2&x=1"],
+    ["/call%62ack", "/callback"]]) {
+    process.env.OAUTH_REDIRECT_URIS = `http://127.0.0.1:8765${suffix}`;
+    process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS = process.env.OAUTH_REDIRECT_URIS;
+    const uri = `http://127.0.0.1:54321${suffix}`;
+    const res = await app.inject({ url: authorizeUrl(uri) });
+    assert.equal(res.statusCode, 302, suffix);
+    assert.equal(new URL(String(res.headers.location)).searchParams.get("redirect_uri"), uri);
+    assert.equal((await app.inject({ url: authorizeUrl(`http://127.0.0.1:54321${other}`) })).statusCode, 400, other);
+  }
+});
 
 // A deployment that never configures OAuth must be unaffected. The variables are optional for
 // exactly this reason: a required one would stop the process at module load on every existing

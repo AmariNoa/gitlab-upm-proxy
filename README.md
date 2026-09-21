@@ -106,6 +106,48 @@ MAX_UPSTREAM_BODY_BYTES=536870912
 Cached tarballs and merged metadata are stored under:
 `{TARBALL_CACHE_DIR}/{upstreamHost}/{packageName}/`
 
+### Optional OAuth loopback ports
+
+OAuth is configured separately from package authentication with `OAUTH_CLIENT_ID`,
+`OAUTH_REDIRECT_URIS` (comma-separated), and optional `OAUTH_SCOPES` (default `read_api`).
+It requires HTTPS for the default GitLab upstream and `PUBLIC_BASE_URL`.
+Without OAuth configuration, package access continues to work as before.
+
+By default, redirect URIs must match a configured entry exactly. To let a native client use
+an OS-assigned loopback port, explicitly opt in individual registered URIs:
+
+```text
+OAUTH_REDIRECT_URIS=http://127.0.0.1:8765/callback
+OAUTH_LOOPBACK_DYNAMIC_PORT_URIS=http://127.0.0.1:8765/callback
+```
+
+The second list must be an exact subset of the first. Surrounding whitespace and empty entries
+are ignored, and duplicates keep their first position. Each dynamic entry must use the exact
+`http://127.0.0.1:` prefix, an explicit decimal port from 1 to 65535 without leading zeros, and
+a path starting with `/`. Query strings are allowed; userinfo, fragments, backslashes, whitespace,
+non-ASCII characters, malformed percent escapes and paths that normalize to a different path are
+not. IPv6, `localhost` and HTTPS are not supported by the dynamic option.
+
+Only the port may change. Path and query must match literally, including percent-escape case,
+query ordering and an empty trailing `?`. The actual redirect URI is preserved through authorize,
+code exchange and refresh (when a redirect URI is supplied). Register the baseline URI in GitLab
+as well; this option does not change the GitLab application.
+
+`GET /auth/config` advertises `oauth.loopbackDynamicPortRedirectUris` only when OAuth is enabled
+and the dynamic list is nonempty. `protocolVersion` remains 1. An unset or empty option preserves
+the existing response shape and exact-match behavior. An invalid dynamic entry disables **all
+OAuth**, including fixed redirects: config returns `oauth.enabled=false`, and other OAuth routes
+return 404. Package/PAT routes remain available.
+
+Clients must check the capability before selecting a free port, bind before opening the browser,
+and use the same actual URI for authorization and code exchange. With a valid version-1 OAuth
+configuration but no usable dynamic capability, clients use registered fixed ports. A fixed-port
+conflict is an error, not permission to use another port. Unknown protocol versions or disabled
+OAuth must not be bypassed with this fallback. Existing exact-match redirects remain supported.
+
+Dynamic-port acceptance has been observed through the consent screen on GitLab CE 19.2.6;
+successful callback and token exchange still require validation against the target deployment.
+
 ### Behind a reverse proxy
 
 `TRUST_PROXY` is optional and unset by default, which leaves `req.ip` as the address of whoever

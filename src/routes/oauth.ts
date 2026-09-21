@@ -41,6 +41,7 @@ const MIN_STATE_LENGTH = 43;
 type OAuthConfig = {
   clientId: string;
   redirectUris: string[];
+  loopbackDynamicPortRedirectUris: string[];
   scopes: string[];
   gitlabBaseUrl: string;
 };
@@ -60,6 +61,18 @@ class OAuthError extends Error {
 function isLoopbackHttp(url: URL): boolean {
   if (url.protocol !== "http:") return false;
   return url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
+}
+
+function dynamicLoopbackTarget(value: string): string | null {
+  if (/[^\x21-\x7e]|[\\#]|%(?![0-9a-fA-F]{2})/.test(value)) return null;
+  const parts = /^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})(\/[^?]*)(\?.*)?$/.exec(value);
+  if (!parts || Number(parts[1]) > 65535) return null;
+  try {
+    if (new URL(value).pathname !== parts[2]) return null;
+  } catch {
+    return null;
+  }
+  return parts[2] + (parts[3] ?? "");
 }
 
 /**
@@ -95,6 +108,18 @@ function resolveConfig(): { config: OAuthConfig | null; reason: string } {
     }
   }
 
+  const loopbackDynamicPortRedirectUris = [...new Set(
+    (process.env.OAUTH_LOOPBACK_DYNAMIC_PORT_URIS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+  )];
+  for (const raw of loopbackDynamicPortRedirectUris) {
+    if (!rawRedirects.includes(raw) || dynamicLoopbackTarget(raw) === null) {
+      return { config: null, reason: "OAUTH_LOOPBACK_DYNAMIC_PORT_URIS contains an invalid entry" };
+    }
+  }
+
   const scopes = (process.env.OAUTH_SCOPES || "read_api")
     .split(/[,\s]+/)
     .map((s) => s.trim())
@@ -116,7 +141,7 @@ function resolveConfig(): { config: OAuthConfig | null; reason: string } {
     return { config: null, reason: "PUBLIC_BASE_URL is not https" };
   }
 
-  return { config: { clientId, redirectUris: rawRedirects, scopes, gitlabBaseUrl }, reason: "" };
+  return { config: { clientId, redirectUris: rawRedirects, loopbackDynamicPortRedirectUris, scopes, gitlabBaseUrl }, reason: "" };
 }
 
 function requireConfig(): OAuthConfig {
@@ -154,11 +179,14 @@ function requireBody(body: any, name: string): string {
   return value;
 }
 
-/** Exact match against the configured list. A prefix test here is an open redirect. */
 function requireAllowedRedirect(config: OAuthConfig, value: string | undefined): string {
   if (!value) throw new OAuthError("invalid_request", 400);
-  if (!config.redirectUris.includes(value)) throw new OAuthError("invalid_request", 400);
-  return value;
+  if (config.redirectUris.includes(value)) return value;
+  const target = dynamicLoopbackTarget(value);
+  if (target !== null && config.loopbackDynamicPortRedirectUris.some((uri) => dynamicLoopbackTarget(uri) === target)) {
+    return value;
+  }
+  throw new OAuthError("invalid_request", 400);
 }
 
 /** The requested scopes must be a subset of what the operator allowed; silence means all of them. */
@@ -438,6 +466,9 @@ const routes: FastifyPluginAsync = async (app) => {
         clientId: config.clientId,
         scopes: config.scopes,
         redirectUris: config.redirectUris,
+        ...(config.loopbackDynamicPortRedirectUris.length > 0
+          ? { loopbackDynamicPortRedirectUris: config.loopbackDynamicPortRedirectUris }
+          : {}),
         codeChallengeMethods: ["S256"],
         // Built from the prefix this plugin was registered under. Hard-coding /auth would hand a
         // client the wrong paths on any deployment that mounts the proxy below the root, and the
